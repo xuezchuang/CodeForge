@@ -1,8 +1,8 @@
 [package]
-name = "snowagent-desktop"
+name = "codeforge-desktop"
 version = "0.1.0"
-description = "SnowAgent Desktop MVP"
-authors = ["SnowAgent"]
+description = "CodeForge Desktop MVP"
+authors = ["CodeForge"]
 edition = "2021"
 
 [build-dependencies]

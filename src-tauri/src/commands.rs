@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::agent_runner::{self, AgentRunInput};
 use crate::app_state::{current_settings, lock_error, AppState};
@@ -131,6 +131,14 @@ pub fn run_mock_agent(
     Ok(run)
 }
 
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallTestInput {
+    pub project_id: String,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+}
+
 #[tauri::command]
 pub async fn run_agent(
     state: State<'_, AppState>,
@@ -146,6 +154,41 @@ pub async fn run_agent(
     };
 
     let run = agent_runner::run_agent(&project, &settings, input).await?;
+    let mut traces = state.traces.lock().map_err(|_| lock_error())?;
+    traces.insert_task(run.task_id.clone(), run.traces.clone());
+    Ok(run)
+}
+
+#[tauri::command]
+pub async fn run_tool_call_test(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    input: ToolCallTestInput,
+) -> Result<MockAgentRun, String> {
+    let project = {
+        let projects = state.projects.lock().map_err(|_| lock_error())?;
+        projects.get(&input.project_id)?
+    };
+    let settings = {
+        let settings_store = state.settings.lock().map_err(|_| lock_error())?;
+        current_settings(&settings_store)
+    };
+    let trace_state = state.inner().clone();
+
+    let run = agent_runner::run_tool_call_test(
+        &project,
+        &settings,
+        input.provider_id.as_deref(),
+        input.model_id.as_deref(),
+        move |event| {
+            if let Ok(mut traces) = trace_state.traces.lock() {
+                traces.append_event(&event.task_id, event.clone());
+            }
+            let _ = app_handle.emit("agent_trace_event", event.clone());
+        },
+    )
+    .await?;
+
     let mut traces = state.traces.lock().map_err(|_| lock_error())?;
     traces.insert_task(run.task_id.clone(), run.traces.clone());
     Ok(run)

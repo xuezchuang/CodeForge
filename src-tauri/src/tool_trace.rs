@@ -12,8 +12,12 @@ use crate::project_registry::ProjectSession;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceEventType {
+    UserMessage,
+    LlmRequest,
+    LlmResponse,
     ToolCall,
     ToolResult,
+    FinalResponse,
     ModelMessage,
     SystemEvent,
     Error,
@@ -24,6 +28,7 @@ pub enum TraceEventType {
 pub enum TraceStatus {
     Running,
     Success,
+    Warning,
     Failed,
 }
 
@@ -352,7 +357,10 @@ mod tests {
 
         let sample = find_sample_code_link(&project).unwrap();
         assert_eq!(sample.code_link, "Source/Project/Private/Project.cpp:10");
-        assert_eq!(sample.relative_path, "Source\\Project\\Private\\Project.cpp");
+        assert_eq!(
+            sample.relative_path,
+            "Source\\Project\\Private\\Project.cpp"
+        );
         assert_eq!(sample.line, 10);
     }
 
@@ -369,7 +377,11 @@ mod tests {
     #[test]
     fn mock_agent_trace_contains_clickable_model_message() {
         let root = create_temp_project();
-        let cpp_file = root.join("Source").join("Project").join("Private").join("Test.cpp");
+        let cpp_file = root
+            .join("Source")
+            .join("Project")
+            .join("Private")
+            .join("Test.cpp");
         fs::create_dir_all(cpp_file.parent().unwrap()).unwrap();
         fs::write(&cpp_file, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
         let project = test_project(&root);
@@ -380,7 +392,10 @@ mod tests {
         assert_eq!(run.traces[0].title, "Start task");
         assert_eq!(run.traces[1].title, "list_files");
         assert_eq!(run.traces[2].title, "read_file");
-        assert!(matches!(run.traces[3].event_type, TraceEventType::ModelMessage));
+        assert!(matches!(
+            run.traces[3].event_type,
+            TraceEventType::ModelMessage
+        ));
         assert_eq!(run.traces[3].title, "model_message");
         assert_eq!(run.traces[4].title, "open_code_link suggestion");
         assert_eq!(

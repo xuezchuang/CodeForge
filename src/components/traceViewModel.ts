@@ -11,6 +11,7 @@ export interface TraceStepViewModel {
   id: string
   index: number
   title: string
+  shortSummary: string
   status: TraceStatus
   durationMs: number | null
   summaryItems: TraceSummaryItem[]
@@ -29,7 +30,7 @@ export function createTraceStepViewModels(events: ToolTraceEvent[]): TraceStepVi
       const sanitizedMessage = sanitizeModelMessage(finalMessage)
       const chatCompletion = [...steps]
         .reverse()
-        .find((step) => step.title === 'Chat completion')
+        .find((step) => step.title === 'LLM' || step.title === 'Chat completion')
 
       if (chatCompletion && sanitizedMessage) {
         appendOrReplaceItem(chatCompletion.outputSummary, {
@@ -45,10 +46,14 @@ export function createTraceStepViewModels(events: ToolTraceEvent[]): TraceStepVi
       }
     }
 
+    if (isMergedIntoLaterStep(event)) {
+      continue
+    }
+
     steps.push(toTraceStepViewModel(event))
   }
 
-  return steps
+  return steps.map((step, index) => ({ ...step, index: index + 1 }))
 }
 
 export function sanitizeModelMessage(text: string): string {
@@ -77,6 +82,16 @@ function toTraceStepViewModel(event: ToolTraceEvent): TraceStepViewModel {
     }
   }
 
+  if (event.type === 'user_message') {
+    return {
+      ...baseStep(event, 'User input', rawInput, rawOutput),
+      inputSummary: compactItems([
+        item('Project', stringValue(input.projectName)),
+        item('Prompt', event.outputSummary ?? stringValue(input.prompt), true),
+      ]),
+    }
+  }
+
   if (event.title === 'select_model') {
     return {
       ...baseStep(event, 'Select model', rawInput, rawOutput),
@@ -89,30 +104,82 @@ function toTraceStepViewModel(event: ToolTraceEvent): TraceStepViewModel {
     }
   }
 
-  if (event.title === 'chat_completion') {
-    const message = extractMessage(event.output)
-    const tokens = readTokenUsage(output)
+  if (event.type === 'llm_response') {
+    const request = asRecord(input.request)
+    const choice = firstChoice(output)
     return {
-      ...baseStep(event, 'Chat completion', rawInput, rawOutput),
+      ...baseStep(event, 'LLM', rawInput, rawOutput),
       summaryItems: compactItems([
-        item('Provider', stringValue(input.provider)),
-        item('Model', stringValue(input.model ?? output.model)),
-        item('Duration', formatDuration(event.durationMs)),
-        item('Tokens', tokens.display),
+        item('Model', stringValue(request.model)),
+        item('Tools', String(arrayCount(request.tools))),
+        item('Messages', String(arrayCount(request.messages))),
+        item('Finish Reason', stringValue(choice.finish_reason)),
+        item('Tool Calls', String(arrayCount(asRecord(choice.message).tool_calls))),
+        item('Content Chars', contentCharCount(choice.message)),
       ]),
       inputSummary: compactItems([
-        item('Prompt chars', stringValue(input.promptChars)),
-        item('Messages', stringValue(input.messages ?? input.messageCount)),
-        item('Input tokens', tokens.inputTokens),
+        item('Model', stringValue(request.model)),
+        item('Tools', String(arrayCount(request.tools))),
+        item('Messages', String(arrayCount(request.messages))),
       ]),
       outputSummary: compactItems([
-        item('Model', stringValue(output.model ?? input.model)),
-        item('Message chars', stringValue(output.messageChars)),
-        item('Output tokens', tokens.outputTokens),
-        item('Total tokens', tokens.totalTokens),
-        item('Final Message', message ? sanitizeModelMessage(message) : '', true),
+        item('Finish Reason', stringValue(choice.finish_reason)),
+        item('Tool Calls', String(arrayCount(asRecord(choice.message).tool_calls))),
+        item('Content Chars', contentCharCount(choice.message)),
       ]),
     }
+  }
+
+  if (event.type === 'tool_result') {
+    if (event.title === 'chat_completion') {
+      return createChatCompletionStep(event, input, output, rawInput, rawOutput)
+    }
+
+    const argumentsValue = asRecord(input.arguments)
+    return {
+      ...baseStep(event, 'Tool', rawInput, rawOutput),
+      summaryItems: compactItems([
+        item('Tool', event.toolName ?? ''),
+      ]),
+      inputSummary: compactItems([
+        item('Tool', event.toolName ?? stringValue(input.toolName)),
+        item('Arguments', compactJson(argumentsValue)),
+      ]),
+      outputSummary: compactItems([
+        item('Result', event.outputSummary ?? compactJson(event.output)),
+      ]),
+    }
+  }
+
+  if (event.type === 'final_response') {
+    const request = asRecord(input.request)
+    const response = asRecord(output.response)
+    const choice = firstChoice(response)
+    const message = extractMessage(event.output) ?? event.outputSummary ?? ''
+    return {
+      ...baseStep(event, 'LLM', rawInput, rawOutput),
+      summaryItems: compactItems([
+        item('Model', stringValue(request.model)),
+        item('Tools', String(arrayCount(request.tools))),
+        item('Messages', String(arrayCount(request.messages))),
+        item('Finish Reason', stringValue(choice.finish_reason)),
+        item('Content Chars', contentCharCount(choice.message)),
+      ]),
+      inputSummary: compactItems([
+        item('Model', stringValue(request.model)),
+        item('Tools', String(arrayCount(request.tools))),
+        item('Messages', String(arrayCount(request.messages))),
+      ]),
+      outputSummary: compactItems([
+        item('Finish Reason', stringValue(choice.finish_reason)),
+        item('Content Chars', contentCharCount(choice.message)),
+        item('Final Response', sanitizeModelMessage(message), true),
+      ]),
+    }
+  }
+
+  if (event.title === 'chat_completion') {
+    return createChatCompletionStep(event, input, output, rawInput, rawOutput)
   }
 
   if (event.type === 'model_message') {
@@ -145,6 +212,48 @@ function toTraceStepViewModel(event: ToolTraceEvent): TraceStepViewModel {
   }
 }
 
+function isMergedIntoLaterStep(event: ToolTraceEvent): boolean {
+  return (
+    event.type === 'user_message' ||
+    event.type === 'llm_request' ||
+    event.type === 'tool_call'
+  )
+}
+
+function createChatCompletionStep(
+  event: ToolTraceEvent,
+  input: Record<string, unknown>,
+  output: Record<string, unknown>,
+  rawInput: unknown | null,
+  rawOutput: unknown | null,
+): TraceStepViewModel {
+  const request = asRecord(input.request)
+  const message = extractMessage(event.output)
+  const tokens = readTokenUsage(output)
+  return {
+    ...baseStep(event, 'LLM', rawInput, rawOutput),
+    summaryItems: compactItems([
+      item('Provider', stringValue(input.provider)),
+      item('Model', stringValue(request.model ?? input.model ?? output.model)),
+      item('Messages', String(arrayCount(request.messages))),
+      item('Tokens', tokens.display),
+    ]),
+    inputSummary: compactItems([
+      item('Provider', stringValue(input.provider)),
+      item('Model', stringValue(request.model ?? input.model)),
+      item('Messages', String(arrayCount(request.messages))),
+      item('Input tokens', tokens.inputTokens),
+    ]),
+    outputSummary: compactItems([
+      item('Model', stringValue(output.model ?? request.model ?? input.model)),
+      item('Message chars', stringValue(output.messageChars)),
+      item('Output tokens', tokens.outputTokens),
+      item('Total tokens', tokens.totalTokens),
+      item('Final Message', message ? sanitizeModelMessage(message) : '', true),
+    ]),
+  }
+}
+
 function baseStep(
   event: ToolTraceEvent,
   title: string,
@@ -155,6 +264,7 @@ function baseStep(
     id: event.id,
     index: event.stepIndex,
     title,
+    shortSummary: event.outputSummary ? sanitizeModelMessage(event.outputSummary) : '',
     status: event.status,
     durationMs: event.durationMs,
     summaryItems: compactItems([item('Duration', formatDuration(event.durationMs))]),
@@ -197,6 +307,34 @@ function stringValue(value: unknown): string {
     return sanitizeModelMessage(value)
   }
   return String(value)
+}
+
+function arrayCount(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0
+}
+
+function firstChoice(value: Record<string, unknown>): Record<string, unknown> {
+  const choices = value.choices
+  if (!Array.isArray(choices)) {
+    return {}
+  }
+  return asRecord(choices[0])
+}
+
+function contentCharCount(message: unknown): string {
+  const content = asRecord(message).content
+  return typeof content === 'string' ? String([...content].length) : ''
+}
+
+function compactJson(value: unknown): string {
+  if (value === null || value === undefined) {
+    return ''
+  }
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
 }
 
 function extractMessage(value: unknown): string | null {

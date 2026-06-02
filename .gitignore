@@ -15,6 +15,13 @@ vsix/**/bin/
 vsix/**/obj/
 vsix/**/.vs/
 *.local
+.env
+.env.*
+!.env.example
+settings.json
+projects.json
+**/settings.json
+**/projects.json
 
 # Editor directories and files
 .vscode/*

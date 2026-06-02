@@ -1,4 +1,12 @@
-import { ArrowUp, Check, ChevronDown, Mic, Plus, Settings2 } from 'lucide-react'
+import {
+  ArrowUp,
+  Calculator,
+  Check,
+  ChevronDown,
+  Mic,
+  Plus,
+  Settings2,
+} from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import type { ProviderConfig } from '../types/provider'
@@ -13,9 +21,19 @@ interface ComposerProps {
     prompt: string,
     selection: { providerId: string | null; modelId: string | null },
   ) => void
+  onRunToolCallTest: (
+    selection: { providerId: string | null; modelId: string | null },
+  ) => void
 }
 
-function Composer({ providers, busy, value, onChange, onSend }: ComposerProps) {
+function Composer({
+  providers,
+  busy,
+  value,
+  onChange,
+  onSend,
+  onRunToolCallTest,
+}: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const modelPickerRef = useRef<HTMLDivElement>(null)
   const [selectedModelId, setSelectedModelId] = useState('')
@@ -26,6 +44,7 @@ function Composer({ providers, busy, value, onChange, onSend }: ComposerProps) {
     selectableModels[0] ??
     null
   const canSend = value.trim().length > 0 && !busy && selectedModel !== null
+  const canRunToolCallTest = !busy && selectedModel !== null
 
   useEffect(() => {
     const textarea = textareaRef.current
@@ -67,6 +86,16 @@ function Composer({ providers, busy, value, onChange, onSend }: ComposerProps) {
     onChange('')
   }
 
+  const runToolCallTest = () => {
+    if (!canRunToolCallTest) {
+      return
+    }
+    onRunToolCallTest({
+      providerId: selectedModel?.providerId ?? null,
+      modelId: selectedModel?.modelId ?? null,
+    })
+  }
+
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
@@ -103,6 +132,18 @@ function Composer({ providers, busy, value, onChange, onSend }: ComposerProps) {
               <span className="button-caret" aria-hidden="true">
                 v
               </span>
+            </button>
+            <button
+              type="button"
+              className="composer-mode-button composer-test-button"
+              title={
+                selectedModel ? 'Run Tool Call Test' : 'Enable a provider in Settings'
+              }
+              onClick={runToolCallTest}
+              disabled={!canRunToolCallTest}
+            >
+              <Calculator size={15} aria-hidden="true" />
+              <span>Run Tool Call Test</span>
             </button>
           </div>
           <div className="composer-action-group">

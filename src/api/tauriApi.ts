@@ -6,7 +6,12 @@ import type {
   ProjectSession,
 } from '../types/project'
 import type { AppSettings, SettingsInput } from '../types/settings'
-import type { AgentRunInput, MockAgentRun, ToolTraceEvent } from '../types/trace'
+import type {
+  AgentRunInput,
+  MockAgentRun,
+  ToolCallTestInput,
+  ToolTraceEvent,
+} from '../types/trace'
 import type {
   OpenCodeLinkResult,
   VSInstance,
@@ -85,6 +90,10 @@ export function runMockAgent(
 
 export function runAgent(input: AgentRunInput): Promise<MockAgentRun> {
   return call<MockAgentRun>('run_agent', { input })
+}
+
+export function runToolCallTest(input: ToolCallTestInput): Promise<MockAgentRun> {
+  return call<MockAgentRun>('run_tool_call_test', { input })
 }
 
 export function listTraces(taskId: string): Promise<ToolTraceEvent[]> {

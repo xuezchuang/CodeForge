@@ -8,6 +8,7 @@ mod desktop_http_server;
 mod path_utils;
 mod process_manager;
 mod project_registry;
+mod tool_registry;
 mod tool_trace;
 mod vs_bridge_service;
 mod vs_registry;
@@ -45,6 +46,7 @@ fn main() {
             commands::heartbeat_vs_instance,
             commands::list_vs_instances,
             commands::run_agent,
+            commands::run_tool_call_test,
             commands::run_mock_agent,
             commands::list_traces,
             commands::open_code_link,

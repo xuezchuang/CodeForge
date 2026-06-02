@@ -5,7 +5,13 @@ import type {
   PointerEvent as ReactPointerEvent,
   SetStateAction,
 } from 'react'
-import { listTraces, openVisualStudio, runAgent } from '../api/tauriApi'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import {
+  listTraces,
+  openVisualStudio,
+  runAgent,
+  runToolCallTest,
+} from '../api/tauriApi'
 import type { AppState } from '../state/appState'
 import type { AgentTask, ChatMessage } from '../types/task'
 import type { AgentConversationMessage, ToolTraceEvent } from '../types/trace'
@@ -29,6 +35,9 @@ interface SelectedTrace {
   taskId: string
   events: ToolTraceEvent[]
 }
+
+const toolCallTestPrompt = '请必须调用 calculator.add 工具计算 1+1，然后告诉我结果。'
+const traceEventName = 'agent_trace_event'
 
 function Workspace({
   state,
@@ -119,15 +128,25 @@ function Workspace({
   }, [currentTask?.id, state.traceDrawerOpen, traceWidth, updateHeaderDivider])
 
   useEffect(() => {
-    setSelectedTrace((current) => {
-      if (!current || !currentTask) {
-        return null
+    const task = currentTask
+    let active = true
+    window.queueMicrotask(() => {
+      if (!active) {
+        return
       }
-      return currentTask.messages.some((message) => message.taskId === current.taskId) ?
-          current
-        : null
+      setSelectedTrace((current) => {
+        if (!current || !task) {
+          return null
+        }
+        return task.messages.some((message) => message.taskId === current.taskId) ?
+            current
+          : null
+      })
     })
-  }, [currentTask?.id])
+    return () => {
+      active = false
+    }
+  }, [currentTask])
 
   const showWorkspaceToast = (kind: ToastState['kind'], message: string) => {
     const id = Date.now()
@@ -194,6 +213,79 @@ function Workspace({
       )
       showWorkspaceToast('error', message)
     } finally {
+      setBusy(false)
+    }
+  }
+
+  const runToolCallTestTask = async (
+    selection: { providerId: string | null; modelId: string | null },
+  ) => {
+    if (!activeProject) {
+      return
+    }
+
+    const sessionTaskId = crypto.randomUUID()
+    const userMessage = createMessage(sessionTaskId, 'user', toolCallTestPrompt)
+    const pendingTask: AgentTask = {
+      id: sessionTaskId,
+      projectId: activeProject.id,
+      prompt: toolCallTestPrompt,
+      messages: [userMessage],
+      traceEvents: [],
+      status: 'running',
+    }
+    let unlisten: UnlistenFn | null = null
+
+    setBusy(true)
+    setSelectedTrace(null)
+    setState((current) => ({
+      ...addOrReplaceSessionTask(current, activeProject.id, pendingTask),
+      traceDrawerOpen: true,
+    }))
+
+    try {
+      unlisten = await listen<ToolTraceEvent>(traceEventName, (event) => {
+        const traceEvent = event.payload
+        if (!isToolTraceEvent(traceEvent)) {
+          return
+        }
+        setSelectedTrace((current) => ({
+          taskId: traceEvent.taskId,
+          events:
+            current?.taskId === traceEvent.taskId ?
+              appendTraceEvent(current.events, traceEvent)
+            : [traceEvent],
+        }))
+        setState((current) =>
+          appendTraceEventToSession(current, sessionTaskId, traceEvent),
+        )
+      })
+
+      const run = await runToolCallTest({
+        projectId: activeProject.id,
+        providerId: selection.providerId,
+        modelId: selection.modelId,
+      })
+      const assistantMessage = createAssistantMessage(run.taskId, run.traces)
+      setSelectedTrace({ taskId: run.taskId, events: run.traces })
+
+      setState((current) =>
+        completeSessionRun(
+          current,
+          sessionTaskId,
+          assistantMessage,
+          run.traces,
+        ),
+      )
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught)
+      const errorMessage = createMessage(sessionTaskId, 'system', message)
+      setState((current) =>
+        appendMessagesToSession(current, activeProject.id, sessionTaskId, [errorMessage], 'failed'),
+      )
+      showWorkspaceToast('error', message)
+    } finally {
+      unlisten?.()
       setBusy(false)
     }
   }
@@ -370,6 +462,7 @@ function Workspace({
               value={composerDraft}
               onChange={setComposerDraft}
               onSend={runTask}
+              onRunToolCallTest={runToolCallTestTask}
             />
           </div>
         </main>
@@ -518,6 +611,38 @@ function updateTraceEventsForMessage(
   return changed ? { ...state, tasksById } : state
 }
 
+function appendTraceEventToSession(
+  state: AppState,
+  sessionTaskId: string,
+  traceEvent: ToolTraceEvent,
+): AppState {
+  const task = state.tasksById[sessionTaskId]
+  if (!task) {
+    return state
+  }
+
+  return {
+    ...state,
+    tasksById: {
+      ...state.tasksById,
+      [sessionTaskId]: {
+        ...task,
+        traceEvents: appendTraceEvent(task.traceEvents, traceEvent),
+      },
+    },
+  }
+}
+
+function appendTraceEvent(
+  events: ToolTraceEvent[],
+  traceEvent: ToolTraceEvent,
+): ToolTraceEvent[] {
+  if (events.some((event) => event.id === traceEvent.id)) {
+    return events
+  }
+  return [...events, traceEvent]
+}
+
 function createConversationMessages(messages: ChatMessage[]): AgentConversationMessage[] {
   return messages
     .filter(
@@ -549,8 +674,10 @@ function createAssistantMessage(
   traces: ToolTraceEvent[],
 ): ChatMessage {
   const summary =
+    traces.find((event) => event.type === 'final_response')?.outputSummary ??
     traces.find((event) => event.type === 'model_message')?.outputSummary ??
     traces.find((event) => event.status === 'failed')?.outputSummary ??
+    traces.find((event) => event.status === 'warning')?.outputSummary ??
     `Agent produced ${traces.length} trace events.`
   const content = sanitizeModelMessage(summary)
   const links = extractCodeLinksFromText(content).map((rawLink) => ({ rawLink }))
@@ -564,6 +691,18 @@ function createAssistantMessage(
 
 function hasFailedTrace(traces: ToolTraceEvent[]): boolean {
   return traces.some((event) => event.status === 'failed')
+}
+
+function isToolTraceEvent(value: unknown): value is ToolTraceEvent {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'id' in value &&
+    'taskId' in value &&
+    'stepIndex' in value &&
+    'type' in value &&
+    'status' in value
+  )
 }
 
 function normalizeCodeLinkError(message: string): string {

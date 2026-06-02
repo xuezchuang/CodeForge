@@ -6,8 +6,11 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::project_registry::ProjectSession;
+use crate::tool_registry::{self, CALCULATOR_ADD_TOOL_NAME};
 use crate::tool_trace::{self, MockAgentRun, ToolTraceEvent, TraceEventType, TraceStatus};
 use crate::vs_registry::{AppSettings, ProviderConfig};
+
+pub const TOOL_CALL_TEST_PROMPT: &str = "请必须调用 calculator.add 工具计算 1+1，然后告诉我结果。";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,7 +35,7 @@ struct SelectedModel {
     model_id: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatMessage {
     role: String,
@@ -45,6 +48,8 @@ struct TokenUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    input_cached_tokens: Option<u64>,
+    input_uncached_tokens: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -56,6 +61,27 @@ struct ProviderCompletion {
     response_body: Value,
 }
 
+#[derive(Debug)]
+struct ChatCompletionResult {
+    duration_ms: u64,
+    request_body: Value,
+    response_body: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OpenAiToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: String,
+    function: OpenAiFunctionCall,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OpenAiFunctionCall {
+    name: String,
+    arguments: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct OpenAiChatResponse {
     choices: Vec<OpenAiChoice>,
@@ -65,11 +91,14 @@ struct OpenAiChatResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiChoice {
     message: OpenAiMessage,
+    finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct OpenAiMessage {
+    role: Option<String>,
     content: Option<String>,
+    tool_calls: Option<Vec<OpenAiToolCall>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +106,12 @@ struct OpenAiUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +144,8 @@ struct ClaudeContentBlock {
 struct ClaudeUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
 }
 
 pub async fn run_agent(
@@ -209,6 +246,8 @@ pub async fn run_agent(
                     "inputTokens": completion.token_usage.input_tokens,
                     "outputTokens": completion.token_usage.output_tokens,
                     "totalTokens": completion.token_usage.total_tokens,
+                    "inputCachedTokens": completion.token_usage.input_cached_tokens,
+                    "inputUncachedTokens": completion.token_usage.input_uncached_tokens,
                 })),
                 Some(format!("Received {message_chars} chars")),
                 TraceStatus::Success,
@@ -244,6 +283,350 @@ pub async fn run_agent(
             ));
         }
     }
+
+    Ok(MockAgentRun { task_id, traces })
+}
+
+pub async fn run_tool_call_test(
+    project: &ProjectSession,
+    settings: &AppSettings,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+    mut on_trace: impl FnMut(&ToolTraceEvent),
+) -> Result<MockAgentRun, String> {
+    let task_id = Uuid::new_v4().to_string();
+    let mut traces = Vec::new();
+    let mut step_index = 1;
+
+    push_trace(
+        &mut traces,
+        trace(
+            &task_id,
+            step_index,
+            TraceEventType::UserMessage,
+            None,
+            "user_message",
+            Some(json!({
+                "projectId": project.id,
+                "projectName": project.name,
+                "prompt": TOOL_CALL_TEST_PROMPT,
+            })),
+            None,
+            Some("请必须调用 calculator.add 工具计算 1+1".to_string()),
+            TraceStatus::Success,
+            0,
+        ),
+        &mut on_trace,
+    );
+    step_index += 1;
+
+    let selected = match select_model(settings, provider_id, model_id) {
+        Ok(selected) => selected,
+        Err(error) => {
+            push_trace(
+                &mut traces,
+                error_trace(
+                    &task_id,
+                    step_index,
+                    "select_model failed",
+                    Some(json!({
+                        "providerId": provider_id,
+                        "modelId": model_id,
+                    })),
+                    &error,
+                ),
+                &mut on_trace,
+            );
+            return Ok(MockAgentRun { task_id, traces });
+        }
+    };
+
+    if matches!(
+        selected.provider.provider_type.as_str(),
+        "claude" | "ollama"
+    ) {
+        let error =
+            "Run Tool Call Test supports OpenAI-compatible Chat Completions providers only.";
+        push_trace(
+            &mut traces,
+            error_trace(
+                &task_id,
+                step_index,
+                "provider_not_supported",
+                Some(json!({
+                    "provider": selected.provider.name,
+                    "type": selected.provider.provider_type,
+                    "model": selected.model_id,
+                })),
+                error,
+            ),
+            &mut on_trace,
+        );
+        return Ok(MockAgentRun { task_id, traces });
+    }
+
+    let base_messages = build_tool_call_test_messages(project);
+    let first_request = build_chat_completion_request(
+        &selected,
+        base_messages.clone(),
+        Some(tool_registry::tool_definitions()),
+    );
+    push_trace(
+        &mut traces,
+        trace(
+            &task_id,
+            step_index,
+            TraceEventType::LlmRequest,
+            None,
+            "llm_request:first",
+            Some(first_request.clone()),
+            None,
+            Some(request_summary(&first_request)),
+            TraceStatus::Success,
+            0,
+        ),
+        &mut on_trace,
+    );
+    step_index += 1;
+
+    let first_completion = match send_chat_completion(&selected, &first_request).await {
+        Ok(completion) => completion,
+        Err(error) => {
+            push_trace(
+                &mut traces,
+                error_trace(
+                    &task_id,
+                    step_index,
+                    "llm_request:first failed",
+                    Some(first_request),
+                    &error,
+                ),
+                &mut on_trace,
+            );
+            return Ok(MockAgentRun { task_id, traces });
+        }
+    };
+    push_trace(
+        &mut traces,
+        trace(
+            &task_id,
+            step_index,
+            TraceEventType::LlmResponse,
+            None,
+            "llm_response:first",
+            Some(json!({
+                "request": first_completion.request_body.clone(),
+            })),
+            Some(first_completion.response_body.clone()),
+            Some(response_summary(&first_completion.response_body)),
+            TraceStatus::Success,
+            first_completion.duration_ms,
+        ),
+        &mut on_trace,
+    );
+    step_index += 1;
+
+    let tool_calls = match parse_tool_calls(&first_completion.response_body) {
+        Ok(tool_calls) => tool_calls,
+        Err(error) => {
+            push_trace(
+                &mut traces,
+                error_trace(
+                    &task_id,
+                    step_index,
+                    "parse_tool_calls failed",
+                    Some(first_completion.response_body),
+                    &error,
+                ),
+                &mut on_trace,
+            );
+            return Ok(MockAgentRun { task_id, traces });
+        }
+    };
+
+    if tool_calls.is_empty() {
+        let warning = "模型没有触发工具调用";
+        push_trace(
+            &mut traces,
+            trace(
+                &task_id,
+                step_index,
+                TraceEventType::FinalResponse,
+                None,
+                "model_did_not_call_tool",
+                Some(first_completion.response_body),
+                Some(json!({ "warning": "model_did_not_call_tool" })),
+                Some(warning.to_string()),
+                TraceStatus::Warning,
+                0,
+            ),
+            &mut on_trace,
+        );
+        return Ok(MockAgentRun { task_id, traces });
+    }
+
+    let mut second_messages = base_messages;
+    second_messages.push(build_assistant_tool_call_message(
+        &first_completion.response_body,
+    )?);
+
+    for tool_call in tool_calls {
+        let arguments = match parse_tool_arguments(&tool_call.function.arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                push_trace(
+                    &mut traces,
+                    error_trace(
+                        &task_id,
+                        step_index,
+                        "tool_arguments parse failed",
+                        Some(json!({ "toolCall": tool_call.clone() })),
+                        &error,
+                    ),
+                    &mut on_trace,
+                );
+                return Ok(MockAgentRun { task_id, traces });
+            }
+        };
+
+        push_trace(
+            &mut traces,
+            trace(
+                &task_id,
+                step_index,
+                TraceEventType::ToolCall,
+                Some(&tool_call.function.name),
+                "tool_call",
+                Some(json!({ "toolCall": tool_call.clone(), "arguments": arguments.clone() })),
+                None,
+                Some(tool_call_summary(&tool_call.function.name, &arguments)),
+                TraceStatus::Success,
+                0,
+            ),
+            &mut on_trace,
+        );
+        step_index += 1;
+
+        let started = Instant::now();
+        let tool_result = match tool_registry::execute_tool(&tool_call.function.name, &arguments) {
+            Ok(result) => result,
+            Err(error) => {
+                push_trace(
+                    &mut traces,
+                    error_trace(
+                        &task_id,
+                        step_index,
+                        "tool execution failed",
+                        Some(json!({
+                            "toolName": tool_call.function.name.clone(),
+                            "arguments": arguments.clone(),
+                        })),
+                        &error,
+                    ),
+                    &mut on_trace,
+                );
+                return Ok(MockAgentRun { task_id, traces });
+            }
+        };
+        push_trace(
+            &mut traces,
+            trace(
+                &task_id,
+                step_index,
+                TraceEventType::ToolResult,
+                Some(&tool_call.function.name),
+                "tool_result",
+                Some(json!({
+                    "toolName": tool_call.function.name.clone(),
+                    "arguments": arguments.clone(),
+                })),
+                Some(tool_result.clone()),
+                Some(tool_result_summary(&tool_result)),
+                TraceStatus::Success,
+                started.elapsed().as_millis() as u64,
+            ),
+            &mut on_trace,
+        );
+        step_index += 1;
+
+        second_messages.push(build_tool_result_message(&tool_call, &tool_result));
+    }
+
+    let second_request = build_chat_completion_request(
+        &selected,
+        second_messages,
+        Some(tool_registry::tool_definitions()),
+    );
+    push_trace(
+        &mut traces,
+        trace(
+            &task_id,
+            step_index,
+            TraceEventType::LlmRequest,
+            None,
+            "llm_request:second",
+            Some(second_request.clone()),
+            None,
+            Some(request_summary(&second_request)),
+            TraceStatus::Success,
+            0,
+        ),
+        &mut on_trace,
+    );
+    step_index += 1;
+
+    let final_completion = match send_chat_completion(&selected, &second_request).await {
+        Ok(completion) => completion,
+        Err(error) => {
+            push_trace(
+                &mut traces,
+                error_trace(
+                    &task_id,
+                    step_index,
+                    "llm_request:second failed",
+                    Some(second_request),
+                    &error,
+                ),
+                &mut on_trace,
+            );
+            return Ok(MockAgentRun { task_id, traces });
+        }
+    };
+    let final_message = extract_message_from_response(&final_completion.response_body)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let final_summary = if final_message.is_empty() {
+        "Final response was empty".to_string()
+    } else {
+        final_message.clone()
+    };
+
+    push_trace(
+        &mut traces,
+        trace(
+            &task_id,
+            step_index,
+            TraceEventType::FinalResponse,
+            None,
+            "final_response",
+            Some(json!({
+                "request": final_completion.request_body.clone(),
+            })),
+            Some(json!({
+                "response": final_completion.response_body.clone(),
+                "message": final_message.clone(),
+            })),
+            Some(final_summary),
+            if final_message.is_empty() {
+                TraceStatus::Warning
+            } else {
+                TraceStatus::Success
+            },
+            final_completion.duration_ms,
+        ),
+        &mut on_trace,
+    );
 
     Ok(MockAgentRun { task_id, traces })
 }
@@ -331,11 +714,30 @@ async fn call_provider(
     call_openai_compatible(project, selected, conversation_messages).await
 }
 
-async fn call_openai_compatible(
-    project: &ProjectSession,
+fn build_chat_completion_request(
     selected: &SelectedModel,
-    conversation_messages: &[ChatMessage],
-) -> Result<ProviderCompletion, String> {
+    messages: Vec<Value>,
+    tools: Option<Vec<Value>>,
+) -> Value {
+    let mut request_body = json!({
+        "model": selected.model_id,
+        "messages": messages,
+        "temperature": selected.provider.temperature,
+        "stream": false,
+    });
+
+    if let Some(tools) = tools {
+        request_body["tools"] = json!(tools);
+        request_body["tool_choice"] = json!("auto");
+    }
+
+    request_body
+}
+
+async fn send_chat_completion(
+    selected: &SelectedModel,
+    request_body: &Value,
+) -> Result<ChatCompletionResult, String> {
     let base_url = selected.provider.base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
         return Err(format!(
@@ -351,14 +753,6 @@ async fn call_openai_compatible(
     }
 
     let url = format!("{base_url}/chat/completions");
-    let messages = build_messages(project, conversation_messages);
-    let request_body = json!({
-        "model": selected.model_id,
-        "messages": messages,
-        "temperature": selected.provider.temperature,
-        "stream": false,
-    });
-
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let auth = format!("Bearer {}", selected.provider.api_key.trim());
@@ -371,7 +765,7 @@ async fn call_openai_compatible(
     let response = reqwest::Client::new()
         .post(&url)
         .headers(headers)
-        .json(&request_body)
+        .json(request_body)
         .send()
         .await
         .map_err(|error| format!("Model request failed: {error}"))?;
@@ -387,14 +781,30 @@ async fn call_openai_compatible(
         ));
     }
 
-    let response_body = serde_json::from_str::<Value>(&body).map_err(|error| {
-        format!(
-            "Model response parse failed: {error}; body={}",
-            body
-        )
-    })?;
+    let response_body = serde_json::from_str::<Value>(&body)
+        .map_err(|error| format!("Model response parse failed: {error}; body={}", body))?;
+
+    Ok(ChatCompletionResult {
+        duration_ms,
+        request_body: request_body.clone(),
+        response_body,
+    })
+}
+
+async fn call_openai_compatible(
+    project: &ProjectSession,
+    selected: &SelectedModel,
+    conversation_messages: &[ChatMessage],
+) -> Result<ProviderCompletion, String> {
+    let messages = build_messages(project, conversation_messages)
+        .into_iter()
+        .map(|message| json!(message))
+        .collect::<Vec<_>>();
+    let request_body = build_chat_completion_request(selected, messages, None);
+    let completion = send_chat_completion(selected, &request_body).await?;
+    let response_body = completion.response_body.clone();
     let parsed = serde_json::from_value::<OpenAiChatResponse>(response_body.clone())
-        .map_err(|error| format!("Model response parse failed: {error}; body={body}"))?;
+        .map_err(|error| format!("Model response parse failed: {error}; body={response_body}"))?;
     let message = parsed
         .choices
         .first()
@@ -408,18 +818,28 @@ async fn call_openai_compatible(
 
     let token_usage = parsed
         .usage
-        .map(|usage| TokenUsage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
+        .map(|usage| {
+            let cached_tokens = usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens);
+            TokenUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+                input_cached_tokens: cached_tokens,
+                input_uncached_tokens: usage.prompt_tokens.zip(cached_tokens).map(
+                    |(input_tokens, cached_tokens)| input_tokens.saturating_sub(cached_tokens),
+                ),
+            }
         })
         .unwrap_or_default();
 
     Ok(ProviderCompletion {
         message,
-        duration_ms,
+        duration_ms: completion.duration_ms,
         token_usage,
-        request_body,
+        request_body: completion.request_body,
         response_body,
     })
 }
@@ -488,12 +908,8 @@ async fn call_claude(
         ));
     }
 
-    let response_body = serde_json::from_str::<Value>(&body).map_err(|error| {
-        format!(
-            "Claude response parse failed: {error}; body={}",
-            body
-        )
-    })?;
+    let response_body = serde_json::from_str::<Value>(&body)
+        .map_err(|error| format!("Claude response parse failed: {error}; body={}", body))?;
     let parsed = serde_json::from_value::<ClaudeMessagesResponse>(response_body.clone())
         .map_err(|error| format!("Claude response parse failed: {error}; body={body}"))?;
     let message = parsed
@@ -511,13 +927,20 @@ async fn call_claude(
 
     let token_usage = parsed
         .usage
-        .map(|usage| TokenUsage {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            total_tokens: usage
-                .input_tokens
-                .zip(usage.output_tokens)
-                .map(|(input_tokens, output_tokens)| input_tokens + output_tokens),
+        .map(|usage| {
+            let input_uncached_tokens =
+                sum_optional_tokens(usage.input_tokens, usage.cache_creation_input_tokens);
+            let input_tokens =
+                sum_optional_tokens(input_uncached_tokens, usage.cache_read_input_tokens);
+            TokenUsage {
+                input_tokens,
+                output_tokens: usage.output_tokens,
+                total_tokens: input_tokens
+                    .zip(usage.output_tokens)
+                    .map(|(input_tokens, output_tokens)| input_tokens + output_tokens),
+                input_cached_tokens: usage.cache_read_input_tokens,
+                input_uncached_tokens,
+            }
         })
         .unwrap_or_default();
 
@@ -569,12 +992,8 @@ async fn call_ollama(
         ));
     }
 
-    let response_body = serde_json::from_str::<Value>(&body).map_err(|error| {
-        format!(
-            "Ollama response parse failed: {error}; body={}",
-            body
-        )
-    })?;
+    let response_body = serde_json::from_str::<Value>(&body)
+        .map_err(|error| format!("Ollama response parse failed: {error}; body={}", body))?;
     let parsed = serde_json::from_value::<OllamaChatResponse>(response_body.clone())
         .map_err(|error| format!("Ollama response parse failed: {error}; body={body}"))?;
     let message = parsed
@@ -595,6 +1014,8 @@ async fn call_ollama(
             .prompt_eval_count
             .zip(parsed.eval_count)
             .map(|(input_tokens, output_tokens)| input_tokens + output_tokens),
+        input_cached_tokens: None,
+        input_uncached_tokens: None,
     };
 
     Ok(ProviderCompletion {
@@ -639,7 +1060,18 @@ fn normalize_conversation_messages(
     normalized
 }
 
-fn build_messages(project: &ProjectSession, conversation_messages: &[ChatMessage]) -> Vec<ChatMessage> {
+fn sum_optional_tokens(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn build_messages(
+    project: &ProjectSession,
+    conversation_messages: &[ChatMessage],
+) -> Vec<ChatMessage> {
     let mut messages = vec![ChatMessage {
         role: "system".to_string(),
         content: system_prompt(project),
@@ -653,6 +1085,157 @@ fn system_prompt(project: &ProjectSession) -> String {
         "You are SnowAgent Desktop, a coding assistant for the project \"{}\". Repo root: {}. Answer concisely and use clickable file:line references when relevant.",
         project.name, project.repo_root
     )
+}
+
+fn build_tool_call_test_messages(project: &ProjectSession) -> Vec<Value> {
+    vec![
+        json!({
+            "role": "system",
+            "content": format!(
+                "You are SnowAgent Desktop. For this test you must call the {CALCULATOR_ADD_TOOL_NAME} tool before answering. Project: {}.",
+                project.name
+            ),
+        }),
+        json!({
+            "role": "user",
+            "content": TOOL_CALL_TEST_PROMPT,
+        }),
+    ]
+}
+
+fn parse_openai_response(response_body: &Value) -> Result<OpenAiChatResponse, String> {
+    serde_json::from_value::<OpenAiChatResponse>(response_body.clone())
+        .map_err(|error| format!("Model response parse failed: {error}; body={response_body}"))
+}
+
+fn parse_tool_calls(response_body: &Value) -> Result<Vec<OpenAiToolCall>, String> {
+    let parsed = parse_openai_response(response_body)?;
+    Ok(parsed
+        .choices
+        .first()
+        .and_then(|choice| choice.message.tool_calls.clone())
+        .unwrap_or_default())
+}
+
+fn build_assistant_tool_call_message(response_body: &Value) -> Result<Value, String> {
+    let parsed = parse_openai_response(response_body)?;
+    let choice = parsed
+        .choices
+        .first()
+        .ok_or_else(|| "Model response had no choices.".to_string())?;
+    let content = choice
+        .message
+        .content
+        .clone()
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "role": "assistant",
+        "content": content,
+        "tool_calls": choice.message.tool_calls.clone().unwrap_or_default(),
+    }))
+}
+
+fn build_tool_result_message(tool_call: &OpenAiToolCall, result: &Value) -> Value {
+    json!({
+        "role": "tool",
+        "tool_call_id": tool_call.id.clone(),
+        "name": tool_call.function.name.clone(),
+        "content": result.to_string(),
+    })
+}
+
+fn parse_tool_arguments(arguments: &str) -> Result<Value, String> {
+    serde_json::from_str::<Value>(arguments).map_err(|error| {
+        format!("Tool arguments JSON parse failed: {error}; arguments={arguments}")
+    })
+}
+
+fn extract_message_from_response(response_body: &Value) -> Option<String> {
+    parse_openai_response(response_body)
+        .ok()
+        .and_then(|parsed| parsed.choices.into_iter().next())
+        .and_then(|choice| choice.message.content)
+}
+
+fn request_summary(request_body: &Value) -> String {
+    format!(
+        "model={}, tools={}, messages={}",
+        string_field(request_body, "model").unwrap_or("unknown"),
+        array_len(request_body, "tools"),
+        array_len(request_body, "messages"),
+    )
+}
+
+fn response_summary(response_body: &Value) -> String {
+    match parse_openai_response(response_body) {
+        Ok(parsed) => {
+            let choice = parsed.choices.first();
+            let finish_reason = choice
+                .and_then(|choice| choice.finish_reason.as_deref())
+                .unwrap_or("unknown");
+            let tool_calls = choice
+                .and_then(|choice| choice.message.tool_calls.as_ref())
+                .map(Vec::len)
+                .unwrap_or(0);
+            let content_chars = choice
+                .and_then(|choice| choice.message.content.as_deref())
+                .map(|content| content.chars().count())
+                .unwrap_or(0);
+            format!(
+                "finish_reason={finish_reason}, tool_calls={tool_calls}, content_chars={content_chars}"
+            )
+        }
+        Err(_) => "response parse failed".to_string(),
+    }
+}
+
+fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
+    if tool_name == CALCULATOR_ADD_TOOL_NAME {
+        let a = arguments
+            .get("a")
+            .map(compact_json)
+            .unwrap_or_else(|| "?".to_string());
+        let b = arguments
+            .get("b")
+            .map(compact_json)
+            .unwrap_or_else(|| "?".to_string());
+        return format!("{CALCULATOR_ADD_TOOL_NAME}({{a:{a},b:{b}}})");
+    }
+
+    format!("{tool_name}({})", compact_json(arguments))
+}
+
+fn tool_result_summary(result: &Value) -> String {
+    result
+        .get("result")
+        .map(|value| format!("result={}", compact_json(value)))
+        .unwrap_or_else(|| compact_json(result))
+}
+
+fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    value.get(field).and_then(Value::as_str)
+}
+
+fn array_len(value: &Value, field: &str) -> usize {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+}
+
+fn push_trace(
+    traces: &mut Vec<ToolTraceEvent>,
+    event: ToolTraceEvent,
+    on_trace: &mut impl FnMut(&ToolTraceEvent),
+) {
+    on_trace(&event);
+    traces.push(event);
 }
 
 fn trace(

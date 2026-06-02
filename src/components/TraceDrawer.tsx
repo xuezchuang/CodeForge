@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import type { ToolTraceEvent } from '../types/trace'
+import TraceEventRow from './TraceEventRow'
+import { createTraceStepViewModels } from './traceViewModel'
 
 interface TraceDrawerProps {
   open: boolean
@@ -29,11 +31,8 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
   const bodyRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const [scrollbar, setScrollbar] = useState<TraceScrollbarState>(hiddenScrollbar)
-  const [formatEscapedNewlines, setFormatEscapedNewlines] = useState(false)
-  const payload = useMemo(
-    () => createTracePayload(taskId, traceEvents),
-    [taskId, traceEvents],
-  )
+  const steps = useMemo(() => createTraceStepViewModels(traceEvents), [traceEvents])
+  const tokenSummary = useMemo(() => createTraceTokenSummary(traceEvents), [traceEvents])
 
   const updateScrollbar = useCallback(() => {
     const body = bodyRef.current
@@ -128,33 +127,17 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
           <X size={16} aria-hidden="true" />
         </button>
       </div>
+      <TraceTokenSummary summary={tokenSummary} />
       <div className="trace-drawer-body" ref={bodyRef}>
         <div className="trace-drawer-content" ref={contentRef}>
           {traceEvents.length === 0 ? (
             <div className="empty-state">No trace events yet.</div>
           ) : (
-            <>
-              <div className="trace-json-toolbar">
-                <label className="trace-newline-toggle">
-                  <input
-                    type="checkbox"
-                    checked={formatEscapedNewlines}
-                    onChange={(event) => setFormatEscapedNewlines(event.target.checked)}
-                  />
-                  <span>{'Render \\n as line breaks'}</span>
-                </label>
-              </div>
-              <TraceJsonPanel
-                title="Input"
-                value={payload.input}
-                formatEscapedNewlines={formatEscapedNewlines}
-              />
-              <TraceJsonPanel
-                title="Output"
-                value={payload.output}
-                formatEscapedNewlines={formatEscapedNewlines}
-              />
-            </>
+            <div className="trace-event-list">
+              {steps.map((step) => (
+                <TraceEventRow step={step} key={step.id} />
+              ))}
+            </div>
           )}
         </div>
       </div>
@@ -177,101 +160,317 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
   )
 }
 
-interface TracePayload {
-  input: unknown | null
-  output: unknown | null
+interface TraceTokenTotals {
+  input: number | null
+  output: number | null
+  total: number | null
+  inputCached: number | null
+  inputUncached: number | null
 }
 
-function TraceJsonPanel({
-  title,
-  value,
-  formatEscapedNewlines,
-}: {
-  title: string
-  value: unknown | null
-  formatEscapedNewlines: boolean
-}) {
+interface TraceTokenUsage {
+  input: number | null
+  output: number | null
+  total: number | null
+  inputCached: number | null
+  inputUncached: number | null
+}
+
+const tokenFormatter = new Intl.NumberFormat()
+
+function TraceTokenSummary({ summary }: { summary: TraceTokenTotals }) {
+  const cacheTitle =
+    summary.inputCached !== null || summary.inputUncached !== null ?
+      `cache hit: ${formatTokenValue(summary.inputCached)}\ncache miss: ${formatTokenValue(
+        summary.inputUncached,
+      )}`
+    : 'cache hit: -\ncache miss: -'
+
   return (
-    <section className="trace-section trace-json-panel">
-      <h4>{title}</h4>
-      {value === null || value === undefined ? (
-        <div className="empty-state">No {title.toLowerCase()} JSON.</div>
-      ) : (
-        <pre className="trace-raw-code trace-json-code">
-          {formatJson(value, formatEscapedNewlines)}
-        </pre>
-      )}
+    <section className="trace-token-summary" aria-label="Token usage">
+      <TokenStat label="all" value={summary.total} />
+      <TokenStat label="in" value={summary.input} tooltip={cacheTitle} />
+      <TokenStat label="out" value={summary.output} />
     </section>
   )
 }
 
-function createTracePayload(taskId: string | null, events: ToolTraceEvent[]): TracePayload {
-  const chatCompletion = events.find((event) => event.title === 'chat_completion')
-  if (chatCompletion) {
-    const input = asRecord(chatCompletion.input)
-    const output = asRecord(chatCompletion.output)
-    return {
-      input: input.request ?? chatCompletion.input ?? null,
-      output: output.response ?? chatCompletion.output ?? null,
+function TokenStat({
+  label,
+  value,
+  tooltip,
+}: {
+  label: string
+  value: number | null
+  tooltip?: string
+}) {
+  const className = tooltip ? 'trace-token-stat has-tooltip' : 'trace-token-stat'
+
+  return (
+    <span className={className} data-tooltip={tooltip}>
+      <span className="trace-token-label">{label}</span>
+      <span className="trace-token-value">{formatTokenValue(value)}</span>
+    </span>
+  )
+}
+
+function createTraceTokenSummary(traceEvents: ToolTraceEvent[]): TraceTokenTotals {
+  const usages = traceEvents
+    .map((event) => readTraceTokenUsage(event.output))
+    .filter((usage): usage is TraceTokenUsage => usage !== null)
+
+  return {
+    input: sumKnown(usages.map((usage) => usage.input)),
+    output: sumKnown(usages.map((usage) => usage.output)),
+    total: sumKnown(usages.map((usage) => usage.total)),
+    inputCached: sumKnown(usages.map((usage) => usage.inputCached)),
+    inputUncached: sumKnown(usages.map((usage) => usage.inputUncached)),
+  }
+}
+
+function readTraceTokenUsage(value: unknown): TraceTokenUsage | null {
+  const record = asRecord(value)
+  if (!record) {
+    return null
+  }
+
+  const candidates = tokenCandidatesForProvider(readProviderType(record), record)
+  let merged: TraceTokenUsage | null = null
+
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue
+    }
+
+    const usage = readTokenUsage(candidate)
+    if (usage) {
+      merged = mergeTokenUsage(merged, usage)
     }
   }
 
-  const failedChatCompletion = events.find((event) => event.title === 'chat_completion failed')
-  if (failedChatCompletion) {
-    const input = asRecord(failedChatCompletion.input)
-    return {
-      input: input.request ?? failedChatCompletion.input ?? null,
-      output: failedChatCompletion.output ?? null,
-    }
+  if (!merged) {
+    return null
+  }
+
+  return completeTokenUsage(merged)
+}
+
+function tokenCandidatesForProvider(
+  providerType: string,
+  record: Record<string, unknown>,
+): Array<Record<string, unknown> | null> {
+  const response = asRecord(record.response)
+  const recordBaseResp = asRecord(record.base_resp) ?? asRecord(record.baseResp)
+  const responseBaseResp = asRecord(response?.base_resp) ?? asRecord(response?.baseResp)
+  const normalizedCandidates = [
+    record,
+    asRecord(record.tokenUsage),
+    asRecord(record.usage),
+    asRecord(record.tokens),
+  ]
+  const openAiLikeCandidates = [
+    asRecord(response?.usage),
+    asRecord(responseBaseResp?.usage),
+    asRecord(recordBaseResp?.usage),
+    response,
+    responseBaseResp,
+    recordBaseResp,
+  ]
+
+  if (providerType === 'claude') {
+    return [
+      asRecord(response?.usage),
+      asRecord(record.usage),
+      response,
+      ...normalizedCandidates,
+    ]
+  }
+
+  if (providerType === 'ollama') {
+    return [response, ...normalizedCandidates]
+  }
+
+  if (isOpenAiLikeProvider(providerType)) {
+    return [...openAiLikeCandidates, ...normalizedCandidates]
+  }
+
+  return [...normalizedCandidates, ...openAiLikeCandidates]
+}
+
+function readTokenUsage(record: Record<string, unknown>): TraceTokenUsage | null {
+  const rawInput = firstNumber(record, [
+    'inputTokens',
+    'input_tokens',
+    'promptTokens',
+    'prompt_tokens',
+    'promptEvalCount',
+    'prompt_eval_count',
+  ])
+  const output = firstNumber(record, [
+    'outputTokens',
+    'output_tokens',
+    'completionTokens',
+    'completion_tokens',
+    'evalCount',
+    'eval_count',
+  ])
+  const reportedTotal = firstNumber(record, ['totalTokens', 'total_tokens'])
+  const details = asRecord(record.promptTokensDetails) ?? asRecord(record.prompt_tokens_details)
+  const cacheRead = firstNumber(record, [
+    'cacheReadInputTokens',
+    'cache_read_input_tokens',
+  ])
+  const cacheCreation = firstNumber(record, [
+    'cacheCreationInputTokens',
+    'cache_creation_input_tokens',
+  ])
+  const reportedCached =
+    firstNumber(record, [
+      'inputCachedTokens',
+      'input_cached_tokens',
+      'cachedInputTokens',
+      'cached_input_tokens',
+    ]) ?? firstNumber(details, ['cachedTokens', 'cached_tokens'])
+  const inputCached = reportedCached ?? cacheRead
+  const explicitUncached = firstNumber(record, [
+    'inputUncachedTokens',
+    'input_uncached_tokens',
+    'uncachedInputTokens',
+    'uncached_input_tokens',
+  ])
+  const hasClaudeCacheShape = cacheRead !== null || cacheCreation !== null
+  const input =
+    hasClaudeCacheShape ? sumKnown([rawInput, cacheCreation, cacheRead]) : rawInput
+  const inputUncached =
+    explicitUncached ??
+    (hasClaudeCacheShape ?
+      sumKnown([rawInput, cacheCreation])
+    : input !== null && inputCached !== null ? Math.max(0, input - inputCached)
+    : null)
+  const resolvedTotal = reportedTotal ?? sumNullable(input, output)
+
+  if (
+    input === null &&
+    output === null &&
+    resolvedTotal === null &&
+    inputCached === null &&
+    inputUncached === null
+  ) {
+    return null
   }
 
   return {
-    input: {
-      taskId,
-      events: events.map((event) => ({
-        id: event.id,
-        taskId: event.taskId,
-        stepIndex: event.stepIndex,
-        type: event.type,
-        toolName: event.toolName,
-        title: event.title,
-        startedAt: event.startedAt,
-        input: event.input,
-      })),
-    },
-    output: {
-      taskId,
-      events: events.map((event) => ({
-        id: event.id,
-        taskId: event.taskId,
-        stepIndex: event.stepIndex,
-        type: event.type,
-        toolName: event.toolName,
-        title: event.title,
-        status: event.status,
-        startedAt: event.startedAt,
-        endedAt: event.endedAt,
-        durationMs: event.durationMs,
-        outputSummary: event.outputSummary,
-        output: event.output,
-      })),
-    },
+    input,
+    output,
+    total: resolvedTotal,
+    inputCached,
+    inputUncached,
   }
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
+function mergeTokenUsage(
+  current: TraceTokenUsage | null,
+  next: TraceTokenUsage,
+): TraceTokenUsage {
+  if (!current) {
+    return next
+  }
+
+  return {
+    input: current.input ?? next.input,
+    output: current.output ?? next.output,
+    total: current.total ?? next.total,
+    inputCached: current.inputCached ?? next.inputCached,
+    inputUncached: current.inputUncached ?? next.inputUncached,
+  }
+}
+
+function completeTokenUsage(usage: TraceTokenUsage): TraceTokenUsage {
+  return {
+    ...usage,
+    total: usage.total ?? sumNullable(usage.input, usage.output),
+    inputUncached:
+      usage.inputUncached ??
+      (usage.input !== null && usage.inputCached !== null ?
+        Math.max(0, usage.input - usage.inputCached)
+      : null),
+  }
+}
+
+function readProviderType(record: Record<string, unknown>): string {
+  return stringValue(record.type ?? record.providerType ?? record.provider_type).toLowerCase()
+}
+
+function isOpenAiLikeProvider(providerType: string): boolean {
+  return [
+    'openai',
+    'openai-compatible',
+    'deepseek',
+    'minimax',
+    'local-gateway',
+  ].includes(providerType)
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     return value as Record<string, unknown>
   }
-  return {}
+  return null
 }
 
-function formatJson(value: unknown, formatEscapedNewlines: boolean): string {
-  const json = JSON.stringify(value, null, 2)
-  if (!formatEscapedNewlines) {
-    return json
+function firstNumber(record: Record<string, unknown> | null, keys: string[]): number | null {
+  if (!record) {
+    return null
   }
-  return json.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n')
+
+  for (const key of keys) {
+    const number = numberValue(record[key])
+    if (number !== null) {
+      return number
+    }
+  }
+
+  return null
+}
+
+function numberValue(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function sumKnown(values: Array<number | null>): number | null {
+  let total = 0
+  let hasValue = false
+
+  for (const value of values) {
+    if (value !== null) {
+      total += value
+      hasValue = true
+    }
+  }
+
+  return hasValue ? total : null
+}
+
+function sumNullable(left: number | null, right: number | null): number | null {
+  if (left !== null && right !== null) {
+    return left + right
+  }
+  return null
+}
+
+function formatTokenValue(value: number | null): string {
+  return value === null ? '-' : tokenFormatter.format(value)
 }
 
 export default TraceDrawer

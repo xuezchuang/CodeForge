@@ -7,20 +7,20 @@ import {
   Clock3,
   LoaderCircle,
 } from 'lucide-react'
-import type { TraceStepViewModel, TraceSummaryItem } from './traceViewModel'
+import type { TraceStepViewModel } from './traceViewModel'
 
 interface TraceEventRowProps {
   step: TraceStepViewModel
 }
-
-const longTextLimit = 500
 
 function TraceEventRow({ step }: TraceEventRowProps) {
   const [expanded, setExpanded] = useState(false)
   const [rawInputOpen, setRawInputOpen] = useState(false)
   const [rawOutputOpen, setRawOutputOpen] = useState(false)
   const rowClass =
-    step.status === 'failed' ? 'drawer-trace-row failed' : 'drawer-trace-row'
+    step.status === 'failed' || step.status === 'warning' ?
+      `drawer-trace-row ${step.status}`
+    : 'drawer-trace-row'
 
   return (
     <article className={rowClass}>
@@ -37,7 +37,12 @@ function TraceEventRow({ step }: TraceEventRowProps) {
         )}
         <span className="trace-step">{step.index}</span>
         <StatusIcon status={step.status} />
-        <span className="trace-title">{step.title}</span>
+        <span className="trace-title-block">
+          <span className="trace-title">{step.title}</span>
+          {step.shortSummary ? (
+            <span className="trace-row-summary">{step.shortSummary}</span>
+          ) : null}
+        </span>
         <span className={`trace-status ${step.status}`}>{step.status}</span>
         <span className="trace-duration">
           <Clock3 size={13} aria-hidden="true" />
@@ -47,15 +52,6 @@ function TraceEventRow({ step }: TraceEventRowProps) {
 
       {expanded ? (
         <div className="trace-details">
-          {step.summaryItems.length > 0 ? (
-            <TraceSection title="Summary" items={step.summaryItems} />
-          ) : null}
-          {step.inputSummary.length > 0 ? (
-            <TraceSection title="Input" items={step.inputSummary} />
-          ) : null}
-          {step.outputSummary.length > 0 ? (
-            <TraceSection title="Output" items={step.outputSummary} />
-          ) : null}
           <RawToggle
             label="View raw input"
             value={step.rawInput}
@@ -78,47 +74,13 @@ function StatusIcon({ status }: { status: TraceStepViewModel['status'] }) {
   if (status === 'failed') {
     return <CircleAlert className="status-icon failed" size={16} aria-hidden="true" />
   }
+  if (status === 'warning') {
+    return <CircleAlert className="status-icon warning" size={16} aria-hidden="true" />
+  }
   if (status === 'running') {
     return <LoaderCircle className="status-icon running" size={16} aria-hidden="true" />
   }
   return <CheckCircle2 className="status-icon success" size={16} aria-hidden="true" />
-}
-
-function TraceSection({ title, items }: { title: string; items: TraceSummaryItem[] }) {
-  return (
-    <section className="trace-section">
-      <h4>{title}</h4>
-      <div className="trace-summary-list">
-        {items.map((item) => (
-          <TraceSummaryRow item={item} key={item.label} />
-        ))}
-      </div>
-    </section>
-  )
-}
-
-function TraceSummaryRow({ item }: { item: TraceSummaryItem }) {
-  const [expanded, setExpanded] = useState(false)
-  const isLong = item.value.length > longTextLimit
-  const value = isLong && !expanded ? `${item.value.slice(0, longTextLimit)}...` : item.value
-
-  return (
-    <div className={item.multiline ? 'trace-summary-row multiline' : 'trace-summary-row'}>
-      <span className="trace-summary-label">{item.label}</span>
-      <div className="trace-summary-value-wrap">
-        <span className="trace-summary-value">{value}</span>
-        {isLong ? (
-          <button
-            type="button"
-            className="trace-inline-button"
-            onClick={() => setExpanded((current) => !current)}
-          >
-            {expanded ? 'Collapse' : 'Show more'}
-          </button>
-        ) : null}
-      </div>
-    </div>
-  )
 }
 
 function RawToggle({

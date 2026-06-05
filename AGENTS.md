@@ -120,7 +120,15 @@ The VSIX should remain a semantic bridge. Model orchestration, task planning, pa
 
 ## Verification
 
-Use the smallest safe check that proves the change. By default, prefer static review, diffs, and existing IDE/compiler/linter diagnostics. Do not run build, test, or dev-server commands automatically; use explicit safe tools with user confirmation if they are added later.
+After any code change in this repository, compile the main desktop release before reporting completion:
+
+```text
+npm run tauri build
+```
+
+This is the required release verification for code edits. If the release build fails, inspect the concrete error, fix the cause when it is in scope, and rerun the release build. If the build cannot be run, report the blocker explicitly.
+
+For documentation-only edits, use the smallest safe check that proves the change, such as direct file review or `git diff --check`.
 
 ## Reporting
 

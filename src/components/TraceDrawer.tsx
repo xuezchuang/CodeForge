@@ -1,8 +1,26 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { X } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
+import {
+  AlertTriangle,
+  Box,
+  Braces,
+  CheckCircle2,
+  CircleAlert,
+  CircleCheck,
+  CircleX,
+  Clock3,
+  Copy,
+  Download,
+  FileText,
+  Search,
+  X,
+  Zap,
+} from 'lucide-react'
 import type { ToolTraceEvent } from '../types/trace'
-import TraceEventRow from './TraceEventRow'
-import { createTraceStepViewModels } from './traceViewModel'
+import {
+  createTraceStepViewModels,
+  type TraceStepViewModel,
+} from './traceViewModel'
 
 interface TraceDrawerProps {
   open: boolean
@@ -11,153 +29,646 @@ interface TraceDrawerProps {
   onClose: () => void
 }
 
-interface TraceScrollbarState {
-  visible: boolean
-  top: number
-  height: number
-  thumbTop: number
-  thumbHeight: number
-}
-
-const hiddenScrollbar: TraceScrollbarState = {
-  visible: false,
-  top: 0,
-  height: 0,
-  thumbTop: 0,
-  thumbHeight: 0,
-}
+type TraceDetailTab = 'payload' | 'headers' | 'metadata' | 'events'
 
 function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
-  const bodyRef = useRef<HTMLDivElement>(null)
-  const contentRef = useRef<HTMLDivElement>(null)
-  const [scrollbar, setScrollbar] = useState<TraceScrollbarState>(hiddenScrollbar)
+  const dialogRef = useRef<HTMLElement>(null)
+  const [selectedStepId, setSelectedStepId] = useState<string | null>(null)
+  const [detailTab, setDetailTab] = useState<TraceDetailTab>('payload')
   const steps = useMemo(() => createTraceStepViewModels(traceEvents), [traceEvents])
   const tokenSummary = useMemo(() => createTraceTokenSummary(traceEvents), [traceEvents])
-
-  const updateScrollbar = useCallback(() => {
-    const body = bodyRef.current
-    if (!body) {
-      setScrollbar(hiddenScrollbar)
-      return
-    }
-
-    const maxScroll = body.scrollHeight - body.clientHeight
-    const trackInset = 8
-    const trackHeight = Math.max(0, body.clientHeight - trackInset * 2)
-    if (maxScroll <= 1 || trackHeight <= 0) {
-      setScrollbar(hiddenScrollbar)
-      return
-    }
-
-    const thumbHeight = Math.max(
-      44,
-      Math.round((body.clientHeight / body.scrollHeight) * trackHeight),
-    )
-    const thumbTravel = Math.max(0, trackHeight - thumbHeight)
-    const thumbTop = Math.round((body.scrollTop / maxScroll) * thumbTravel)
-    const nextScrollbar = {
-      visible: true,
-      top: body.offsetTop + trackInset,
-      height: trackHeight,
-      thumbTop,
-      thumbHeight,
-    }
-
-    setScrollbar((current) =>
-      current.visible === nextScrollbar.visible &&
-      current.top === nextScrollbar.top &&
-      current.height === nextScrollbar.height &&
-      current.thumbTop === nextScrollbar.thumbTop &&
-      current.thumbHeight === nextScrollbar.thumbHeight
-        ? current
-        : nextScrollbar,
-    )
-  }, [])
+  const runSummary = useMemo(
+    () => createTraceRunSummary(traceEvents, steps),
+    [steps, traceEvents],
+  )
 
   useEffect(() => {
     if (!open) {
       return undefined
     }
 
-    const body = bodyRef.current
-    const content = contentRef.current
-    if (!body) {
-      return undefined
+    dialogRef.current?.focus()
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose()
+      }
     }
 
-    updateScrollbar()
-    const animationFrame = window.requestAnimationFrame(updateScrollbar)
-    body.addEventListener('scroll', updateScrollbar, { passive: true })
-    window.addEventListener('resize', updateScrollbar)
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [onClose, open])
 
-    const resizeObserver = new ResizeObserver(updateScrollbar)
-    resizeObserver.observe(body)
-    if (content) {
-      resizeObserver.observe(content)
+  useEffect(() => {
+    if (!open) {
+      return
     }
 
-    const mutationObserver = new MutationObserver(updateScrollbar)
-    mutationObserver.observe(body, {
-      attributes: true,
-      childList: true,
-      subtree: true,
+    setSelectedStepId((current) => {
+      if (current && steps.some((step) => step.id === current)) {
+        return current
+      }
+
+      return preferredInitialStep(steps)?.id ?? null
     })
-
-    return () => {
-      window.cancelAnimationFrame(animationFrame)
-      body.removeEventListener('scroll', updateScrollbar)
-      window.removeEventListener('resize', updateScrollbar)
-      resizeObserver.disconnect()
-      mutationObserver.disconnect()
-    }
-  }, [open, traceEvents.length, updateScrollbar])
+  }, [open, steps])
 
   if (!open) {
     return null
   }
 
+  const selectedStep =
+    steps.find((step) => step.id === selectedStepId) ?? preferredInitialStep(steps) ?? null
+
+  const handleBackdropMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.target === event.currentTarget) {
+      onClose()
+    }
+  }
+
   return (
-    <aside className="trace-drawer" aria-label="Trace drawer">
-      <div className="trace-drawer-header">
-        <div>
-          <h3>Trace</h3>
-          <p>{taskId ? `message trace: ${taskId}` : 'No message trace selected'}</p>
-        </div>
-        <button type="button" className="icon-button" onClick={onClose} aria-label="Close trace">
-          <X size={16} aria-hidden="true" />
-        </button>
-      </div>
-      <TraceTokenSummary summary={tokenSummary} />
-      <div className="trace-drawer-body" ref={bodyRef}>
-        <div className="trace-drawer-content" ref={contentRef}>
-          {traceEvents.length === 0 ? (
-            <div className="empty-state">No trace events yet.</div>
-          ) : (
-            <div className="trace-event-list">
-              {steps.map((step) => (
-                <TraceEventRow step={step} key={step.id} />
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-      {scrollbar.visible ? (
-        <div
-          className="trace-scrollbar"
-          style={{ top: scrollbar.top, height: scrollbar.height }}
-          aria-hidden="true"
-        >
-          <div
-            className="trace-scrollbar-thumb"
-            style={{
-              height: scrollbar.thumbHeight,
-              transform: `translateY(${scrollbar.thumbTop}px)`,
-            }}
+    <div className="trace-modal-backdrop" onMouseDown={handleBackdropMouseDown}>
+      <aside
+        className="trace-drawer trace-workbench"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="trace-drawer-title"
+        ref={dialogRef}
+        tabIndex={-1}
+      >
+        <header className="trace-drawer-header trace-window-header">
+          <div>
+            <h3 id="trace-drawer-title">Trace / 调用链追踪</h3>
+            <p>{taskId ? `trace id: ${taskId}` : 'No message trace selected'}</p>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Close trace">
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+
+        <TraceMetricGrid runSummary={runSummary} tokenSummary={tokenSummary} />
+
+        <section className="trace-workbench-lower">
+          <TraceStepNavigator
+            steps={steps}
+            selectedStepId={selectedStep?.id ?? null}
+            onSelectStep={setSelectedStepId}
+            runSummary={runSummary}
           />
-        </div>
-      ) : null}
+          <TraceDetailPanel
+            step={selectedStep}
+            tab={detailTab}
+            onTabChange={setDetailTab}
+          />
+        </section>
+
+        <TraceWorkbenchFooter
+          runSummary={runSummary}
+          traceEvents={traceEvents}
+          taskId={taskId}
+        />
+      </aside>
+    </div>
+  )
+}
+
+interface TraceRunSummary {
+  totalDurationMs: number | null
+  requestCount: number
+  successCount: number
+  failedCount: number
+  warningCount: number
+  startMs: number | null
+  endMs: number | null
+}
+
+function TraceMetricGrid({
+  runSummary,
+  tokenSummary,
+}: {
+  runSummary: TraceRunSummary
+  tokenSummary: TraceTokenTotals
+}) {
+  const cachePercent = percentText(tokenSummary.inputCached, tokenSummary.input)
+  const uncachedPercent = percentText(tokenSummary.inputUncached, tokenSummary.input)
+
+  return (
+    <section className="trace-metric-grid" aria-label="Trace summary">
+      <TraceMetricCard
+        icon={<Clock3 size={16} aria-hidden="true" />}
+        label="总耗时"
+        value={formatDurationShort(runSummary.totalDurationMs)}
+      />
+      <TraceMetricCard
+        icon={<Box size={16} aria-hidden="true" />}
+        label="总 Tokens"
+        value={formatTokenValue(tokenSummary.total)}
+      />
+      <TraceMetricCard
+        icon={<Zap size={16} aria-hidden="true" />}
+        label="缓存命中 Tokens"
+        value={formatTokenValue(tokenSummary.inputCached)}
+        detail={cachePercent}
+        tone="success"
+      />
+      <TraceMetricCard
+        icon={<Braces size={16} aria-hidden="true" />}
+        label="非缓存命中 Tokens"
+        value={formatTokenValue(tokenSummary.inputUncached)}
+        detail={uncachedPercent}
+        tone="info"
+      />
+      <TraceMetricCard
+        icon={<FileText size={16} aria-hidden="true" />}
+        label="请求数"
+        value={String(runSummary.requestCount)}
+      />
+      <TraceMetricCard
+        icon={<CircleCheck size={16} aria-hidden="true" />}
+        label="成功"
+        value={String(runSummary.successCount)}
+        tone="success"
+      />
+      <TraceMetricCard
+        icon={<CircleX size={16} aria-hidden="true" />}
+        label="失败"
+        value={String(runSummary.failedCount)}
+        tone="danger"
+      />
+      <TraceMetricCard
+        icon={<AlertTriangle size={16} aria-hidden="true" />}
+        label="警告"
+        value={String(runSummary.warningCount)}
+        tone="warning"
+      />
+    </section>
+  )
+}
+
+function TraceMetricCard({
+  icon,
+  label,
+  value,
+  detail,
+  tone = 'neutral',
+}: {
+  icon: ReactNode
+  label: string
+  value: string
+  detail?: string
+  tone?: 'neutral' | 'success' | 'info' | 'danger' | 'warning'
+}) {
+  return (
+    <div className="trace-metric-card" data-tone={tone}>
+      <span className="trace-metric-icon">{icon}</span>
+      <span className="trace-metric-copy">
+        <span>{label}</span>
+        <strong>
+          {value}
+          {detail ? <small>{detail}</small> : null}
+        </strong>
+      </span>
+    </div>
+  )
+}
+
+function TraceStepNavigator({
+  steps,
+  selectedStepId,
+  onSelectStep,
+  runSummary,
+}: {
+  steps: TraceStepViewModel[]
+  selectedStepId: string | null
+  onSelectStep: (stepId: string) => void
+  runSummary: TraceRunSummary
+}) {
+  const [query, setQuery] = useState('')
+  const filteredSteps = query.trim()
+    ? steps.filter((step) => traceSearchText(step).includes(query.trim().toLowerCase()))
+    : steps
+
+  return (
+    <aside className="trace-step-nav" aria-label="Trace step navigation">
+      <div className="trace-step-nav-header">
+        <strong>步骤导航</strong>
+        <label className="trace-step-search">
+          <Search size={15} aria-hidden="true" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索步骤或工具..."
+          />
+        </label>
+      </div>
+      <div className="trace-step-list">
+        {filteredSteps.map((step) => (
+          <button
+            type="button"
+            className={step.id === selectedStepId ? 'trace-step-item selected' : 'trace-step-item'}
+            onClick={() => onSelectStep(step.id)}
+            key={step.id}
+          >
+            <StatusGlyph status={step.status} />
+            <span>{step.index}</span>
+            <strong>{step.title}</strong>
+            <small>{formatDurationShort(step.durationMs)}</small>
+          </button>
+        ))}
+        {filteredSteps.length === 0 ? (
+          <div className="trace-step-empty">No matching steps.</div>
+        ) : null}
+      </div>
+      <div className="trace-step-nav-footer">
+        <span>
+          <CircleCheck size={14} aria-hidden="true" />
+          成功 {runSummary.successCount}
+        </span>
+        <span>
+          <CircleX size={14} aria-hidden="true" />
+          失败 {runSummary.failedCount}
+        </span>
+        <span>
+          <AlertTriangle size={14} aria-hidden="true" />
+          警告 {runSummary.warningCount}
+        </span>
+      </div>
     </aside>
   )
+}
+
+function TraceDetailPanel({
+  step,
+  tab,
+  onTabChange,
+}: {
+  step: TraceStepViewModel | null
+  tab: TraceDetailTab
+  onTabChange: (tab: TraceDetailTab) => void
+}) {
+  const tabs: Array<{ id: TraceDetailTab; label: string }> = [
+    { id: 'payload', label: '请求输入' },
+    { id: 'headers', label: 'Headers' },
+    { id: 'metadata', label: 'Metadata' },
+    { id: 'events', label: 'Events' },
+  ]
+
+  return (
+    <section className="trace-detail-panel" aria-label="Trace detail">
+      <div className="trace-detail-tabs" role="tablist" aria-label="Trace detail tabs">
+        {tabs.map((item) => (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === item.id}
+            className={tab === item.id ? 'trace-detail-tab active' : 'trace-detail-tab'}
+            onClick={() => onTabChange(item.id)}
+            key={item.id}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+
+      {!step ? (
+        <div className="trace-detail-empty">No trace step selected.</div>
+      ) : (
+        <TraceDetailContent step={step} tab={tab} />
+      )}
+    </section>
+  )
+}
+
+function TraceDetailContent({
+  step,
+  tab,
+}: {
+  step: TraceStepViewModel
+  tab: TraceDetailTab
+}) {
+  if (tab === 'headers') {
+    return (
+      <div className="trace-json-single-pane">
+        <JsonCodePanel title="Headers" value={buildTraceHeaders(step)} />
+      </div>
+    )
+  }
+
+  if (tab === 'metadata') {
+    return (
+      <div className="trace-json-single-pane">
+        <JsonCodePanel title="Metadata" value={buildTraceMetadata(step)} />
+      </div>
+    )
+  }
+
+  if (tab === 'events') {
+    return (
+      <div className="trace-json-single-pane">
+        <JsonCodePanel title="Events" value={buildTraceEventPayload(step)} />
+      </div>
+    )
+  }
+
+  return (
+    <div className="trace-json-split">
+      <JsonCodePanel
+        title="请求输入"
+        subtitle={formatTimestamp(step.startedAt)}
+        value={step.rawInput}
+        badge={step.title}
+      />
+      <JsonCodePanel
+        title="响应输出"
+        subtitle={formatTimestamp(step.endedAt)}
+        value={step.rawOutput}
+        badge={statusLabel(step.status)}
+      />
+    </div>
+  )
+}
+
+function JsonCodePanel({
+  title,
+  subtitle,
+  value,
+  badge,
+}: {
+  title: string
+  subtitle?: string
+  value: unknown
+  badge?: string
+}) {
+  const [copied, setCopied] = useState(false)
+  const text = formatJsonForPanel(value)
+  const lines = text.split('\n')
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      return
+    }
+    setCopied(true)
+    window.setTimeout(() => setCopied(false), 1200)
+  }
+
+  return (
+    <section className="trace-json-pane">
+      <header className="trace-json-pane-header">
+        <span>
+          {badge ? <small>{badge}</small> : null}
+          <strong>{title}</strong>
+          {subtitle ? <em>{subtitle}</em> : null}
+        </span>
+        <button type="button" className="trace-copy-button" onClick={copy}>
+          <Copy size={14} aria-hidden="true" />
+          {copied ? '已复制' : '复制JSON'}
+        </button>
+      </header>
+      <pre className="trace-code-list" aria-label={`${title} JSON`}>
+        {lines.map((line, index) => (
+          <span className="trace-code-line" key={`${index}-${line}`}>
+            <span className="trace-code-line-number">{index + 1}</span>
+            <code>{line || ' '}</code>
+          </span>
+        ))}
+      </pre>
+    </section>
+  )
+}
+
+function TraceWorkbenchFooter({
+  runSummary,
+  traceEvents,
+  taskId,
+}: {
+  runSummary: TraceRunSummary
+  traceEvents: ToolTraceEvent[]
+  taskId: string | null
+}) {
+  return (
+    <footer className="trace-workbench-footer">
+      <span>显示时区：UTC+8</span>
+      <button
+        type="button"
+        className="trace-export-button"
+        onClick={() => exportTraceEvents(traceEvents, taskId)}
+      >
+        <Download size={15} aria-hidden="true" />
+        导出 Trace
+      </button>
+      <span>{formatDurationShort(runSummary.totalDurationMs)}</span>
+    </footer>
+  )
+}
+
+function createTraceRunSummary(
+  traceEvents: ToolTraceEvent[],
+  steps: TraceStepViewModel[],
+): TraceRunSummary {
+  const stepStartTimes = steps
+    .map((step) => timeToMs(step.startedAt))
+    .filter((value): value is number => value !== null)
+  const stepEndTimes = steps
+    .map((step) => {
+      const startMs = timeToMs(step.startedAt)
+      const endMs = timeToMs(step.endedAt)
+      if (endMs !== null) {
+        return endMs
+      }
+      if (startMs !== null && step.durationMs !== null) {
+        return startMs + step.durationMs
+      }
+      return null
+    })
+    .filter((value): value is number => value !== null)
+  const startMs = stepStartTimes.length ? Math.min(...stepStartTimes) : null
+  const endMs = stepEndTimes.length ? Math.max(...stepEndTimes) : startMs
+  const countedEvents = traceEvents.filter((event) => event.type === 'tool_result')
+  const statusSource = countedEvents.length > 0 ? countedEvents : traceEvents
+
+  return {
+    totalDurationMs: startMs !== null && endMs !== null ? Math.max(0, endMs - startMs) : null,
+    requestCount: traceEvents.filter((event) =>
+      ['llm_response', 'final_response', 'tool_result'].includes(event.type),
+    ).length,
+    successCount: statusSource.filter((event) => event.status === 'success').length,
+    failedCount: statusSource.filter((event) => event.status === 'failed').length,
+    warningCount: statusSource.filter((event) => event.status === 'warning').length,
+    startMs,
+    endMs,
+  }
+}
+
+function preferredInitialStep(steps: TraceStepViewModel[]): TraceStepViewModel | null {
+  return (
+    steps.find((step) => step.title === 'LLM') ??
+    steps.find((step) => step.eventType === 'tool_result') ??
+    steps[0] ??
+    null
+  )
+}
+
+function StatusGlyph({ status }: { status: TraceStepViewModel['status'] }) {
+  if (status === 'failed') {
+    return <CircleAlert className="trace-status-glyph failed" size={15} aria-hidden="true" />
+  }
+  if (status === 'warning') {
+    return <AlertTriangle className="trace-status-glyph warning" size={15} aria-hidden="true" />
+  }
+  if (status === 'running') {
+    return <Clock3 className="trace-status-glyph running" size={15} aria-hidden="true" />
+  }
+  return <CheckCircle2 className="trace-status-glyph success" size={15} aria-hidden="true" />
+}
+
+function traceSearchText(step: TraceStepViewModel): string {
+  return [
+    step.index,
+    step.title,
+    step.toolName,
+    step.shortSummary,
+    step.eventType,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+}
+
+function buildTraceHeaders(step: TraceStepViewModel): unknown {
+  const input = asRecord(step.rawInput)
+  const output = asRecord(step.rawOutput)
+  const request = asRecord(input?.request)
+  const response = asRecord(output?.response)
+
+  return (
+    asRecord(input?.headers) ??
+    asRecord(request?.headers) ??
+    asRecord(output?.headers) ??
+    asRecord(response?.headers) ??
+    {}
+  )
+}
+
+function buildTraceMetadata(step: TraceStepViewModel): unknown {
+  return {
+    id: step.id,
+    index: step.index,
+    title: step.title,
+    eventType: step.eventType,
+    toolName: step.toolName,
+    status: step.status,
+    startedAt: step.startedAt,
+    endedAt: step.endedAt,
+    durationMs: step.durationMs,
+    summaryItems: step.summaryItems,
+  }
+}
+
+function buildTraceEventPayload(step: TraceStepViewModel): unknown {
+  return {
+    inputSummary: step.inputSummary,
+    outputSummary: step.outputSummary,
+    rawInput: step.rawInput,
+    rawOutput: step.rawOutput,
+  }
+}
+
+function exportTraceEvents(traceEvents: ToolTraceEvent[], taskId: string | null): void {
+  const payload = JSON.stringify({ taskId, traceEvents }, null, 2)
+  const blob = new Blob([payload], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  const safeTaskId = taskId?.replace(/[^a-zA-Z0-9_.-]+/g, '-') || 'trace'
+
+  link.href = url
+  link.download = `${safeTaskId}.json`
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
+function formatJsonForPanel(value: unknown): string {
+  if (value === null || value === undefined || value === '') {
+    return '{\n}'
+  }
+
+  if (typeof value === 'string') {
+    try {
+      return JSON.stringify(JSON.parse(value), null, 2)
+    } catch {
+      return JSON.stringify(value, null, 2)
+    }
+  }
+
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return JSON.stringify(String(value), null, 2)
+  }
+}
+
+function formatTimestamp(value: string | null): string {
+  const date = value ? new Date(value) : null
+  if (!date || Number.isNaN(date.getTime())) {
+    return '-'
+  }
+
+  return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(
+    date.getSeconds(),
+  )}.${pad3(date.getMilliseconds())}`
+}
+
+function formatDurationShort(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return '-'
+  }
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(3)} s`
+  }
+  return `${formatMs(value)} ms`
+}
+
+function formatMs(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(3)
+}
+
+function percentText(part: number | null, total: number | null): string | undefined {
+  if (part === null || total === null || total <= 0) {
+    return undefined
+  }
+  return `(${((part / total) * 100).toFixed(1)}%)`
+}
+
+function statusLabel(status: TraceStepViewModel['status']): string {
+  if (status === 'success') {
+    return '成功'
+  }
+  if (status === 'failed') {
+    return '失败'
+  }
+  if (status === 'warning') {
+    return '警告'
+  }
+  return '运行中'
+}
+
+function timeToMs(value: string | null): number | null {
+  if (!value) {
+    return null
+  }
+  const ms = Date.parse(value)
+  return Number.isFinite(ms) ? ms : null
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, '0')
+}
+
+function pad3(value: number): string {
+  return String(value).padStart(3, '0')
 }
 
 interface TraceTokenTotals {
@@ -177,42 +688,6 @@ interface TraceTokenUsage {
 }
 
 const tokenFormatter = new Intl.NumberFormat()
-
-function TraceTokenSummary({ summary }: { summary: TraceTokenTotals }) {
-  const cacheTitle =
-    summary.inputCached !== null || summary.inputUncached !== null ?
-      `cache hit: ${formatTokenValue(summary.inputCached)}\ncache miss: ${formatTokenValue(
-        summary.inputUncached,
-      )}`
-    : 'cache hit: -\ncache miss: -'
-
-  return (
-    <section className="trace-token-summary" aria-label="Token usage">
-      <TokenStat label="all" value={summary.total} />
-      <TokenStat label="in" value={summary.input} tooltip={cacheTitle} />
-      <TokenStat label="out" value={summary.output} />
-    </section>
-  )
-}
-
-function TokenStat({
-  label,
-  value,
-  tooltip,
-}: {
-  label: string
-  value: number | null
-  tooltip?: string
-}) {
-  const className = tooltip ? 'trace-token-stat has-tooltip' : 'trace-token-stat'
-
-  return (
-    <span className={className} data-tooltip={tooltip}>
-      <span className="trace-token-label">{label}</span>
-      <span className="trace-token-value">{formatTokenValue(value)}</span>
-    </span>
-  )
-}
 
 function createTraceTokenSummary(traceEvents: ToolTraceEvent[]): TraceTokenTotals {
   const usages = traceEvents

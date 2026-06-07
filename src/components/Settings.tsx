@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Save } from 'lucide-react'
 import { updateSettings } from '../api/tauriApi'
 import type { ProviderConfig } from '../types/provider'
@@ -65,6 +65,8 @@ function SettingsForm({
   const [devenvPath, setDevenvPath] = useState(settings.devenvPath ?? '')
   const [uiPreferences, setUiPreferences] = useState(settings.uiPreferences)
   const [busy, setBusy] = useState(false)
+  const hasMountedProviders = useRef(false)
+  const lastSavedProvidersJson = useRef(JSON.stringify(providers))
 
   const saveSettings = async (
     nextProviders = providers,
@@ -79,6 +81,7 @@ function SettingsForm({
         uiPreferences: nextUiPreferences,
         providers: nextProviders,
       })
+      lastSavedProvidersJson.current = JSON.stringify(saved.providers)
       onSettingsChanged(saved)
       onProvidersChanged(saved.providers)
       onNotice(notice)
@@ -88,6 +91,26 @@ function SettingsForm({
       setBusy(false)
     }
   }
+
+  useEffect(() => {
+    const providersJson = JSON.stringify(providers)
+    if (!hasMountedProviders.current) {
+      hasMountedProviders.current = true
+      lastSavedProvidersJson.current = providersJson
+      return
+    }
+    if (providersJson === lastSavedProvidersJson.current) {
+      return
+    }
+
+    const timerId = window.setTimeout(() => {
+      void saveSettings(providers, uiPreferences, 'Provider settings saved')
+    }, 300)
+
+    return () => {
+      window.clearTimeout(timerId)
+    }
+  }, [providers])
 
   return (
     <section className="page-section settings-page">

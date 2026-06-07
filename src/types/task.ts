@@ -7,12 +7,22 @@ export interface CodeLinkRef {
   rawLink: string
 }
 
+export interface MessageAttachment {
+  id: string
+  kind: 'image'
+  name: string
+  mimeType: string
+  dataUrl: string
+}
+
 export interface ChatMessage {
   id: string
   taskId: string
   role: ChatRole
   content: string
+  status?: AgentTaskStatus
   codeLinks?: CodeLinkRef[]
+  attachments?: MessageAttachment[]
   traceEvents?: ToolTraceEvent[]
   createdAt: string
 }

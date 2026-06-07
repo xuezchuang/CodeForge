@@ -1,19 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type {
-  CSSProperties,
-  Dispatch,
-  PointerEvent as ReactPointerEvent,
-  SetStateAction,
-} from 'react'
+import type { Dispatch, SetStateAction } from 'react'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
+  listTools,
   listTraces,
   openVisualStudio,
   runAgent,
-  runToolCallTest,
+  type ToolDefinitionSummary,
 } from '../api/tauriApi'
 import type { AppState } from '../state/appState'
-import type { AgentTask, ChatMessage } from '../types/task'
+import type { AgentTask, ChatMessage, MessageAttachment } from '../types/task'
 import type { AgentConversationMessage, ToolTraceEvent } from '../types/trace'
 import ChatTimeline from './ChatTimeline'
 import Composer from './Composer'
@@ -36,7 +32,6 @@ interface SelectedTrace {
   events: ToolTraceEvent[]
 }
 
-const toolCallTestPrompt = '请必须调用 calculator.add 工具计算 1+1，然后告诉我结果。'
 const traceEventName = 'agent_trace_event'
 
 function Workspace({
@@ -47,11 +42,9 @@ function Workspace({
   onGlobalError,
 }: WorkspaceProps) {
   const workspaceRef = useRef<HTMLElement>(null)
-  const bodyRef = useRef<HTMLDivElement>(null)
   const [busy, setBusy] = useState(false)
   const [composerDraft, setComposerDraft] = useState('')
   const [workspaceToast, setWorkspaceToast] = useState<ToastState | null>(null)
-  const [traceWidth, setTraceWidth] = useState(loadTraceWidth)
   const [headerDivided, setHeaderDivided] = useState(false)
   const [selectedTrace, setSelectedTrace] = useState<SelectedTrace | null>(null)
   const activeProject = useMemo(
@@ -85,7 +78,7 @@ function Workspace({
       .map((element) => element.getBoundingClientRect())
     const contentRects = Array.from(
       workspace.querySelectorAll<HTMLElement>(
-        '.message-body, .chat-empty-content, .drawer-trace-row',
+        '.message-body, .chat-empty-content',
       ),
     ).map((element) => element.getBoundingClientRect())
     const nextDivided = contentRects.some((contentRect) =>
@@ -107,7 +100,7 @@ function Workspace({
     }
 
     const scrollTargets = Array.from(
-      workspace.querySelectorAll<HTMLElement>('.chat-timeline, .trace-drawer-body'),
+      workspace.querySelectorAll<HTMLElement>('.chat-timeline'),
     )
     scrollTargets.forEach((target) => {
       target.addEventListener('scroll', scheduleUpdate, { passive: true })
@@ -125,7 +118,7 @@ function Workspace({
       window.removeEventListener('resize', scheduleUpdate)
       resizeObserver.disconnect()
     }
-  }, [currentTask?.id, state.traceDrawerOpen, traceWidth, updateHeaderDivider])
+  }, [currentTask?.id, updateHeaderDivider])
 
   useEffect(() => {
     const task = currentTask
@@ -161,18 +154,28 @@ function Workspace({
   const runTask = async (
     prompt: string,
     selection: { providerId: string | null; credentialId: string | null; modelId: string | null },
+    attachments: MessageAttachment[] = [],
   ) => {
     if (!activeProject) {
       return
     }
+    if (isListToolsCommand(prompt)) {
+      await showToolsCommand(activeProject.id, prompt)
+      return
+    }
 
     const sessionTaskId = currentTask?.id ?? crypto.randomUUID()
-    const userMessage = createMessage(sessionTaskId, 'user', prompt)
+    const userMessage = createMessage(sessionTaskId, 'user', prompt, attachments)
+    const pendingAssistantMessage = createPendingAssistantMessage(sessionTaskId)
+    const conversationMessages = createConversationMessages([
+      ...(currentTask?.messages ?? []),
+      userMessage,
+    ])
     const pendingTask: AgentTask =
       currentTask ?
         {
           ...currentTask,
-          messages: [...currentTask.messages, userMessage],
+          messages: [...currentTask.messages, userMessage, pendingAssistantMessage],
           traceEvents: [],
           status: 'running',
         }
@@ -180,11 +183,10 @@ function Workspace({
           id: sessionTaskId,
           projectId: activeProject.id,
           prompt,
-          messages: [userMessage],
+          messages: [userMessage, pendingAssistantMessage],
           traceEvents: [],
           status: 'running',
         }
-    const messages = createConversationMessages(pendingTask.messages)
     let unlisten: UnlistenFn | null = null
 
     setBusy(true)
@@ -208,19 +210,28 @@ function Workspace({
             : [traceEvent],
         }))
         setState((current) =>
-          appendTraceEventToSession(current, sessionTaskId, traceEvent),
+          appendTraceEventToSession(
+            current,
+            sessionTaskId,
+            traceEvent,
+            pendingAssistantMessage.id,
+          ),
         )
       })
 
       const run = await runAgent({
         projectId: activeProject.id,
         userPrompt: prompt,
-        messages,
+        messages: conversationMessages,
         providerId: selection.providerId,
         credentialId: selection.credentialId,
         modelId: selection.modelId,
       })
-      const assistantMessage = createAssistantMessage(run.taskId, run.traces)
+      const assistantMessage = createAssistantMessage(
+        run.taskId,
+        run.traces,
+        pendingAssistantMessage.id,
+      )
       setSelectedTrace({ taskId: run.taskId, events: run.traces })
 
       setState((current) =>
@@ -229,13 +240,19 @@ function Workspace({
           sessionTaskId,
           assistantMessage,
           run.traces,
+          pendingAssistantMessage.id,
         ),
       )
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught)
-      const errorMessage = createMessage(sessionTaskId, 'system', message)
       setState((current) =>
-        appendMessagesToSession(current, activeProject.id, sessionTaskId, [errorMessage], 'failed'),
+        failSessionRun(
+          current,
+          activeProject.id,
+          sessionTaskId,
+          pendingAssistantMessage.id,
+          message,
+        ),
       )
       showWorkspaceToast('error', message)
     } finally {
@@ -244,76 +261,43 @@ function Workspace({
     }
   }
 
-  const runToolCallTestTask = async (
-    selection: { providerId: string | null; credentialId: string | null; modelId: string | null },
-  ) => {
-    if (!activeProject) {
-      return
-    }
-
-    const sessionTaskId = crypto.randomUUID()
-    const userMessage = createMessage(sessionTaskId, 'user', toolCallTestPrompt)
-    const pendingTask: AgentTask = {
-      id: sessionTaskId,
-      projectId: activeProject.id,
-      prompt: toolCallTestPrompt,
-      messages: [userMessage],
-      traceEvents: [],
-      status: 'running',
-    }
-    let unlisten: UnlistenFn | null = null
+  const showToolsCommand = async (projectId: string, prompt: string) => {
+    const sessionTaskId = currentTask?.id ?? crypto.randomUUID()
+    const userMessage = createMessage(sessionTaskId, 'user', prompt)
 
     setBusy(true)
-    setSelectedTrace(null)
-    setState((current) => ({
-      ...addOrReplaceSessionTask(current, activeProject.id, pendingTask),
-      traceDrawerOpen: true,
-    }))
-
     try {
-      unlisten = await listen<ToolTraceEvent>(traceEventName, (event) => {
-        const traceEvent = event.payload
-        if (!isToolTraceEvent(traceEvent)) {
-          return
-        }
-        setSelectedTrace((current) => ({
-          taskId: traceEvent.taskId,
-          events:
-            current?.taskId === traceEvent.taskId ?
-              appendTraceEvent(current.events, traceEvent)
-            : [traceEvent],
-        }))
-        setState((current) =>
-          appendTraceEventToSession(current, sessionTaskId, traceEvent),
-        )
-      })
-
-      const run = await runToolCallTest({
-        projectId: activeProject.id,
-        providerId: selection.providerId,
-        credentialId: selection.credentialId,
-        modelId: selection.modelId,
-      })
-      const assistantMessage = createAssistantMessage(run.taskId, run.traces)
-      setSelectedTrace({ taskId: run.taskId, events: run.traces })
-
-      setState((current) =>
-        completeSessionRun(
-          current,
-          sessionTaskId,
-          assistantMessage,
-          run.traces,
-        ),
+      const tools = await listTools()
+      const assistantMessage = createMessage(
+        sessionTaskId,
+        'assistant',
+        formatToolsListMessage(tools),
       )
+      setSelectedTrace(null)
+      setState((current) => ({
+        ...appendMessagesToSession(
+          current,
+          projectId,
+          sessionTaskId,
+          [userMessage, assistantMessage],
+          'completed',
+        ),
+        traceDrawerOpen: false,
+      }))
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught)
       const errorMessage = createMessage(sessionTaskId, 'system', message)
       setState((current) =>
-        appendMessagesToSession(current, activeProject.id, sessionTaskId, [errorMessage], 'failed'),
+        appendMessagesToSession(
+          current,
+          projectId,
+          sessionTaskId,
+          [userMessage, errorMessage],
+          'failed',
+        ),
       )
       showWorkspaceToast('error', message)
     } finally {
-      unlisten?.()
       setBusy(false)
     }
   }
@@ -406,39 +390,6 @@ function Workspace({
     showWorkspaceToast('notice', 'Workspace cleared.')
   }
 
-  const beginTraceResize = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const body = bodyRef.current
-    if (!body) {
-      return
-    }
-    event.preventDefault()
-    event.currentTarget.setPointerCapture(event.pointerId)
-
-    const bodyRect = body.getBoundingClientRect()
-    const minTraceWidth = 340
-    const minChatWidth = 420
-    const maxTraceWidth = Math.max(minTraceWidth, bodyRect.width - minChatWidth)
-
-    const move = (pointerEvent: PointerEvent) => {
-      const nextWidth = Math.min(
-        maxTraceWidth,
-        Math.max(minTraceWidth, bodyRect.right - pointerEvent.clientX),
-      )
-      setTraceWidth(nextWidth)
-      saveTraceWidth(nextWidth)
-    }
-
-    const stop = () => {
-      window.removeEventListener('pointermove', move)
-      window.removeEventListener('pointerup', stop)
-      document.body.classList.remove('workspace-resizing')
-    }
-
-    document.body.classList.add('workspace-resizing')
-    window.addEventListener('pointermove', move)
-    window.addEventListener('pointerup', stop, { once: true })
-  }
-
   if (!activeProject) {
     return (
       <section className="page-section">
@@ -464,11 +415,7 @@ function Workspace({
         onNotice={(message) => showWorkspaceToast('notice', message)}
       />
 
-      <div
-        className={state.traceDrawerOpen ? 'workspace-body trace-open' : 'workspace-body'}
-        style={{ '--trace-width': `${traceWidth}px` } as CSSProperties}
-        ref={bodyRef}
-      >
+      <div className="workspace-body">
         <main className="chat-shell">
           <div className="chat-main">
             <ChatTimeline
@@ -482,6 +429,7 @@ function Workspace({
                 void refreshTrace(taskId)
               }}
               onOpenTrace={openMessageTrace}
+              onEditUserMessage={(message) => setComposerDraft(message.content)}
               onSuggestionSelect={setComposerDraft}
             />
             <Composer
@@ -490,31 +438,21 @@ function Workspace({
               value={composerDraft}
               onChange={setComposerDraft}
               onSend={runTask}
-              onRunToolCallTest={runToolCallTestTask}
             />
           </div>
         </main>
-        {state.traceDrawerOpen ? (
-          <div
-            className="workspace-resizer"
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize Trace panel"
-            onPointerDown={beginTraceResize}
-          />
-        ) : null}
-        <TraceDrawer
-          open={state.traceDrawerOpen}
-          taskId={selectedTrace?.taskId ?? null}
-          traceEvents={selectedTraceEvents}
-          onClose={() =>
-            setState((current) => ({
-              ...current,
-              traceDrawerOpen: false,
-            }))
-          }
-        />
       </div>
+      <TraceDrawer
+        open={state.traceDrawerOpen}
+        taskId={selectedTrace?.taskId ?? null}
+        traceEvents={selectedTraceEvents}
+        onClose={() =>
+          setState((current) => ({
+            ...current,
+            traceDrawerOpen: false,
+          }))
+        }
+      />
     </section>
   )
 }
@@ -575,6 +513,7 @@ function completeSessionRun(
   sessionTaskId: string,
   assistantMessage: ChatMessage,
   traces: ToolTraceEvent[],
+  pendingAssistantMessageId: string,
 ): AppState {
   const task = state.tasksById[sessionTaskId]
   if (!task) {
@@ -592,7 +531,7 @@ function completeSessionRun(
       ...state.tasksById,
       [sessionTaskId]: {
         ...task,
-        messages: [...task.messages, assistantMessage],
+        messages: replaceMessageById(task.messages, pendingAssistantMessageId, assistantMessage),
         traceEvents: traces,
         status: failed ? 'failed' : 'completed',
       },
@@ -643,6 +582,7 @@ function appendTraceEventToSession(
   state: AppState,
   sessionTaskId: string,
   traceEvent: ToolTraceEvent,
+  pendingAssistantMessageId?: string,
 ): AppState {
   const task = state.tasksById[sessionTaskId]
   if (!task) {
@@ -656,6 +596,52 @@ function appendTraceEventToSession(
       [sessionTaskId]: {
         ...task,
         traceEvents: appendTraceEvent(task.traceEvents, traceEvent),
+        messages:
+          pendingAssistantMessageId ?
+            task.messages.map((message) =>
+              message.id === pendingAssistantMessageId ?
+                {
+                  ...message,
+                  taskId: traceEvent.taskId,
+                  traceEvents: appendTraceEvent(message.traceEvents ?? [], traceEvent),
+                  status: 'running',
+                }
+              : message,
+            )
+          : task.messages,
+      },
+    },
+  }
+}
+
+function failSessionRun(
+  state: AppState,
+  projectId: string,
+  sessionTaskId: string,
+  pendingAssistantMessageId: string,
+  error: string,
+): AppState {
+  const task = state.tasksById[sessionTaskId]
+  const failedMessage: ChatMessage = {
+    ...createMessage(sessionTaskId, 'assistant', `Run failed: ${error}`),
+    id: pendingAssistantMessageId,
+    status: 'failed',
+    traceEvents: task?.traceEvents ?? [],
+  }
+
+  if (!task) {
+    return appendMessagesToSession(state, projectId, sessionTaskId, [failedMessage], 'failed')
+  }
+
+  return {
+    ...state,
+    currentWorkspaceTaskId: sessionTaskId,
+    tasksById: {
+      ...state.tasksById,
+      [sessionTaskId]: {
+        ...task,
+        messages: replaceMessageById(task.messages, pendingAssistantMessageId, failedMessage),
+        status: 'failed',
       },
     },
   }
@@ -687,6 +673,12 @@ function createConversationMessages(messages: ChatMessage[]): AgentConversationM
     .map((message) => ({
       role: message.role,
       content: message.content,
+      attachments: message.attachments?.map(({ kind, name, mimeType, dataUrl }) => ({
+        kind,
+        name,
+        mimeType,
+        dataUrl,
+      })),
     }))
 }
 
@@ -694,20 +686,32 @@ function createMessage(
   taskId: string,
   role: ChatMessage['role'],
   content: string,
+  attachments?: MessageAttachment[],
 ): ChatMessage {
   return {
     id: crypto.randomUUID(),
     taskId,
     role,
     content,
+    ...(attachments && attachments.length > 0 ? { attachments } : {}),
     createdAt: new Date().toISOString(),
+  }
+}
+
+function createPendingAssistantMessage(taskId: string): ChatMessage {
+  return {
+    ...createMessage(taskId, 'assistant', 'Working...'),
+    status: 'running',
+    traceEvents: [],
   }
 }
 
 function createAssistantMessage(
   taskId: string,
   traces: ToolTraceEvent[],
+  messageId?: string,
 ): ChatMessage {
+  const failed = hasFailedTrace(traces)
   const summary =
     traces.find((event) => event.type === 'final_response')?.outputSummary ??
     traces.find((event) => event.type === 'model_message')?.outputSummary ??
@@ -719,9 +723,46 @@ function createAssistantMessage(
 
   return {
     ...createMessage(taskId, 'assistant', content),
+    ...(messageId ? { id: messageId } : {}),
     codeLinks: links,
     traceEvents: traces,
+    status: failed ? 'failed' : 'completed',
   }
+}
+
+function replaceMessageById(
+  messages: ChatMessage[],
+  messageId: string,
+  replacement: ChatMessage,
+): ChatMessage[] {
+  let replaced = false
+  const nextMessages = messages.map((message) => {
+    if (message.id !== messageId) {
+      return message
+    }
+    replaced = true
+    return {
+      ...replacement,
+      createdAt: message.createdAt,
+    }
+  })
+  return replaced ? nextMessages : [...messages, replacement]
+}
+
+function isListToolsCommand(prompt: string): boolean {
+  const command = prompt.trim().toLowerCase()
+  return command === '/skill' || command === '/skills'
+}
+
+function formatToolsListMessage(tools: ToolDefinitionSummary[]): string {
+  if (tools.length === 0) {
+    return 'No tools are currently registered.'
+  }
+  const lines = tools.map((tool) => {
+    const description = tool.description.trim()
+    return description ? `- \`${tool.name}\` - ${description}` : `- \`${tool.name}\``
+  })
+  return [`Registered tools (${tools.length}):`, '', ...lines].join('\n')
 }
 
 function hasFailedTrace(traces: ToolTraceEvent[]): boolean {
@@ -751,28 +792,6 @@ function normalizeCodeLinkError(message: string): string {
 }
 
 export default Workspace
-
-function loadTraceWidth(): number {
-  if (typeof window === 'undefined') {
-    return 560
-  }
-  const value = Number(window.localStorage.getItem('snowagent.traceWidth'))
-  if (!Number.isFinite(value)) {
-    return 560
-  }
-  return Math.min(900, Math.max(340, value))
-}
-
-function saveTraceWidth(width: number): void {
-  if (typeof window === 'undefined') {
-    return
-  }
-  try {
-    window.localStorage.setItem('snowagent.traceWidth', String(Math.round(width)))
-  } catch {
-    // Best-effort UI preference.
-  }
-}
 
 function rectsIntersect(left: DOMRect, right: DOMRect): boolean {
   return (

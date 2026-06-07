@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import type { CSSProperties } from 'react'
 import {
   CheckCircle2,
   ChevronDown,
@@ -6,6 +7,9 @@ import {
   CircleAlert,
   Clock3,
   LoaderCircle,
+  Maximize2,
+  Minimize2,
+  WrapText,
 } from 'lucide-react'
 import type { TraceStepViewModel } from './traceViewModel'
 
@@ -103,7 +107,7 @@ function RawToggle({
       <button type="button" className="trace-raw-toggle" onClick={onToggle}>
         {open ? label.replace('View', 'Hide') : label}
       </button>
-      {open ? <pre className="trace-raw-code">{formatRawJson(value)}</pre> : null}
+      {open ? <JsonTree value={orderRawJson(value)} /> : null}
     </div>
   )
 }
@@ -145,8 +149,197 @@ const preferredRawJsonKeyOrder = [
   'after',
 ]
 
-function formatRawJson(value: unknown): string {
-  return JSON.stringify(orderRawJson(value), null, 2)
+function JsonTree({ value }: { value: unknown }) {
+  const [expansionCommand, setExpansionCommand] = useState<JsonTreeExpansionCommand>({
+    open: null,
+    version: 0,
+  })
+  const [lineWrap, setLineWrap] = useState(true)
+  const complex = isComplexJson(value)
+  const treeClass =
+    lineWrap ? 'trace-raw-code trace-json-tree is-wrapped' : 'trace-raw-code trace-json-tree'
+
+  const setAllNodesOpen = (open: boolean) => {
+    setExpansionCommand((current) => ({
+      open,
+      version: current.version + 1,
+    }))
+  }
+
+  return (
+    <div className={treeClass}>
+      {complex ? (
+        <div className="trace-json-tree-toolbar" aria-label="JSON tree controls">
+          <button
+            type="button"
+            className={
+              lineWrap ? 'trace-json-tree-action active' : 'trace-json-tree-action'
+            }
+            onClick={() => setLineWrap((current) => !current)}
+            title={lineWrap ? 'Disable line wrap' : 'Enable line wrap'}
+            aria-label={lineWrap ? 'Disable JSON line wrap' : 'Enable JSON line wrap'}
+            aria-pressed={lineWrap}
+          >
+            <WrapText size={14} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className="trace-json-tree-action"
+            onClick={() => setAllNodesOpen(false)}
+            title="Collapse all"
+            aria-label="Collapse all JSON nodes"
+          >
+            <Minimize2 size={14} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className="trace-json-tree-action"
+            onClick={() => setAllNodesOpen(true)}
+            title="Expand all"
+            aria-label="Expand all JSON nodes"
+          >
+            <Maximize2 size={14} aria-hidden="true" />
+          </button>
+        </div>
+      ) : null}
+      <JsonNode value={value} depth={0} expansionCommand={expansionCommand} />
+    </div>
+  )
+}
+
+type JsonTreeExpansionCommand = {
+  open: boolean | null
+  version: number
+}
+
+function JsonNode({
+  label,
+  value,
+  depth,
+  expansionCommand,
+}: {
+  label?: string
+  value: unknown
+  depth: number
+  expansionCommand: JsonTreeExpansionCommand
+}) {
+  const complex = isComplexJson(value)
+  const [open, setOpen] = useState(() => expansionCommand.open ?? depth === 0)
+
+  useEffect(() => {
+    if (expansionCommand.open !== null) {
+      setOpen(expansionCommand.open)
+    }
+  }, [expansionCommand.open, expansionCommand.version])
+
+  if (!complex) {
+    return (
+      <div className="trace-json-node" style={jsonNodeStyle(depth)}>
+        {label ? <span className="trace-json-key">{label}: </span> : null}
+        <JsonPrimitive value={value} />
+      </div>
+    )
+  }
+
+  const entries = jsonEntries(value)
+  const bracket = Array.isArray(value) ? ['[', ']'] : ['{', '}']
+  const summary = Array.isArray(value) ? `${entries.length} items` : `${entries.length} keys`
+
+  return (
+    <div className="trace-json-group">
+      <button
+        type="button"
+        className="trace-json-node trace-json-branch"
+        style={jsonNodeStyle(depth)}
+        onClick={() => setOpen((current) => !current)}
+        aria-expanded={open}
+      >
+        {open ? (
+          <ChevronDown size={14} aria-hidden="true" />
+        ) : (
+          <ChevronRight size={14} aria-hidden="true" />
+        )}
+        {label ? <span className="trace-json-key">{label}: </span> : null}
+        <span>{bracket[0]}</span>
+        {!open ? <span className="trace-json-muted"> {summary} </span> : null}
+        {!open ? <span>{bracket[1]}</span> : null}
+      </button>
+      {open ? (
+        <div className="trace-json-children">
+          {entries.map(([entryLabel, entryValue]) => (
+            <JsonNode
+              key={entryLabel}
+              label={entryLabel}
+              value={entryValue}
+              depth={depth + 1}
+              expansionCommand={expansionCommand}
+            />
+          ))}
+          <div className="trace-json-node trace-json-close" style={jsonNodeStyle(depth)}>
+            {bracket[1]}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function JsonPrimitive({ value }: { value: unknown }) {
+  if (typeof value === 'string') {
+    return <JsonString value={value} />
+  }
+  if (typeof value === 'number') {
+    return <span className="trace-json-number">{String(value)}</span>
+  }
+  if (typeof value === 'boolean') {
+    return <span className="trace-json-boolean">{String(value)}</span>
+  }
+  if (value === null) {
+    return <span className="trace-json-null">null</span>
+  }
+  return <span>{JSON.stringify(value)}</span>
+}
+
+function JsonString({ value }: { value: string }) {
+  const lines = value.split(/\r\n|\r|\n/)
+  if (lines.length === 1) {
+    return <span className="trace-json-string">{JSON.stringify(value)}</span>
+  }
+
+  return (
+    <span className="trace-json-string trace-json-string-multiline">
+      <span>"{escapeJsonStringContent(lines[0])}</span>
+      {lines.slice(1).map((line, index) => (
+        <span key={index}>
+          <br />
+          {escapeJsonStringContent(line)}
+        </span>
+      ))}
+      <span>"</span>
+    </span>
+  )
+}
+
+function escapeJsonStringContent(value: string): string {
+  return JSON.stringify(value).slice(1, -1)
+}
+
+function jsonNodeStyle(depth: number): CSSProperties {
+  return { '--json-depth': depth } as CSSProperties
+}
+
+function isComplexJson(value: unknown): boolean {
+  return Array.isArray(value) || isRecord(value)
+}
+
+function jsonEntries(value: unknown): Array<[string, unknown]> {
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => [String(index), entry])
+  }
+  if (isRecord(value)) {
+    return Object.entries(value)
+  }
+  return []
 }
 
 function orderRawJson(value: unknown): unknown {

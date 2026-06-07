@@ -5,6 +5,7 @@ use crate::app_state::{current_settings, lock_error, AppState};
 use crate::code_link::{self, OpenCodeLinkResult, OpenFilePayload};
 use crate::process_manager;
 use crate::project_registry::{ProjectInput, ProjectSession};
+use crate::tool_registry;
 use crate::tool_trace::{self, MockAgentRun, ToolTraceEvent, TraceEventType, TraceStatus};
 use crate::vs_bridge_service;
 use crate::vs_registry::{
@@ -19,6 +20,13 @@ pub struct OpenVisualStudioResult {
     pub process_id: u32,
     pub devenv_path: String,
     pub message: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDefinitionSummary {
+    pub name: String,
+    pub description: String,
 }
 
 #[tauri::command]
@@ -112,6 +120,23 @@ pub fn heartbeat_vs_instance(
 pub fn list_vs_instances(state: State<'_, AppState>) -> Result<Vec<VSInstance>, String> {
     let registry = state.vs_registry.lock().map_err(|_| lock_error())?;
     Ok(registry.list())
+}
+
+#[tauri::command]
+pub fn list_tools() -> Result<Vec<ToolDefinitionSummary>, String> {
+    Ok(tool_registry::tool_definitions()
+        .into_iter()
+        .filter_map(|definition| {
+            let function = definition.get("function")?;
+            let name = function.get("name")?.as_str()?.to_string();
+            let description = function
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(ToolDefinitionSummary { name, description })
+        })
+        .collect())
 }
 
 #[tauri::command]

@@ -1,6 +1,19 @@
 {
   "providers": [
     {
+      "id": "codex-cli",
+      "type": "codex-cli",
+      "name": "Codex CLI",
+      "enabled": true,
+      "baseUrl": "",
+      "baseUrlLocked": true,
+      "defaultCredentialId": "",
+      "defaultModel": "default",
+      "temperature": 0.2,
+      "credentials": [],
+      "models": []
+    },
+    {
       "id": "openai-compatible",
       "type": "openai-compatible",
       "name": "OpenAI-Compatible",

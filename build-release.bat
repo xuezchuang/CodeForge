@@ -1,22 +1,29 @@
 @echo off
-setlocal
-
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
+set "LAST_EXIT=0"
 
-echo Building CodeForge release...
-call npm run tauri build
+echo Building CodeForge release binary without installer bundles...
+call npm run tauri build -- --no-bundle
 if errorlevel 1 (
   echo.
-  echo Release build failed with exit code %errorlevel%.
-  exit /b %errorlevel%
+  echo Release binary build failed with exit code %errorlevel%.
+  set "LAST_EXIT=!errorlevel!"
+  goto :__done
 )
 
 echo.
-echo Release build finished.
+echo Release binary build finished.
 echo App:
 echo   %~dp0src-tauri\target\release\codeforge-desktop.exe
-echo Bundles:
-echo   %~dp0src-tauri\target\release\bundle\nsis\CodeForge_0.1.0_x64-setup.exe
-echo   %~dp0src-tauri\target\release\bundle\msi\CodeForge_0.1.0_x64_en-US.msi
+goto :__done
 
-endlocal
+:__done
+echo.
+if "!LAST_EXIT!" NEQ "0" (
+  echo Build finished with failures. Press any key to close.
+) else (
+  echo Build finished successfully. Press any key to close.
+)
+pause
+exit /b !LAST_EXIT!

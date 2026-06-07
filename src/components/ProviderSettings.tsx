@@ -444,7 +444,7 @@ function ProviderSettings({ providers, onProvidersChanged }: ProviderSettingsPro
                           )
                         }
                       >
-                        {providers.map((provider) => (
+                        {providers.filter(providerUsesCredentials).map((provider) => (
                           <option key={provider.id} value={provider.id}>
                             {providerTypeLabels[provider.type] ?? provider.name}
                           </option>
@@ -584,10 +584,7 @@ function ProviderSettings({ providers, onProvidersChanged }: ProviderSettingsPro
         ) : (
           <div className="selected-models-table">
             <div className="selected-models-row selected-models-head">
-              <span>Display Name</span>
-              <span>Provider</span>
-              <span>Key Alias</span>
-              <span>Model ID</span>
+              <span>Model</span>
               <span>Status</span>
               <span>Actions</span>
             </div>
@@ -607,9 +604,6 @@ function ProviderSettings({ providers, onProvidersChanged }: ProviderSettingsPro
                       row.model.name || row.model.id
                     )}
                   </span>
-                  <span>{row.provider.name}</span>
-                  <span>{row.credential ? credentialAlias(row.credential) : 'default'}</span>
-                  <span className="model-id-cell">{row.model.id}</span>
                   <label className="selected-model-switch">
                     <input
                       type="checkbox"
@@ -617,8 +611,12 @@ function ProviderSettings({ providers, onProvidersChanged }: ProviderSettingsPro
                       onChange={(event) =>
                         updateSelectedModel(row, { enabled: event.target.checked })
                       }
+                      aria-label={
+                        row.model.enabled ?
+                          `${row.model.name || row.model.id} enabled`
+                        : `${row.model.name || row.model.id} disabled`
+                      }
                     />
-                    <span>{row.model.enabled ? 'Enabled' : 'Disabled'}</span>
                   </label>
                   <span className="selected-model-actions">
                     <button
@@ -659,6 +657,7 @@ function buildProviderKeyCards(
   fetchStateByCardId: Record<string, FetchState>,
 ): ProviderKeyCard[] {
   return providers.flatMap((provider) =>
+    providerUsesCredentials(provider) ?
     (provider.credentials ?? []).map((credential) => {
       const id = cardId(provider.id, credential.id)
       return {
@@ -668,7 +667,8 @@ function buildProviderKeyCards(
         selectedCount: selectedModelIdsForCredential(provider, credential.id).length,
         fetchState: fetchStateByCardId[id] ?? { status: 'not-fetched' },
       }
-    }),
+    })
+    : [],
   )
 }
 
@@ -835,15 +835,21 @@ function finalizeProvider(provider: ProviderConfig): ProviderConfig {
   const models = normalizeModels(provider, provider.models ?? [], credentials)
   const enabledCredential = credentials.find((credential) => credential.enabled)
   const enabledModel = models.find((model) => model.enabled)
+  const usesCredentials = providerUsesCredentials(provider)
+  const enabledWithoutCredentials =
+    provider.type === 'codex-cli'
+      ? provider.enabled && provider.defaultModel.trim().length > 0
+      : Boolean(enabledModel)
 
   return {
     ...provider,
     apiKey: undefined,
-    enabled: Boolean(enabledCredential && enabledModel),
+    enabled:
+      usesCredentials ? Boolean(enabledCredential && enabledModel) : enabledWithoutCredentials,
     baseUrl: isMiniMax(provider) ? minimaxOpenAiBaseUrl : provider.baseUrl,
     baseUrlLocked: isMiniMax(provider) ? true : provider.baseUrlLocked,
     credentials,
-    defaultCredentialId: enabledCredential?.id ?? credentials[0]?.id ?? '',
+    defaultCredentialId: usesCredentials ? enabledCredential?.id ?? credentials[0]?.id ?? '' : '',
     defaultModel: enabledModel?.id ?? models[0]?.id ?? provider.defaultModel,
     models,
   }
@@ -873,10 +879,12 @@ function normalizeModels(
     .map((model) => {
       const id = model.id.trim()
       const credentialId =
-        model.credentialId?.trim() ||
-        provider.defaultCredentialId ||
-        credentials[0]?.id ||
-        ''
+        providerUsesCredentials(provider) ?
+          model.credentialId?.trim() ||
+          provider.defaultCredentialId ||
+          credentials[0]?.id ||
+          ''
+        : ''
       return {
         ...model,
         id,
@@ -940,6 +948,9 @@ function statusLabel(status: FetchStatus): string {
 }
 
 function providerBrandClass(provider: ProviderConfig): string {
+  if (provider.id === 'codex-cli' || provider.type === 'codex-cli') {
+    return 'provider-key-brand codex-cli'
+  }
   if (isMiniMax(provider)) {
     return 'provider-key-brand minimax'
   }
@@ -958,6 +969,10 @@ function maskApiKey(apiKey: string | undefined): string {
 
 function isMiniMax(provider: ProviderConfig): boolean {
   return provider.id === 'minimax' || provider.type === 'minimax'
+}
+
+function providerUsesCredentials(provider: ProviderConfig): boolean {
+  return provider.type !== 'ollama' && provider.type !== 'codex-cli'
 }
 
 function modelTags(modelId: string): string[] {

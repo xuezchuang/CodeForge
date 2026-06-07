@@ -67,9 +67,33 @@ namespace SnowAgent.VSBridge
                 }
 
                 BridgeResponse response;
-                if (requestLine.StartsWith("POST /openFile ", StringComparison.OrdinalIgnoreCase))
+                if (IsPost(requestLine, "/openFile"))
                 {
                     response = await HandleOpenFileAsync(request.Body).ConfigureAwait(false);
+                }
+                else if (IsPost(requestLine, "/currentSolution"))
+                {
+                    response = await package.CurrentSolutionAsync().ConfigureAwait(false);
+                }
+                else if (IsPost(requestLine, "/currentDocument"))
+                {
+                    response = await package.CurrentDocumentAsync().ConfigureAwait(false);
+                }
+                else if (IsPost(requestLine, "/currentSelection"))
+                {
+                    response = await package.CurrentSelectionAsync().ConfigureAwait(false);
+                }
+                else if (IsPost(requestLine, "/listProjects"))
+                {
+                    response = await package.ListProjectsAsync().ConfigureAwait(false);
+                }
+                else if (IsPost(requestLine, "/listProjectFiles"))
+                {
+                    response = await HandleListProjectFilesAsync(request.Body).ConfigureAwait(false);
+                }
+                else if (IsPost(requestLine, "/getErrorList"))
+                {
+                    response = await package.GetErrorListAsync().ConfigureAwait(false);
                 }
                 else
                 {
@@ -78,6 +102,11 @@ namespace SnowAgent.VSBridge
 
                 await WriteResponseAsync(stream, response, token).ConfigureAwait(false);
             }
+        }
+
+        private static bool IsPost(string requestLine, string path)
+        {
+            return requestLine.StartsWith("POST " + path + " ", StringComparison.OrdinalIgnoreCase);
         }
 
         private static async Task<HttpRequestData> ReadRequestAsync(NetworkStream stream, CancellationToken token)
@@ -163,10 +192,32 @@ namespace SnowAgent.VSBridge
             }
         }
 
+        private async Task<BridgeResponse> HandleListProjectFilesAsync(string body)
+        {
+            try
+            {
+                var request = string.IsNullOrWhiteSpace(body)
+                    ? new ProjectFilesRequest()
+                    : JsonUtil.Deserialize<ProjectFilesRequest>(body);
+                return await package.ListProjectFilesAsync(request).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                return new ProjectFilesResponse
+                {
+                    Ok = false,
+                    Message = ex.Message,
+                    ProjectName = null,
+                    Files = new ProjectFileDto[0],
+                    Truncated = false,
+                };
+            }
+        }
+
         private static async Task WriteResponseAsync(Stream stream, BridgeResponse response, CancellationToken token)
         {
             var status = response.Ok ? "200 OK" : "400 Bad Request";
-            var json = JsonUtil.Serialize(response);
+            var json = JsonUtil.Serialize(response, response.GetType());
             var body = Encoding.UTF8.GetBytes(json);
             var header = Encoding.ASCII.GetBytes(
                 "HTTP/1.1 " + status + "\r\n" +

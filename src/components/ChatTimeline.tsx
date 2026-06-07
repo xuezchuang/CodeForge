@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import ChatMessage from './ChatMessage'
 import type { AgentTask, ChatMessage as ChatMessageModel } from '../types/task'
 
@@ -8,6 +9,7 @@ interface ChatTimelineProps {
   onCodeLinkError: (message: string) => void
   onTraceChanged: (taskId: string) => void
   onOpenTrace: (message: ChatMessageModel) => void
+  onEditUserMessage: (message: ChatMessageModel) => void
   onSuggestionSelect: (prompt: string) => void
 }
 
@@ -18,8 +20,28 @@ function ChatTimeline({
   onCodeLinkError,
   onTraceChanged,
   onOpenTrace,
+  onEditUserMessage,
   onSuggestionSelect,
 }: ChatTimelineProps) {
+  const timelineRef = useRef<HTMLDivElement>(null)
+  const traceActivityKey =
+    task ?
+      `${task.id}:${task.messages.length}:${task.traceEvents.length}:${task.messages
+        .map((message) => message.traceEvents?.length ?? 0)
+        .join(',')}`
+    : ''
+
+  useEffect(() => {
+    if (task?.status !== 'running') {
+      return
+    }
+    const timeline = timelineRef.current
+    if (!timeline) {
+      return
+    }
+    timeline.scrollTop = timeline.scrollHeight
+  }, [task?.status, traceActivityKey])
+
   if (!task) {
     return (
       <div className="chat-empty">
@@ -47,7 +69,7 @@ function ChatTimeline({
   }
 
   return (
-    <div className="chat-timeline">
+    <div className="chat-timeline" ref={timelineRef}>
       {task.messages.map((message) => (
         <ChatMessage
           key={message.id}
@@ -57,6 +79,7 @@ function ChatTimeline({
           onCodeLinkError={onCodeLinkError}
           onTraceChanged={onTraceChanged}
           onOpenTrace={onOpenTrace}
+          onEditUserMessage={onEditUserMessage}
         />
       ))}
     </div>

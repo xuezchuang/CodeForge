@@ -1,10 +1,13 @@
 use std::time::{Duration, Instant};
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::codex_cli_runner::{self, CODEX_CLI_PROVIDER_TYPE, CODEX_CLI_TOOL_NAME};
 use crate::project_registry::ProjectSession;
 use crate::tool_registry::{self, ToolExecutionContext, CALCULATOR_ADD_TOOL_NAME};
 use crate::tool_trace::{self, MockAgentRun, ToolTraceEvent, TraceEventType, TraceStatus};
@@ -30,6 +33,17 @@ pub struct AgentRunInput {
 pub struct AgentConversationMessage {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<AgentMessageAttachment>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessageAttachment {
+    pub kind: String,
+    pub name: String,
+    pub mime_type: String,
+    pub data_url: String,
 }
 
 #[derive(Clone)]
@@ -53,6 +67,8 @@ impl SelectedModel {
 struct ChatMessage {
     role: String,
     content: String,
+    #[serde(skip)]
+    attachments: Vec<AgentMessageAttachment>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -261,13 +277,25 @@ pub async fn run_agent(
     );
 
     let mut step_index = 3;
+    if codex_cli_runner::is_codex_cli_provider(&selected.provider.provider_type) {
+        record_codex_cli_completion(
+            project,
+            &selected,
+            &conversation_messages,
+            &task_id,
+            &mut traces,
+            &mut step_index,
+            &mut on_trace,
+        )
+        .await;
+        return Ok(MockAgentRun { task_id, traces });
+    }
+
     if supports_openai_tool_calls(&selected) {
-        let initial_messages = build_messages(project, &conversation_messages)
-            .into_iter()
-            .map(|message| json!(message))
-            .collect::<Vec<_>>();
+        let initial_messages = build_openai_messages(project, &conversation_messages);
         let tool_context = ToolExecutionContext {
             workspace_root: &project.repo_root,
+            vs_bridge_endpoint: project.vs_bridge_endpoint.as_deref(),
         };
         run_openai_tool_agent_loop(
             &task_id,
@@ -355,7 +383,7 @@ pub async fn run_tool_call_test(
 
     if matches!(
         selected.provider.provider_type.as_str(),
-        "claude" | "ollama"
+        "claude" | "ollama" | CODEX_CLI_PROVIDER_TYPE
     ) {
         let error =
             "Run Tool Call Test supports OpenAI-compatible Chat Completions providers only.";
@@ -380,6 +408,7 @@ pub async fn run_tool_call_test(
     let initial_messages = build_tool_call_test_messages(project);
     let tool_context = ToolExecutionContext {
         workspace_root: &project.repo_root,
+        vs_bridge_endpoint: project.vs_bridge_endpoint.as_deref(),
     };
     run_openai_tool_agent_loop(
         &task_id,
@@ -422,7 +451,7 @@ async fn run_openai_tool_agent_loop(
                 TraceEventType::LlmRequest,
                 None,
                 &request_title,
-                Some(request.clone()),
+                Some(redact_trace_value(&request)),
                 None,
                 Some(request_summary(&request)),
                 TraceStatus::Success,
@@ -441,7 +470,7 @@ async fn run_openai_tool_agent_loop(
                         task_id,
                         *step_index,
                         &format!("{request_title} failed"),
-                        Some(request),
+                        Some(redact_trace_value(&request)),
                         &error,
                     ),
                     on_trace,
@@ -461,7 +490,7 @@ async fn run_openai_tool_agent_loop(
                 None,
                 &response_title,
                 Some(json!({
-                    "request": completion.request_body.clone(),
+                    "request": redact_trace_value(&completion.request_body),
                 })),
                 Some(completion.response_body.clone()),
                 Some(response_summary(&completion.response_body)),
@@ -591,7 +620,9 @@ async fn run_openai_tool_agent_loop(
                 tool_context,
                 &tool_call.function.name,
                 &arguments,
-            ) {
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(error) => {
                     let tool_result = tool_error_result(&error);
@@ -687,7 +718,7 @@ fn push_final_response_trace(
             None,
             title,
             Some(json!({
-                "request": completion.request_body.clone(),
+                "request": redact_trace_value(&completion.request_body),
             })),
             Some(json!({
                 "response": completion.response_body.clone(),
@@ -720,6 +751,7 @@ async fn record_plain_provider_completion(
         Ok(completion) => {
             let message = completion.message;
             let message_chars = message.chars().count();
+            let trace_request = redact_trace_value(&completion.request_body);
             push_trace(
                 traces,
                 trace(
@@ -732,7 +764,7 @@ async fn record_plain_provider_completion(
                         "provider": selected.provider.name,
                         "type": selected.provider.provider_type,
                         "baseUrl": selected.provider.base_url,
-                        "request": completion.request_body,
+                        "request": trace_request,
                     })),
                     Some(json!({
                         "provider": selected.provider.name,
@@ -798,10 +830,196 @@ async fn record_plain_provider_completion(
     }
 }
 
+async fn record_codex_cli_completion(
+    project: &ProjectSession,
+    selected: &SelectedModel,
+    conversation_messages: &[ChatMessage],
+    task_id: &str,
+    traces: &mut Vec<ToolTraceEvent>,
+    step_index: &mut u32,
+    on_trace: &mut impl FnMut(&ToolTraceEvent),
+) {
+    let prompt = build_codex_cli_prompt(project, conversation_messages);
+    let model_override = codex_cli_runner::model_override(&selected.model_id);
+    push_trace(
+        traces,
+        trace(
+            task_id,
+            *step_index,
+            TraceEventType::ToolCall,
+            Some(CODEX_CLI_TOOL_NAME),
+            "codex_exec",
+            Some(json!({
+                "provider": selected.provider.name,
+                "type": selected.provider.provider_type,
+                "workspaceRoot": project.repo_root,
+                "sandbox": "workspace-write",
+                "model": selected.model_id,
+                "modelOverride": model_override,
+                "prompt": prompt.clone(),
+            })),
+            None,
+            Some("codex exec --json".to_string()),
+            TraceStatus::Success,
+            0,
+        ),
+        on_trace,
+    );
+    *step_index += 1;
+
+    match codex_cli_runner::execute(&project.repo_root, &prompt, model_override).await {
+        Ok(execution) => {
+            let usage = codex_cli_runner::token_usage_from_codex_usage(execution.usage.as_ref());
+            let duration_ms = execution.duration_ms;
+            let exit_code = execution.exit_code;
+            let timed_out = execution.timed_out;
+            let final_message = execution.final_message.clone();
+            let output = json!({
+                "executable": execution.executable,
+                "args": execution.args,
+                "exitCode": exit_code,
+                "timedOut": timed_out,
+                "durationMs": duration_ms,
+                "stderr": execution.stderr,
+                "stdoutLineCount": execution.stdout.lines().count(),
+                "promptWriteError": execution.prompt_write_error,
+                "events": codex_cli_runner::limited_events(&execution.events),
+                "nonJsonStdoutLines": execution.non_json_stdout_lines,
+                "finalMessage": final_message.clone(),
+                "usage": execution.usage,
+                "tokenUsage": usage.clone(),
+            });
+
+            if timed_out || !exit_code.is_some_and(|code| code == 0) {
+                let summary = if timed_out {
+                    "Codex CLI timed out".to_string()
+                } else {
+                    format!(
+                        "Codex CLI failed with exit code {}",
+                        exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    )
+                };
+                push_trace(
+                    traces,
+                    trace(
+                        task_id,
+                        *step_index,
+                        TraceEventType::Error,
+                        Some(CODEX_CLI_TOOL_NAME),
+                        "codex_exec failed",
+                        Some(json!({
+                            "provider": selected.provider.name,
+                            "type": selected.provider.provider_type,
+                            "workspaceRoot": project.repo_root,
+                            "model": selected.model_id,
+                        })),
+                        Some(output),
+                        Some(summary),
+                        TraceStatus::Failed,
+                        duration_ms,
+                    ),
+                    on_trace,
+                );
+                *step_index += 1;
+                return;
+            }
+
+            let final_message = final_message.trim().to_string();
+            let message_chars = final_message.chars().count();
+            let summary = if final_message.is_empty() {
+                "Codex CLI completed without a final message".to_string()
+            } else {
+                format!("Codex CLI returned {message_chars} chars")
+            };
+            let status = if final_message.is_empty() {
+                TraceStatus::Warning
+            } else {
+                TraceStatus::Success
+            };
+
+            push_trace(
+                traces,
+                trace(
+                    task_id,
+                    *step_index,
+                    TraceEventType::ToolResult,
+                    Some(CODEX_CLI_TOOL_NAME),
+                    "codex_exec",
+                    Some(json!({
+                        "provider": selected.provider.name,
+                        "type": selected.provider.provider_type,
+                        "workspaceRoot": project.repo_root,
+                        "model": selected.model_id,
+                    })),
+                    Some(output),
+                    Some(summary),
+                    status.clone(),
+                    duration_ms,
+                ),
+                on_trace,
+            );
+            *step_index += 1;
+
+            push_trace(
+                traces,
+                trace(
+                    task_id,
+                    *step_index,
+                    TraceEventType::FinalResponse,
+                    None,
+                    "final_response",
+                    Some(json!({
+                        "provider": selected.provider.name,
+                        "type": selected.provider.provider_type,
+                        "model": selected.model_id,
+                    })),
+                    Some(json!({
+                        "message": final_message,
+                        "provider": selected.provider.name,
+                        "type": selected.provider.provider_type,
+                        "model": selected.model_id,
+                        "tokenUsage": usage,
+                    })),
+                    Some(if final_message.is_empty() {
+                        "Final response was empty".to_string()
+                    } else {
+                        final_message
+                    }),
+                    status,
+                    0,
+                ),
+                on_trace,
+            );
+            *step_index += 1;
+        }
+        Err(error) => {
+            push_trace(
+                traces,
+                error_trace(
+                    task_id,
+                    *step_index,
+                    "codex_exec failed",
+                    Some(json!({
+                        "provider": selected.provider.name,
+                        "type": selected.provider.provider_type,
+                        "workspaceRoot": project.repo_root,
+                        "model": selected.model_id,
+                    })),
+                    &error,
+                ),
+                on_trace,
+            );
+            *step_index += 1;
+        }
+    }
+}
+
 fn supports_openai_tool_calls(selected: &SelectedModel) -> bool {
     !matches!(
         selected.provider.provider_type.as_str(),
-        "claude" | "ollama"
+        "claude" | "ollama" | CODEX_CLI_PROVIDER_TYPE
     )
 }
 
@@ -843,13 +1061,10 @@ fn select_model(
         .filter(|value| {
             !value.trim().is_empty()
                 && ((provider.models.is_empty())
-                    || provider
-                        .models
-                        .iter()
-                        .any(|model| {
-                            model_is_enabled_for_credential(model, credential.as_ref())
-                                && model.id == *value
-                        }))
+                    || provider.models.iter().any(|model| {
+                        model_is_enabled_for_credential(model, credential.as_ref())
+                            && model.id == *value
+                    }))
         })
         .map(str::to_string)
         .or_else(|| {
@@ -890,7 +1105,7 @@ fn model_is_enabled_for_credential(
 
 fn is_provider_usable(provider: &ProviderConfig) -> bool {
     let model_enabled = provider.models.iter().any(|model| model.enabled);
-    if provider.provider_type == "ollama" {
+    if provider.provider_type == "ollama" || provider.provider_type == CODEX_CLI_PROVIDER_TYPE {
         return provider.enabled || model_enabled;
     }
     (provider.enabled
@@ -899,14 +1114,17 @@ fn is_provider_usable(provider: &ProviderConfig) -> bool {
             .credentials
             .iter()
             .any(|credential| credential.enabled))
-        && provider.credentials.iter().any(|credential| credential.enabled)
+        && provider
+            .credentials
+            .iter()
+            .any(|credential| credential.enabled)
 }
 
 fn select_credential(
     provider: &ProviderConfig,
     credential_id: Option<&str>,
 ) -> Result<Option<ProviderCredential>, String> {
-    if provider.provider_type == "ollama" {
+    if provider.provider_type == "ollama" || provider.provider_type == CODEX_CLI_PROVIDER_TYPE {
         return Ok(None);
     }
 
@@ -934,7 +1152,12 @@ fn select_credential(
         .credentials
         .iter()
         .find(|credential| credential.id == provider.default_credential_id && credential.enabled)
-        .or_else(|| provider.credentials.iter().find(|credential| credential.enabled))
+        .or_else(|| {
+            provider
+                .credentials
+                .iter()
+                .find(|credential| credential.enabled)
+        })
         .cloned()
         .map(Some)
         .ok_or_else(|| format!("No enabled credential for provider {}", provider.name))
@@ -951,6 +1174,9 @@ async fn call_provider(
     }
     if provider_type == "ollama" {
         return call_ollama(project, selected, conversation_messages).await;
+    }
+    if provider_type == CODEX_CLI_PROVIDER_TYPE {
+        return Err("Codex CLI provider must be executed through codex exec.".to_string());
     }
     call_openai_compatible(project, selected, conversation_messages).await
 }
@@ -1127,7 +1353,9 @@ fn parse_streaming_chat_completion(body: &str) -> Result<Value, String> {
     }
 
     if !saw_data {
-        return Err(format!("Streaming response had no data chunks. body={body}"));
+        return Err(format!(
+            "Streaming response had no data chunks. body={body}"
+        ));
     }
 
     let tool_calls = streaming_tool_calls_json(&tool_calls);
@@ -1221,10 +1449,7 @@ async fn call_openai_compatible(
     selected: &SelectedModel,
     conversation_messages: &[ChatMessage],
 ) -> Result<ProviderCompletion, String> {
-    let messages = build_messages(project, conversation_messages)
-        .into_iter()
-        .map(|message| json!(message))
-        .collect::<Vec<_>>();
+    let messages = build_openai_messages(project, conversation_messages);
     let request_body = build_chat_completion_request(selected, messages, None);
     let completion = send_chat_completion(selected, &request_body).await?;
     let response_body = completion.response_body.clone();
@@ -1471,11 +1696,14 @@ fn normalize_conversation_messages(
                 _ => return None,
             };
             if message.content.trim().is_empty() {
-                return None;
+                if message.attachments.is_empty() {
+                    return None;
+                }
             }
             Some(ChatMessage {
                 role: role.to_string(),
                 content: message.content.clone(),
+                attachments: message.attachments.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -1484,6 +1712,7 @@ fn normalize_conversation_messages(
         return vec![ChatMessage {
             role: "user".to_string(),
             content: user_prompt.to_string(),
+            attachments: Vec::new(),
         }];
     }
 
@@ -1505,14 +1734,97 @@ fn build_messages(
     let mut messages = vec![ChatMessage {
         role: "system".to_string(),
         content: system_prompt(project),
+        attachments: Vec::new(),
     }];
     messages.extend(conversation_messages.iter().cloned());
     messages
 }
 
+fn build_openai_messages(
+    project: &ProjectSession,
+    conversation_messages: &[ChatMessage],
+) -> Vec<Value> {
+    build_messages(project, conversation_messages)
+        .into_iter()
+        .map(openai_chat_message_value)
+        .collect()
+}
+
+fn openai_chat_message_value(message: ChatMessage) -> Value {
+    if message.attachments.is_empty() {
+        return json!({
+            "role": message.role,
+            "content": message.content,
+        });
+    }
+
+    let mut content_parts = Vec::new();
+    if !message.content.trim().is_empty() {
+        content_parts.push(json!({
+            "type": "text",
+            "text": message.content,
+        }));
+    }
+
+    for attachment in message.attachments {
+        if attachment.kind == "image"
+            && attachment.mime_type.starts_with("image/")
+            && attachment.data_url.starts_with("data:image/")
+        {
+            content_parts.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": attachment.data_url,
+                },
+            }));
+        }
+    }
+
+    json!({
+        "role": message.role,
+        "content": content_parts,
+    })
+}
+
+fn build_codex_cli_prompt(
+    project: &ProjectSession,
+    conversation_messages: &[ChatMessage],
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("You are running as Codex CLI inside CodeForge Desktop.\n");
+    prompt.push_str(
+        "Follow this repository's AGENTS.md and keep all work inside the active workspace.\n",
+    );
+    prompt.push_str("Do not run package managers, installers, deploy commands, or broad build/test scripts unless the user explicitly asks for that exact command. If verification would require one of those commands, report the command instead.\n");
+    prompt.push_str("Keep trace-relevant behavior explicit in your final response: summarize file changes, validation, and any skipped verification.\n\n");
+    prompt.push_str(&format!("Project: {}\n", project.name));
+    prompt.push_str(&format!("Workspace: {}\n\n", project.repo_root));
+    prompt.push_str("Conversation:\n");
+
+    for message in conversation_messages {
+        let role = match message.role.as_str() {
+            "assistant" => "Assistant",
+            _ => "User",
+        };
+        prompt.push_str(role);
+        prompt.push_str(": ");
+        prompt.push_str(message.content.trim());
+        for attachment in &message.attachments {
+            prompt.push_str("\n[Attachment omitted: ");
+            prompt.push_str(attachment.name.trim());
+            prompt.push_str(" (");
+            prompt.push_str(attachment.mime_type.trim());
+            prompt.push_str(")]");
+        }
+        prompt.push_str("\n\n");
+    }
+
+    prompt
+}
+
 fn system_prompt(project: &ProjectSession) -> String {
     format!(
-        "You are SnowAgent Desktop, a coding assistant for the project \"{}\". Repo root: {}. Answer concisely and use clickable file:line references when relevant.",
+        "You are CodeForge Desktop, a coding assistant for the project \"{}\". Repo root: {}. Internal SnowAgent class or path names may remain unchanged. Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Do not claim rg or text search is precise semantic analysis. Do not execute arbitrary shell commands. Answer concisely and use clickable file:line references when relevant.",
         project.name, project.repo_root
     )
 }
@@ -1522,7 +1834,7 @@ fn build_tool_call_test_messages(project: &ProjectSession) -> Vec<Value> {
         json!({
             "role": "system",
             "content": format!(
-                "You are SnowAgent Desktop. For this test you must call the {CALCULATOR_ADD_TOOL_NAME} tool before answering. Project: {}.",
+                "You are CodeForge Desktop. For this test you must call the {CALCULATOR_ADD_TOOL_NAME} tool before answering. Project: {}.",
                 project.name
             ),
         }),
@@ -1595,6 +1907,26 @@ fn extract_message_from_response(response_body: &Value) -> Option<String> {
         .and_then(|choice| choice.message.content)
 }
 
+fn redact_trace_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) if text.starts_with("data:image/") => {
+            let redacted = text
+                .split_once(',')
+                .map(|(prefix, _)| format!("{prefix},<redacted>"))
+                .unwrap_or_else(|| "data:image/*;base64,<redacted>".to_string());
+            Value::String(redacted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_trace_value).collect()),
+        Value::Object(entries) => Value::Object(
+            entries
+                .iter()
+                .map(|(key, item)| (key.clone(), redact_trace_value(item)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
 fn request_summary(request_body: &Value) -> String {
     format!(
         "model={}, tools={}, messages={}",
@@ -1644,6 +1976,37 @@ fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
 }
 
 fn tool_result_summary(result: &Value) -> String {
+    if result.get("source").and_then(Value::as_str) == Some("vsix") {
+        let mut parts = Vec::new();
+        if let Some(status) = result.get("status").and_then(Value::as_str) {
+            parts.push(format!("status={status}"));
+        }
+        if let Some(ok) = result.get("ok").and_then(Value::as_bool) {
+            parts.push(format!("ok={ok}"));
+        }
+        if let Some(message) = result.get("message").and_then(Value::as_str) {
+            parts.push(format!("message={message}"));
+        }
+        if let Some(path) = result.get("path").and_then(Value::as_str) {
+            parts.push(format!("path={path}"));
+        }
+        if let Some(count) = result.get("count").and_then(Value::as_u64) {
+            parts.push(format!("count={count}"));
+        }
+        if let Some(truncated) = result.get("truncated").and_then(Value::as_bool) {
+            parts.push(format!("truncated={truncated}"));
+        }
+        if let Some(text_truncated) = result.get("textTruncated").and_then(Value::as_bool) {
+            parts.push(format!("textTruncated={text_truncated}"));
+        }
+        if let Some(available) = result.get("available").and_then(Value::as_bool) {
+            parts.push(format!("available={available}"));
+        }
+        if !parts.is_empty() {
+            return parts.join(", ");
+        }
+    }
+
     result
         .get("result")
         .map(|value| format!("result={}", compact_json(value)))
@@ -1747,7 +2110,7 @@ mod tests {
         );
 
         assert_eq!(request["tool_choice"], json!("auto"));
-        assert_eq!(array_len(&request, "tools"), 6);
+        assert_eq!(array_len(&request, "tools"), 12);
         assert_eq!(
             request["tools"][0]["function"]["name"],
             json!(CALCULATOR_ADD_TOOL_NAME)

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::codex_cli_runner::{CODEX_CLI_DEFAULT_MODEL, CODEX_CLI_PROVIDER_TYPE};
 use crate::path_utils::normalize_display_path;
 
 pub const MINIMAX_OPENAI_BASE_URL: &str = "https://api.minimaxi.com/v1";
@@ -206,6 +207,7 @@ fn default_workspace_history_days() -> u32 {
 
 fn default_providers() -> Vec<ProviderConfig> {
     vec![
+        codex_cli_provider(),
         provider(
             "openai-compatible",
             "openai-compatible",
@@ -250,6 +252,23 @@ fn default_providers() -> Vec<ProviderConfig> {
             "local-default",
         ),
     ]
+}
+
+fn codex_cli_provider() -> ProviderConfig {
+    ProviderConfig {
+        id: CODEX_CLI_PROVIDER_TYPE.to_string(),
+        provider_type: CODEX_CLI_PROVIDER_TYPE.to_string(),
+        name: "Codex CLI".to_string(),
+        enabled: true,
+        base_url: String::new(),
+        base_url_locked: true,
+        api_key: String::new(),
+        default_credential_id: String::new(),
+        default_model: CODEX_CLI_DEFAULT_MODEL.to_string(),
+        temperature: 0.2,
+        credentials: Vec::new(),
+        models: Vec::new(),
+    }
 }
 
 fn provider(id: &str, provider_type: &str, name: &str, default_model: &str) -> ProviderConfig {
@@ -325,12 +344,46 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
         .map(|provider| {
             let id = provider.id.trim().to_string();
             let provider_type = provider.provider_type.trim().to_string();
+            if id == CODEX_CLI_PROVIDER_TYPE || provider_type == CODEX_CLI_PROVIDER_TYPE {
+                return ProviderConfig {
+                    id: CODEX_CLI_PROVIDER_TYPE.to_string(),
+                    provider_type: CODEX_CLI_PROVIDER_TYPE.to_string(),
+                    name: "Codex CLI".to_string(),
+                    enabled: provider.enabled,
+                    base_url: String::new(),
+                    base_url_locked: true,
+                    api_key: String::new(),
+                    default_credential_id: String::new(),
+                    default_model: if provider.default_model.trim().is_empty() {
+                        CODEX_CLI_DEFAULT_MODEL.to_string()
+                    } else {
+                        provider.default_model.trim().to_string()
+                    },
+                    temperature: provider.temperature.clamp(0.0, 2.0),
+                    credentials: Vec::new(),
+                    models: provider
+                        .models
+                        .into_iter()
+                        .map(|model| ProviderModel {
+                            id: model.id.trim().to_string(),
+                            name: if model.name.trim().is_empty() {
+                                model.id.trim().to_string()
+                            } else {
+                                model.name.trim().to_string()
+                            },
+                            enabled: model.enabled,
+                            credential_id: String::new(),
+                            owned_by: model.owned_by,
+                            created: model.created,
+                        })
+                        .filter(|model| !model.id.is_empty())
+                        .collect(),
+                };
+            }
             let legacy_api_key = provider.api_key.trim().to_string();
             let credentials = normalize_credentials(provider.credentials, &legacy_api_key);
-            let default_credential_id = normalize_default_credential_id(
-                &provider.default_credential_id,
-                &credentials,
-            );
+            let default_credential_id =
+                normalize_default_credential_id(&provider.default_credential_id, &credentials);
             let models = provider
                 .models
                 .into_iter()
@@ -386,6 +439,9 @@ fn normalize_model_credential_id(
     default_credential_id: &str,
     credentials: &[ProviderCredential],
 ) -> String {
+    if credentials.is_empty() {
+        return String::new();
+    }
     let credential_id = credential_id.trim();
     if !credential_id.is_empty()
         && credentials
@@ -559,5 +615,25 @@ impl VsRegistry {
         let mut instances = self.instances.values().cloned().collect::<Vec<_>>();
         instances.sort_by(|left, right| left.connected_at.cmp(&right.connected_at));
         instances
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_providers_backfills_default_models_when_saved_list_is_empty() {
+        let mut stored = provider("codebuddy", "codebuddy", "CodeBuddy", "glm-5.1");
+        stored.models = Vec::new();
+
+        let normalized = normalize_providers(vec![stored]);
+        let provider = normalized
+            .iter()
+            .find(|provider| provider.id == "codebuddy")
+            .expect("codebuddy provider should be present");
+
+        assert!(!provider.models.is_empty());
+        assert!(provider.models.iter().any(|model| model.id == "glm-5.1"));
     }
 }

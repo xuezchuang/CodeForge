@@ -46,7 +46,7 @@ export function getSelectableModels(providers: ProviderConfig[]): SelectableMode
 }
 
 function providerUsesCredentials(provider: ProviderConfig): boolean {
-  return provider.type !== 'ollama'
+  return provider.type !== 'ollama' && provider.type !== 'codex-cli'
 }
 
 function selectableModel(
@@ -62,8 +62,6 @@ function selectableModel(
     credentialName: credential.name,
     modelId,
     modelName,
-    label: credential.name
-      ? `${provider.name} / ${credential.name} / ${modelName}`
-      : `${provider.name} / ${modelName}`,
+    label: modelName,
   }
 }

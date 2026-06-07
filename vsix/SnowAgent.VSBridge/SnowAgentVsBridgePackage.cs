@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -27,6 +28,25 @@ namespace SnowAgent.VSBridge
         private DesktopRegistrar desktopRegistrar;
         private Timer registrationTimer;
         private string lastRegisteredSolutionPath;
+        private const int MaxDocumentChars = 200000;
+        private const int MaxDocumentLines = 5000;
+        private const int DefaultMaxProjectFiles = 2000;
+        private const int MaxProjectFilesHardLimit = 10000;
+        private static readonly string[] IgnoredPathSegments =
+        {
+            "bin",
+            "obj",
+            ".vs",
+            "Debug",
+            "Release",
+            "x64",
+            ".git",
+            "node_modules",
+            "Intermediate",
+            "Binaries",
+            "Saved",
+            "DerivedDataCache",
+        };
 
         protected override async Task InitializeAsync(CancellationToken cancellationToken, IProgress<ServiceProgressData> progress)
         {
@@ -99,6 +119,290 @@ namespace SnowAgent.VSBridge
             catch (Exception ex)
             {
                 return new BridgeResponse { Ok = false, Message = "openFile failed: " + ex.Message };
+            }
+        }
+
+        internal async Task<CurrentSolutionResponse> CurrentSolutionAsync()
+        {
+            try
+            {
+                await JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                var solutionPath = dte?.Solution?.FullName;
+                if (string.IsNullOrWhiteSpace(solutionPath))
+                {
+                    return new CurrentSolutionResponse
+                    {
+                        Ok = true,
+                        Message = "no_solution_open",
+                        SolutionPath = null,
+                        SolutionName = null,
+                        IsOpen = false,
+                    };
+                }
+
+                return new CurrentSolutionResponse
+                {
+                    Ok = true,
+                    Message = "ok",
+                    SolutionPath = Path.GetFullPath(solutionPath),
+                    SolutionName = Path.GetFileNameWithoutExtension(solutionPath),
+                    IsOpen = true,
+                };
+            }
+            catch (Exception ex)
+            {
+                return new CurrentSolutionResponse
+                {
+                    Ok = false,
+                    Message = "currentSolution failed: " + ex.Message,
+                    SolutionPath = null,
+                    SolutionName = null,
+                    IsOpen = false,
+                };
+            }
+        }
+
+        internal async Task<CurrentDocumentResponse> CurrentDocumentAsync()
+        {
+            try
+            {
+                await JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                var document = dte?.ActiveDocument;
+                if (document == null)
+                {
+                    return new CurrentDocumentResponse
+                    {
+                        Ok = false,
+                        Message = "no_active_document",
+                        Text = string.Empty,
+                    };
+                }
+
+                var textDocument = GetTextDocument(document);
+                if (textDocument == null)
+                {
+                    return new CurrentDocumentResponse
+                    {
+                        Ok = false,
+                        Message = "active_document_is_not_text",
+                        Path = SafeDocumentPath(document),
+                        Name = SafeDocumentName(document),
+                        Language = LanguageFromPath(SafeDocumentPath(document)),
+                        Text = string.Empty,
+                    };
+                }
+
+                var text = ReadTextDocument(textDocument);
+                var totalLines = Math.Max(1, SafeLine(textDocument.EndPoint));
+                var truncated = false;
+                text = TruncateText(text, MaxDocumentChars, MaxDocumentLines, out truncated);
+
+                var selection = document.Selection as TextSelection;
+                var activePoint = selection?.ActivePoint;
+
+                return new CurrentDocumentResponse
+                {
+                    Ok = true,
+                    Message = "ok",
+                    Path = SafeDocumentPath(document),
+                    Name = SafeDocumentName(document),
+                    Language = LanguageFromPath(SafeDocumentPath(document)),
+                    Line = SafeLine(activePoint),
+                    Column = SafeColumn(activePoint),
+                    Text = text,
+                    TextTruncated = truncated,
+                    TotalLines = totalLines,
+                };
+            }
+            catch (Exception ex)
+            {
+                return new CurrentDocumentResponse
+                {
+                    Ok = false,
+                    Message = "currentDocument failed: " + ex.Message,
+                    Text = string.Empty,
+                };
+            }
+        }
+
+        internal async Task<CurrentSelectionResponse> CurrentSelectionAsync()
+        {
+            try
+            {
+                await JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                var document = dte?.ActiveDocument;
+                if (document == null)
+                {
+                    return new CurrentSelectionResponse
+                    {
+                        Ok = false,
+                        Message = "no_active_document",
+                        Text = string.Empty,
+                        IsEmpty = true,
+                    };
+                }
+
+                var selection = document.Selection as TextSelection;
+                if (selection == null)
+                {
+                    return new CurrentSelectionResponse
+                    {
+                        Ok = false,
+                        Message = "active_document_selection_is_not_text",
+                        Path = SafeDocumentPath(document),
+                        Text = string.Empty,
+                        IsEmpty = true,
+                    };
+                }
+
+                var activePoint = selection.ActivePoint;
+                var anchorPoint = selection.AnchorPoint;
+                var startPoint = ComesBeforeOrEqual(activePoint, anchorPoint) ? activePoint : anchorPoint;
+                var endPoint = ComesBeforeOrEqual(activePoint, anchorPoint) ? anchorPoint : activePoint;
+                string text;
+                try
+                {
+                    text = selection.Text ?? string.Empty;
+                }
+                catch
+                {
+                    text = string.Empty;
+                }
+
+                return new CurrentSelectionResponse
+                {
+                    Ok = true,
+                    Message = "ok",
+                    Path = SafeDocumentPath(document),
+                    StartLine = SafeLine(startPoint),
+                    StartColumn = SafeColumn(startPoint),
+                    EndLine = SafeLine(endPoint),
+                    EndColumn = SafeColumn(endPoint),
+                    Text = text,
+                    IsEmpty = string.IsNullOrEmpty(text),
+                };
+            }
+            catch (Exception ex)
+            {
+                return new CurrentSelectionResponse
+                {
+                    Ok = false,
+                    Message = "currentSelection failed: " + ex.Message,
+                    Text = string.Empty,
+                    IsEmpty = true,
+                };
+            }
+        }
+
+        internal async Task<ProjectListResponse> ListProjectsAsync()
+        {
+            try
+            {
+                await JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                var projects = new List<ProjectInfoDto>();
+                CollectProjects(dte?.Solution?.Projects, projects);
+
+                return new ProjectListResponse
+                {
+                    Ok = true,
+                    Message = "ok",
+                    Projects = projects.ToArray(),
+                };
+            }
+            catch (Exception ex)
+            {
+                return new ProjectListResponse
+                {
+                    Ok = false,
+                    Message = "listProjects failed: " + ex.Message,
+                    Projects = new ProjectInfoDto[0],
+                };
+            }
+        }
+
+        internal async Task<ProjectFilesResponse> ListProjectFilesAsync(ProjectFilesRequest request)
+        {
+            try
+            {
+                await JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                var maxFiles = NormalizeMaxFiles(request?.MaxFiles);
+                var allProjects = new List<Project>();
+                CollectProjectObjects(dte?.Solution?.Projects, allProjects);
+                var selectedProjects = SelectProjects(allProjects, request);
+                if (selectedProjects.Count == 0 && HasProjectFilter(request))
+                {
+                    return new ProjectFilesResponse
+                    {
+                        Ok = false,
+                        Message = "project_not_found",
+                        ProjectName = ProjectFilterLabel(request),
+                        Files = new ProjectFileDto[0],
+                        Truncated = false,
+                    };
+                }
+
+                var files = new List<ProjectFileDto>();
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var truncated = false;
+                foreach (var project in selectedProjects)
+                {
+                    CollectProjectItemFiles(SafeProjectItems(project), files, seen, maxFiles, ref truncated);
+                    if (truncated)
+                    {
+                        break;
+                    }
+                }
+
+                return new ProjectFilesResponse
+                {
+                    Ok = true,
+                    Message = "ok",
+                    ProjectName = HasProjectFilter(request) ? ProjectFilterLabel(request) : "all",
+                    Files = files.ToArray(),
+                    Truncated = truncated,
+                };
+            }
+            catch (Exception ex)
+            {
+                return new ProjectFilesResponse
+                {
+                    Ok = false,
+                    Message = "listProjectFiles failed: " + ex.Message,
+                    ProjectName = ProjectFilterLabel(request),
+                    Files = new ProjectFileDto[0],
+                    Truncated = false,
+                };
+            }
+        }
+
+        internal async Task<ErrorListResponse> GetErrorListAsync()
+        {
+            try
+            {
+                await JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                return new ErrorListResponse
+                {
+                    Ok = true,
+                    Message = "not_available",
+                    Diagnostics = new ErrorDiagnosticDto[0],
+                    Available = false,
+                };
+            }
+            catch (Exception ex)
+            {
+                return new ErrorListResponse
+                {
+                    Ok = true,
+                    Message = "not_available: " + ex.Message,
+                    Diagnostics = new ErrorDiagnosticDto[0],
+                    Available = false,
+                };
             }
         }
 
@@ -194,6 +498,581 @@ namespace SnowAgent.VSBridge
             }
 
             return Path.GetFullPath(path);
+        }
+
+        private static TextDocument GetTextDocument(Document document)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (document == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return document.Object("TextDocument") as TextDocument;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string ReadTextDocument(TextDocument textDocument)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (textDocument == null)
+            {
+                return string.Empty;
+            }
+
+            var startPoint = textDocument.StartPoint.CreateEditPoint();
+            return startPoint.GetText(textDocument.EndPoint) ?? string.Empty;
+        }
+
+        private static string TruncateText(string text, int maxChars, int maxLines, out bool truncated)
+        {
+            text = text ?? string.Empty;
+            truncated = false;
+
+            var lineLimitIndex = IndexAfterLineLimit(text, maxLines);
+            if (lineLimitIndex >= 0 && lineLimitIndex < text.Length)
+            {
+                text = text.Substring(0, lineLimitIndex);
+                truncated = true;
+            }
+
+            if (text.Length > maxChars)
+            {
+                text = text.Substring(0, maxChars);
+                truncated = true;
+            }
+
+            return text;
+        }
+
+        private static int IndexAfterLineLimit(string text, int maxLines)
+        {
+            if (maxLines <= 0)
+            {
+                return 0;
+            }
+
+            var lineCount = 1;
+            for (var index = 0; index < text.Length; index++)
+            {
+                if (text[index] != '\n')
+                {
+                    continue;
+                }
+
+                lineCount++;
+                if (lineCount > maxLines)
+                {
+                    return index + 1;
+                }
+            }
+
+            return -1;
+        }
+
+        private static string SafeDocumentPath(Document document)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                return string.IsNullOrWhiteSpace(document?.FullName)
+                    ? null
+                    : Path.GetFullPath(document.FullName);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string SafeDocumentName(Document document)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                return document?.Name;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static int SafeLine(TextPoint point)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                return Math.Max(1, point?.Line ?? 1);
+            }
+            catch
+            {
+                return 1;
+            }
+        }
+
+        private static int SafeColumn(TextPoint point)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                return Math.Max(1, point?.LineCharOffset ?? 1);
+            }
+            catch
+            {
+                return 1;
+            }
+        }
+
+        private static bool ComesBeforeOrEqual(TextPoint left, TextPoint right)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            var leftLine = SafeLine(left);
+            var rightLine = SafeLine(right);
+            if (leftLine != rightLine)
+            {
+                return leftLine < rightLine;
+            }
+
+            return SafeColumn(left) <= SafeColumn(right);
+        }
+
+        private static string LanguageFromPath(string path)
+        {
+            var extension = Path.GetExtension(path ?? string.Empty).ToLowerInvariant();
+            switch (extension)
+            {
+                case ".cpp":
+                case ".cc":
+                case ".cxx":
+                case ".c":
+                    return "cpp";
+                case ".h":
+                case ".hpp":
+                case ".hh":
+                case ".hxx":
+                    return "cpp-header";
+                case ".cs":
+                    return "csharp";
+                case ".ts":
+                    return "typescript";
+                case ".tsx":
+                    return "typescriptreact";
+                case ".rs":
+                    return "rust";
+                case ".json":
+                    return "json";
+                case ".xml":
+                    return "xml";
+                case ".sln":
+                    return "solution";
+                case ".vcxproj":
+                    return "vcxproj";
+                default:
+                    return string.IsNullOrEmpty(extension) ? "unknown" : extension.TrimStart('.');
+            }
+        }
+
+        private static void CollectProjects(Projects projects, List<ProjectInfoDto> results)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (projects == null)
+            {
+                return;
+            }
+
+            foreach (Project project in projects)
+            {
+                CollectProject(project, results);
+            }
+        }
+
+        private static void CollectProject(Project project, List<ProjectInfoDto> results)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (project == null)
+            {
+                return;
+            }
+
+            results.Add(new ProjectInfoDto
+            {
+                Name = SafeProjectName(project),
+                FullName = SafeProjectFullName(project),
+                Kind = SafeProjectKind(project),
+                UniqueName = SafeProjectUniqueName(project),
+            });
+
+            CollectSubProjects(SafeProjectItems(project), results);
+        }
+
+        private static void CollectSubProjects(ProjectItems items, List<ProjectInfoDto> results)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (items == null)
+            {
+                return;
+            }
+
+            foreach (ProjectItem item in items)
+            {
+                Project subProject = null;
+                try
+                {
+                    subProject = item.SubProject;
+                }
+                catch
+                {
+                    subProject = null;
+                }
+
+                if (subProject != null)
+                {
+                    CollectProject(subProject, results);
+                }
+            }
+        }
+
+        private static void CollectProjectObjects(Projects projects, List<Project> results)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (projects == null)
+            {
+                return;
+            }
+
+            foreach (Project project in projects)
+            {
+                CollectProjectObject(project, results);
+            }
+        }
+
+        private static void CollectProjectObject(Project project, List<Project> results)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (project == null)
+            {
+                return;
+            }
+
+            results.Add(project);
+            var items = SafeProjectItems(project);
+            if (items == null)
+            {
+                return;
+            }
+
+            foreach (ProjectItem item in items)
+            {
+                try
+                {
+                    if (item.SubProject != null)
+                    {
+                        CollectProjectObject(item.SubProject, results);
+                    }
+                }
+                catch
+                {
+                    // Ignore individual solution folder entries that cannot be inspected.
+                }
+            }
+        }
+
+        private static List<Project> SelectProjects(List<Project> projects, ProjectFilesRequest request)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (!HasProjectFilter(request))
+            {
+                return projects;
+            }
+
+            var projectName = request.ProjectName?.Trim();
+            var uniqueName = request.ProjectUniqueName?.Trim();
+            var selected = new List<Project>();
+            foreach (var project in projects)
+            {
+                if (!string.IsNullOrWhiteSpace(projectName) &&
+                    string.Equals(SafeProjectName(project), projectName, StringComparison.OrdinalIgnoreCase))
+                {
+                    selected.Add(project);
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(uniqueName) &&
+                    string.Equals(SafeProjectUniqueName(project), uniqueName, StringComparison.OrdinalIgnoreCase))
+                {
+                    selected.Add(project);
+                }
+            }
+
+            return selected;
+        }
+
+        private static bool HasProjectFilter(ProjectFilesRequest request)
+        {
+            return !string.IsNullOrWhiteSpace(request?.ProjectName) ||
+                !string.IsNullOrWhiteSpace(request?.ProjectUniqueName);
+        }
+
+        private static string ProjectFilterLabel(ProjectFilesRequest request)
+        {
+            if (!string.IsNullOrWhiteSpace(request?.ProjectUniqueName))
+            {
+                return request.ProjectUniqueName.Trim();
+            }
+
+            if (!string.IsNullOrWhiteSpace(request?.ProjectName))
+            {
+                return request.ProjectName.Trim();
+            }
+
+            return null;
+        }
+
+        private static int NormalizeMaxFiles(int? maxFiles)
+        {
+            var value = maxFiles.GetValueOrDefault(DefaultMaxProjectFiles);
+            if (value <= 0)
+            {
+                return DefaultMaxProjectFiles;
+            }
+
+            return Math.Min(value, MaxProjectFilesHardLimit);
+        }
+
+        private static void CollectProjectItemFiles(
+            ProjectItems items,
+            List<ProjectFileDto> files,
+            HashSet<string> seen,
+            int maxFiles,
+            ref bool truncated)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (items == null || truncated)
+            {
+                return;
+            }
+
+            foreach (ProjectItem item in items)
+            {
+                if (files.Count >= maxFiles)
+                {
+                    truncated = true;
+                    return;
+                }
+
+                AddProjectItemFiles(item, files, seen, maxFiles, ref truncated);
+                if (truncated)
+                {
+                    return;
+                }
+
+                Project subProject = null;
+                try
+                {
+                    subProject = item.SubProject;
+                }
+                catch
+                {
+                    subProject = null;
+                }
+
+                if (subProject != null)
+                {
+                    CollectProjectItemFiles(SafeProjectItems(subProject), files, seen, maxFiles, ref truncated);
+                }
+
+                CollectProjectItemFiles(SafeChildItems(item), files, seen, maxFiles, ref truncated);
+            }
+        }
+
+        private static void AddProjectItemFiles(
+            ProjectItem item,
+            List<ProjectFileDto> files,
+            HashSet<string> seen,
+            int maxFiles,
+            ref bool truncated)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            int fileCount;
+            try
+            {
+                fileCount = item.FileCount;
+            }
+            catch
+            {
+                return;
+            }
+
+            for (var index = 1; index <= fileCount; index++)
+            {
+                if (files.Count >= maxFiles)
+                {
+                    truncated = true;
+                    return;
+                }
+
+                string path;
+                try
+                {
+                    path = item.FileNames[(short)index];
+                }
+                catch
+                {
+                    continue;
+                }
+
+                AddFilePath(path, files, seen);
+            }
+        }
+
+        private static void AddFilePath(string path, List<ProjectFileDto> files, HashSet<string> seen)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return;
+            }
+
+            string fullPath;
+            try
+            {
+                fullPath = Path.GetFullPath(path);
+            }
+            catch
+            {
+                return;
+            }
+
+            if (!File.Exists(fullPath) || IsIgnoredPath(fullPath) || !seen.Add(fullPath))
+            {
+                return;
+            }
+
+            files.Add(new ProjectFileDto
+            {
+                Path = fullPath,
+                Name = Path.GetFileName(fullPath),
+            });
+        }
+
+        private static bool IsIgnoredPath(string path)
+        {
+            var normalized = path.Replace('/', '\\');
+            foreach (var segment in IgnoredPathSegments)
+            {
+                if (normalized.IndexOf("\\" + segment + "\\", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static ProjectItems SafeProjectItems(Project project)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                return project?.ProjectItems;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static ProjectItems SafeChildItems(ProjectItem item)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                return item?.ProjectItems;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string SafeProjectName(Project project)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                return project?.Name;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string SafeProjectFullName(Project project)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                var fullName = project?.FullName;
+                return string.IsNullOrWhiteSpace(fullName) ? null : Path.GetFullPath(fullName);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string SafeProjectKind(Project project)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                return project?.Kind;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string SafeProjectUniqueName(Project project)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                return project?.UniqueName;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         protected override void Dispose(bool disposing)

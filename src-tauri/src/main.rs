@@ -3,6 +3,7 @@
 mod agent_runner;
 mod app_state;
 mod code_link;
+mod codex_cli_runner;
 mod commands;
 mod desktop_http_server;
 mod path_utils;
@@ -10,6 +11,7 @@ mod process_manager;
 mod project_registry;
 mod tool_registry;
 mod tool_trace;
+mod vs_bridge_client;
 mod vs_bridge_service;
 mod vs_registry;
 mod workspace_tools;
@@ -54,6 +56,7 @@ fn main() {
             commands::unregister_vs_instance,
             commands::heartbeat_vs_instance,
             commands::list_vs_instances,
+            commands::list_tools,
             commands::run_agent,
             commands::run_tool_call_test,
             commands::run_mock_agent,

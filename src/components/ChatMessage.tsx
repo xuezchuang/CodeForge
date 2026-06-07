@@ -1,13 +1,15 @@
 import { useMemo, useState, type ReactNode } from 'react'
 import {
   Bot,
+  Check,
   ChevronDown,
   ChevronRight,
+  CircleAlert,
   Copy,
   Eye,
-  ExternalLink,
   ListTree,
   PanelRightOpen,
+  Pencil,
   Search,
   ThumbsDown,
   ThumbsUp,
@@ -26,6 +28,7 @@ interface ChatMessageProps {
   onCodeLinkError: (message: string) => void
   onTraceChanged: (taskId: string) => void
   onOpenTrace: (message: ChatMessageModel) => void
+  onEditUserMessage: (message: ChatMessageModel) => void
 }
 
 function ChatMessage({
@@ -35,13 +38,30 @@ function ChatMessage({
   onCodeLinkError,
   onTraceChanged,
   onOpenTrace,
+  onEditUserMessage,
 }: ChatMessageProps) {
   const isUser = message.role === 'user'
   const displayContent = isUser ? message.content : sanitizeModelMessage(message.content)
+  const [copiedTarget, setCopiedTarget] = useState<'user' | 'assistant' | null>(null)
   const thinkingSummary = useMemo(
     () => createThinkingSummary(message.traceEvents ?? []),
     [message.traceEvents],
   )
+  const copyText = (value: string, target: 'user' | 'assistant') => {
+    if (!navigator.clipboard) {
+      return
+    }
+
+    void navigator.clipboard
+      .writeText(value)
+      .then(() => {
+        setCopiedTarget(target)
+        window.setTimeout(() => {
+          setCopiedTarget((current) => (current === target ? null : current))
+        }, 1200)
+      })
+      .catch(() => undefined)
+  }
 
   return (
     <article className={isUser ? 'chat-message user' : 'chat-message assistant'}>
@@ -53,35 +73,88 @@ function ChatMessage({
         )}
       </div>
       <div className="message-body">
-        <div className="message-meta">
-          <span>{isUser ? 'You' : 'SnowAgent'}</span>
-          <time>{formatTime(message.createdAt)}</time>
-        </div>
-        {!isUser && thinkingSummary ? (
-          <ThinkingPanel summary={thinkingSummary} />
+        {!isUser ? (
+          <div className="message-meta">
+            <span>SnowAgent</span>
+            <time>{formatTime(message.createdAt)}</time>
+          </div>
         ) : null}
-        <div className="message-content">
-          <MarkdownMessage
-            text={displayContent}
-            projectId={projectId}
-            taskId={message.taskId}
-            onCodeLinkResult={onCodeLinkResult}
-            onCodeLinkError={onCodeLinkError}
-            onTraceChanged={() => onTraceChanged(message.taskId)}
+        {!isUser && thinkingSummary ? (
+          <ThinkingPanel
+            summary={thinkingSummary}
+            defaultOpen={message.status === 'running'}
           />
-        </div>
+        ) : null}
+        {message.attachments && message.attachments.length > 0 ? (
+          <div className="message-attachments" aria-label="Message images">
+            {message.attachments.map((attachment) => (
+              <img
+                key={attachment.id}
+                src={attachment.dataUrl}
+                alt={attachment.name}
+                className="message-attachment-image"
+              />
+            ))}
+          </div>
+        ) : null}
+        {displayContent.trim().length > 0 || !message.attachments?.length ? (
+          <div className="message-content">
+            <MarkdownMessage
+              text={displayContent}
+              projectId={projectId}
+              taskId={message.taskId}
+              onCodeLinkResult={onCodeLinkResult}
+              onCodeLinkError={onCodeLinkError}
+              onTraceChanged={() => onTraceChanged(message.taskId)}
+            />
+          </div>
+        ) : null}
+        {isUser ? (
+          <div className="user-message-actions" aria-label="User message actions">
+            <button
+              type="button"
+              className={
+                copiedTarget === 'user' ? 'message-action-button is-copied' : 'message-action-button'
+              }
+              aria-label="Copy message"
+              title={copiedTarget === 'user' ? 'Copied' : 'Copy'}
+              onClick={() => copyText(message.content, 'user')}
+            >
+              {copiedTarget === 'user' ? (
+                <Check size={15} aria-hidden="true" />
+              ) : (
+                <Copy size={15} aria-hidden="true" />
+              )}
+            </button>
+            <button
+              type="button"
+              className="message-action-button"
+              aria-label="Edit message"
+              title="Edit"
+              onClick={() => onEditUserMessage(message)}
+            >
+              <Pencil size={15} aria-hidden="true" />
+            </button>
+          </div>
+        ) : null}
         {!isUser ? (
           <div className="message-actions" aria-label="Message actions">
             <button
               type="button"
-              className="message-action-button"
+              className={
+                copiedTarget === 'assistant'
+                  ? 'message-action-button is-copied'
+                  : 'message-action-button'
+              }
               aria-label="Copy response"
-              title="Copy response"
-              onClick={() => {
-                void navigator.clipboard.writeText(displayContent)
-              }}
+              title={copiedTarget === 'assistant' ? 'Copied' : 'Copy response'}
+              onClick={() => copyText(displayContent, 'assistant')}
             >
-              <Copy size={15} aria-hidden="true" />
+              {copiedTarget === 'assistant' ? (
+                <Check size={15} aria-hidden="true" />
+              ) : (
+                <Copy size={15} aria-hidden="true" />
+              )}
             </button>
             <button
               type="button"
@@ -107,14 +180,6 @@ function ChatMessage({
               onClick={() => onOpenTrace(message)}
             >
               <PanelRightOpen size={15} aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              className="message-action-button"
-              aria-label="Open response"
-              title="Open response"
-            >
-              <ExternalLink size={15} aria-hidden="true" />
             </button>
           </div>
         ) : null}
@@ -439,19 +504,30 @@ function renderInlineMarkdown(
 interface ThinkingSummary {
   toolCalls: number
   messages: number
+  steps: number
   workedFor: string
   items: ThinkingItem[]
+  omitted: number
 }
 
 interface ThinkingItem {
   id: string
-  kind: 'search' | 'read' | 'list' | 'tool'
+  kind: 'search' | 'read' | 'list' | 'tool' | 'model' | 'message' | 'error'
   text: string
   detail?: string
+  details: string[]
+  status: ToolTraceEvent['status']
+  duration: string
 }
 
-function ThinkingPanel({ summary }: { summary: ThinkingSummary }) {
-  const [open, setOpen] = useState(false)
+function ThinkingPanel({
+  summary,
+  defaultOpen,
+}: {
+  summary: ThinkingSummary
+  defaultOpen: boolean
+}) {
+  const [open, setOpen] = useState(defaultOpen)
 
   return (
     <section className={open ? 'message-thinking open' : 'message-thinking'}>
@@ -475,17 +551,35 @@ function ThinkingPanel({ summary }: { summary: ThinkingSummary }) {
           <div className="thinking-label">
             Thinking
             <span>
-              {summary.toolCalls} tool calls, {summary.messages} messages
+              {summary.toolCalls} tool calls, {summary.messages} messages,{' '}
+              {summary.steps} trace steps
             </span>
           </div>
           <div className="thinking-list">
             {summary.items.map((item) => (
-              <div key={item.id} className="thinking-item">
+              <div key={item.id} className={`thinking-item ${item.status}`}>
                 <ThinkingIcon kind={item.kind} />
-                <span>{item.text}</span>
-                {item.detail ? <code>{item.detail}</code> : null}
+                <div className="thinking-item-body">
+                  <div className="thinking-item-main">
+                    <span>{item.text}</span>
+                    {item.detail ? <code>{item.detail}</code> : null}
+                    <small>{item.duration || item.status}</small>
+                  </div>
+                  {item.details.length > 0 ? (
+                    <div className="thinking-item-details">
+                      {item.details.map((detail, index) => (
+                        <p key={index}>{detail}</p>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
               </div>
             ))}
+            {summary.omitted > 0 ? (
+              <div className="thinking-more">
+                {summary.omitted} more trace steps are available in Trace.
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}
@@ -503,6 +597,9 @@ function ThinkingIcon({ kind }: { kind: ThinkingItem['kind'] }) {
   if (kind === 'list') {
     return <ListTree size={13} aria-hidden="true" />
   }
+  if (kind === 'error') {
+    return <CircleAlert size={13} aria-hidden="true" />
+  }
   return <Bot size={13} aria-hidden="true" />
 }
 
@@ -511,9 +608,8 @@ function createThinkingSummary(events: ToolTraceEvent[]): ThinkingSummary | null
     return null
   }
 
-  const items = events
-    .filter((event) => event.type === 'tool_result' || event.type === 'error')
-    .filter((event) => event.toolName && event.toolName !== 'chat_completion')
+  const visibleEvents = events.filter(isVisibleThinkingEvent)
+  const items = visibleEvents
     .map(createThinkingItem)
     .filter((item): item is ThinkingItem => item !== null)
 
@@ -522,10 +618,12 @@ function createThinkingSummary(events: ToolTraceEvent[]): ThinkingSummary | null
   }
 
   return {
-    toolCalls: items.length,
+    toolCalls: inferToolCallCount(events),
     messages: inferMessageCount(events),
+    steps: visibleEvents.length,
     workedFor: formatWorkedFor(events),
-    items: items.slice(0, 30),
+    items: items.slice(0, 50),
+    omitted: Math.max(0, items.length - 50),
   }
 }
 
@@ -533,12 +631,11 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
   const input = asRecord(event.input)
   const argumentsValue = asRecord(input.arguments)
   const toolName = event.toolName ?? stringValue(input.toolName)
-  if (!toolName) {
-    return null
-  }
+  const base = baseThinkingItem(event, toolName)
 
   if (toolName === 'search_content') {
     return {
+      ...base,
       id: event.id,
       kind: 'search',
       text: event.status === 'failed' ? 'Search failed' : 'Searched content',
@@ -547,11 +644,13 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
         stringValue(argumentsValue.root),
         stringValue(argumentsValue.file_glob),
       ]),
+      details: thinkingDetailsForEvent(event, toolName, argumentsValue),
     }
   }
 
   if (toolName === 'search_file') {
     return {
+      ...base,
       id: event.id,
       kind: 'search',
       text: event.status === 'failed' ? 'File search failed' : 'Searched files',
@@ -559,20 +658,24 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
         stringValue(argumentsValue.pattern),
         stringValue(argumentsValue.root),
       ]),
+      details: thinkingDetailsForEvent(event, toolName, argumentsValue),
     }
   }
 
   if (toolName === 'list_dir') {
     return {
+      ...base,
       id: event.id,
       kind: 'list',
       text: event.status === 'failed' ? 'List directory failed' : 'Listed directory',
       detail: stringValue(argumentsValue.path),
+      details: thinkingDetailsForEvent(event, toolName, argumentsValue),
     }
   }
 
   if (toolName === 'read_file') {
     return {
+      ...base,
       id: event.id,
       kind: 'read',
       text: event.status === 'failed' ? 'Read failed' : 'Read file',
@@ -581,11 +684,13 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
         argumentsValue.start_line,
         argumentsValue.end_line,
       ),
+      details: thinkingDetailsForEvent(event, toolName, argumentsValue),
     }
   }
 
   if (toolName === 'get_file_context') {
     return {
+      ...base,
       id: event.id,
       kind: 'read',
       text: event.status === 'failed' ? 'Context read failed' : 'Read context',
@@ -594,15 +699,396 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
         argumentsValue.line,
         undefined,
       ),
+      details: thinkingDetailsForEvent(event, toolName, argumentsValue),
     }
   }
 
+  return base
+}
+
+function isVisibleThinkingEvent(event: ToolTraceEvent): boolean {
+  if (event.toolName === 'chat_completion') {
+    return event.type === 'llm_request' || event.type === 'llm_response'
+  }
+  return [
+    'llm_request',
+    'llm_response',
+    'tool_call',
+    'tool_result',
+    'model_message',
+    'final_response',
+    'system_event',
+    'error',
+  ].includes(event.type)
+}
+
+function baseThinkingItem(
+  event: ToolTraceEvent,
+  toolName: string,
+): ThinkingItem {
+  const duration = formatDuration(event.durationMs)
+  const detail = defaultThinkingDetail(event, toolName)
   return {
     id: event.id,
-    kind: 'tool',
-    text: event.status === 'failed' ? 'Tool failed' : 'Called tool',
-    detail: toolName,
+    kind: thinkingKind(event, toolName),
+    text: defaultThinkingText(event, toolName),
+    detail,
+    details: thinkingDetailsForEvent(event, toolName, asRecord(asRecord(event.input).arguments)),
+    status: event.status,
+    duration,
   }
+}
+
+function thinkingKind(
+  event: ToolTraceEvent,
+  toolName: string,
+): ThinkingItem['kind'] {
+  if (event.type === 'error' || event.status === 'failed') {
+    return 'error'
+  }
+  if (event.type === 'llm_request' || event.type === 'llm_response') {
+    return 'model'
+  }
+  if (event.type === 'model_message' || event.type === 'final_response') {
+    return 'message'
+  }
+  if (toolName === 'search_content' || toolName === 'search_file') {
+    return 'search'
+  }
+  if (toolName === 'list_dir') {
+    return 'list'
+  }
+  if (toolName === 'read_file' || toolName === 'get_file_context') {
+    return 'read'
+  }
+  return 'tool'
+}
+
+function defaultThinkingText(event: ToolTraceEvent, toolName: string): string {
+  if (event.type === 'llm_request') {
+    return 'Sent model request'
+  }
+  if (event.type === 'llm_response') {
+    return event.status === 'failed' ? 'Model response failed' : 'Received model response'
+  }
+  if (event.type === 'tool_call') {
+    return 'Prepared tool call'
+  }
+  if (event.type === 'tool_result') {
+    return event.status === 'failed' ? 'Tool failed' : 'Tool returned result'
+  }
+  if (event.type === 'model_message') {
+    return 'Read model message'
+  }
+  if (event.type === 'final_response') {
+    return 'Composed final response'
+  }
+  if (event.type === 'error') {
+    return 'Trace error'
+  }
+  return event.title || toolName || 'Trace step'
+}
+
+function defaultThinkingDetail(event: ToolTraceEvent, toolName: string): string {
+  if (toolName && toolName !== 'chat_completion') {
+    return toolName
+  }
+  const input = asRecord(event.input)
+  const output = asRecord(event.output)
+  const request = asRecord(input.request)
+  const response = asRecord(output.response)
+  const model = firstText([
+    input.model,
+    request.model,
+    output.model,
+    response.model,
+  ])
+  return model || event.title
+}
+
+function thinkingDetailsForEvent(
+  event: ToolTraceEvent,
+  toolName: string,
+  argumentsValue: Record<string, unknown>,
+): string[] {
+  const input = asRecord(event.input)
+  const output = asRecord(event.output)
+  const request = asRecord(input.request)
+  const response = asRecord(output.response)
+  const lines: string[] = []
+
+  appendDetail(lines, 'Step', event.title)
+  appendDetail(lines, 'Status', event.status)
+
+  if (event.type === 'llm_request') {
+    appendDetail(lines, 'Provider', firstText([input.provider, input.providerType, request.provider]))
+    appendDetail(lines, 'Model', firstText([input.model, request.model]))
+    appendDetail(lines, 'Messages', String(messageArray(input, request).length || ''))
+    appendDetail(lines, 'Tools', String(toolArray(input, request).length || ''))
+    appendDetail(lines, 'Prompt', messagePreview(messageArray(input, request)))
+    return lines
+  }
+
+  if (event.type === 'llm_response') {
+    appendDetail(lines, 'Model', firstText([output.model, response.model]))
+    appendDetail(lines, 'Tokens', tokenUsageDetail(output, response))
+    appendDetail(lines, 'Content', modelResponsePreview(output, response))
+    appendDetail(lines, 'Tool calls', String(responseToolCallCount(output, response) || ''))
+    return lines
+  }
+
+  if (event.type === 'tool_call') {
+    appendDetail(lines, 'Tool', toolName)
+    appendDetail(lines, 'Arguments', compactJson(argumentsValue, 260))
+    return lines
+  }
+
+  if (event.type === 'tool_result') {
+    appendDetail(lines, 'Tool', toolName)
+    appendDetail(lines, 'Result', compactText(event.outputSummary ?? extractOutputMessage(output), 260))
+    appendDetail(lines, 'Output', compactJson(output, 260))
+    return lines
+  }
+
+  if (event.type === 'model_message' || event.type === 'final_response') {
+    appendDetail(lines, 'Content', compactText(modelMessageContent(input, output, event), 320))
+    return lines
+  }
+
+  appendDetail(lines, 'Input', compactJson(input, 220))
+  appendDetail(lines, 'Output', compactJson(output, 220))
+  return lines
+}
+
+function inferToolCallCount(events: ToolTraceEvent[]): number {
+  const calls = events.filter(
+    (event) => event.type === 'tool_call' && event.toolName !== 'chat_completion',
+  )
+  if (calls.length > 0) {
+    return calls.length
+  }
+  return events.filter(
+    (event) => event.type === 'tool_result' && event.toolName !== 'chat_completion',
+  ).length
+}
+
+function appendDetail(lines: string[], label: string, value: string): void {
+  const trimmed = value.trim()
+  if (trimmed.length > 0) {
+    lines.push(`${label}: ${trimmed}`)
+  }
+}
+
+function firstText(values: unknown[]): string {
+  for (const value of values) {
+    const text = stringValue(value).trim()
+    if (text.length > 0) {
+      return compactText(text, 160)
+    }
+  }
+  return ''
+}
+
+function messageArray(
+  input: Record<string, unknown>,
+  request: Record<string, unknown>,
+): unknown[] {
+  if (Array.isArray(input.messages)) {
+    return input.messages
+  }
+  if (Array.isArray(request.messages)) {
+    return request.messages
+  }
+  return []
+}
+
+function toolArray(
+  input: Record<string, unknown>,
+  request: Record<string, unknown>,
+): unknown[] {
+  if (Array.isArray(input.tools)) {
+    return input.tools
+  }
+  if (Array.isArray(request.tools)) {
+    return request.tools
+  }
+  return []
+}
+
+function messagePreview(messages: unknown[]): string {
+  const candidate =
+    messages
+      .map(asRecord)
+      .reverse()
+      .find((message) => stringValue(message.role) === 'user') ??
+    messages
+      .map(asRecord)
+      .reverse()
+      .find((message) => stringValue(message.role) !== 'system')
+
+  if (!candidate) {
+    return ''
+  }
+
+  const role = stringValue(candidate.role) || 'message'
+  const content = messageContentPreview(candidate.content)
+  return content ? `${role}: ${content}` : role
+}
+
+function messageContentPreview(value: unknown): string {
+  if (typeof value === 'string') {
+    return compactText(value, 220)
+  }
+  if (Array.isArray(value)) {
+    const textParts = value
+      .map(asRecord)
+      .map((part) => stringValue(part.text ?? part.content))
+      .filter((part) => part.trim().length > 0)
+    return compactText(textParts.join(' '), 220)
+  }
+  return compactJson(value, 220)
+}
+
+function modelResponsePreview(
+  output: Record<string, unknown>,
+  response: Record<string, unknown>,
+): string {
+  const firstChoice = firstNonEmptyRecord([firstChoiceRecord(response), firstChoiceRecord(output)])
+  const message = asRecord(firstChoice.message)
+  return firstText([
+    message.content,
+    firstChoice.text,
+    response.content,
+    output.content,
+    output.outputSummary,
+  ])
+}
+
+function firstChoiceRecord(record: Record<string, unknown>): Record<string, unknown> {
+  const choices = record.choices
+  if (Array.isArray(choices)) {
+    return asRecord(choices[0])
+  }
+  return {}
+}
+
+function responseToolCallCount(
+  output: Record<string, unknown>,
+  response: Record<string, unknown>,
+): number {
+  const firstChoice = firstNonEmptyRecord([firstChoiceRecord(response), firstChoiceRecord(output)])
+  const message = asRecord(firstChoice.message)
+  const candidates = [
+    output.tool_calls,
+    output.toolCalls,
+    response.tool_calls,
+    response.toolCalls,
+    message.tool_calls,
+    message.toolCalls,
+  ]
+  return candidates.reduce<number>((max, candidate) => {
+    return Array.isArray(candidate) ? Math.max(max, candidate.length) : max
+  }, 0)
+}
+
+function tokenUsageDetail(
+  output: Record<string, unknown>,
+  response: Record<string, unknown>,
+): string {
+  const usage = firstNonEmptyRecord([
+    asRecord(output.usage),
+    asRecord(output.tokenUsage),
+    asRecord(output.tokens),
+    asRecord(response.usage),
+    asRecord(response.tokenUsage),
+    asRecord(response.tokens),
+  ])
+  const input = firstText([
+    usage.inputTokens,
+    usage.input_tokens,
+    usage.promptTokens,
+    usage.prompt_tokens,
+  ])
+  const outputTokens = firstText([
+    usage.outputTokens,
+    usage.output_tokens,
+    usage.completionTokens,
+    usage.completion_tokens,
+  ])
+  const total = firstText([usage.totalTokens, usage.total_tokens])
+  return [
+    input ? `in ${input}` : '',
+    outputTokens ? `out ${outputTokens}` : '',
+    total ? `total ${total}` : '',
+  ]
+    .filter((part) => part.length > 0)
+    .join(', ')
+}
+
+function extractOutputMessage(output: Record<string, unknown>): string {
+  return firstText([
+    output.message,
+    output.error,
+    output.text,
+    output.content,
+    asRecord(output.response).message,
+  ])
+}
+
+function modelMessageContent(
+  input: Record<string, unknown>,
+  output: Record<string, unknown>,
+  event: ToolTraceEvent,
+): string {
+  return firstText([
+    input.content,
+    output.content,
+    output.message,
+    event.outputSummary,
+  ])
+}
+
+function firstNonEmptyRecord(records: Array<Record<string, unknown>>): Record<string, unknown> {
+  return records.find((record) => Object.keys(record).length > 0) ?? {}
+}
+
+function compactJson(value: unknown, maxLength: number): string {
+  if (value === null || value === undefined) {
+    return ''
+  }
+  try {
+    return compactText(JSON.stringify(value), maxLength)
+  } catch {
+    return compactText(String(value), maxLength)
+  }
+}
+
+function compactText(value: string, maxLength: number): string {
+  const normalized = maskSensitiveText(
+    sanitizeModelMessage(value).replace(/\s+/g, ' ').trim(),
+  )
+  if (normalized.length <= maxLength) {
+    return normalized
+  }
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`
+}
+
+function maskSensitiveText(value: string): string {
+  return value
+    .replace(/sk-[A-Za-z0-9_-]{10,}/g, 'sk-***')
+    .replace(/(api[_-]?key["']?\s*[:=]\s*["']?)[^"',\s}]+/gi, '$1***')
+    .replace(/(bearer\s+)[A-Za-z0-9._-]{10,}/gi, '$1***')
+}
+
+function formatDuration(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) {
+    return ''
+  }
+  if (value >= 1000) {
+    const seconds = value / 1000
+    return `${seconds >= 10 ? Math.round(seconds) : seconds.toFixed(1)}s`
+  }
+  return `${Math.max(0, Math.round(value))} ms`
 }
 
 function inferMessageCount(events: ToolTraceEvent[]): number {
@@ -658,6 +1144,16 @@ function lineRangeDetail(path: string, start: unknown, end: unknown): string {
 function asRecord(value: unknown): Record<string, unknown> {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     return value as Record<string, unknown>
+  }
+  if (typeof value === 'string' && value.trim().startsWith('{')) {
+    try {
+      const parsed: unknown = JSON.parse(value)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      return {}
+    }
   }
   return {}
 }

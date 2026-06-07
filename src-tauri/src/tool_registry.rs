@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 
+use crate::vs_bridge_client;
 use crate::workspace_tools;
 
 pub const CALCULATOR_ADD_TOOL_NAME: &str = "calculator.add";
@@ -8,9 +9,16 @@ pub const READ_FILE_TOOL_NAME: &str = "read_file";
 pub const SEARCH_FILE_TOOL_NAME: &str = "search_file";
 pub const SEARCH_CONTENT_TOOL_NAME: &str = "search_content";
 pub const GET_FILE_CONTEXT_TOOL_NAME: &str = "get_file_context";
+pub const VS_CURRENT_SOLUTION_TOOL_NAME: &str = "vs.current_solution";
+pub const VS_CURRENT_DOCUMENT_TOOL_NAME: &str = "vs.current_document";
+pub const VS_CURRENT_SELECTION_TOOL_NAME: &str = "vs.current_selection";
+pub const VS_LIST_PROJECTS_TOOL_NAME: &str = "vs.list_projects";
+pub const VS_LIST_PROJECT_FILES_TOOL_NAME: &str = "vs.list_project_files";
+pub const VS_GET_ERROR_LIST_TOOL_NAME: &str = "vs.get_error_list";
 
 pub struct ToolExecutionContext<'a> {
     pub workspace_root: &'a str,
+    pub vs_bridge_endpoint: Option<&'a str>,
 }
 
 pub fn tool_definitions() -> Vec<Value> {
@@ -21,10 +29,16 @@ pub fn tool_definitions() -> Vec<Value> {
         search_file_definition(),
         search_content_definition(),
         get_file_context_definition(),
+        vs_current_solution_definition(),
+        vs_current_document_definition(),
+        vs_current_selection_definition(),
+        vs_list_projects_definition(),
+        vs_list_project_files_definition(),
+        vs_get_error_list_definition(),
     ]
 }
 
-pub fn execute_tool(
+pub async fn execute_tool(
     context: &ToolExecutionContext<'_>,
     name: &str,
     arguments: &Value,
@@ -39,6 +53,25 @@ pub fn execute_tool(
         }
         GET_FILE_CONTEXT_TOOL_NAME => {
             workspace_tools::get_file_context(context.workspace_root, arguments)
+        }
+        VS_CURRENT_SOLUTION_TOOL_NAME => {
+            vs_bridge_client::call_vs_current_solution(context.vs_bridge_endpoint).await
+        }
+        VS_CURRENT_DOCUMENT_TOOL_NAME => {
+            vs_bridge_client::call_vs_current_document(context.vs_bridge_endpoint).await
+        }
+        VS_CURRENT_SELECTION_TOOL_NAME => {
+            vs_bridge_client::call_vs_current_selection(context.vs_bridge_endpoint).await
+        }
+        VS_LIST_PROJECTS_TOOL_NAME => {
+            vs_bridge_client::call_vs_list_projects(context.vs_bridge_endpoint).await
+        }
+        VS_LIST_PROJECT_FILES_TOOL_NAME => {
+            vs_bridge_client::call_vs_list_project_files(context.vs_bridge_endpoint, arguments)
+                .await
+        }
+        VS_GET_ERROR_LIST_TOOL_NAME => {
+            vs_bridge_client::call_vs_get_error_list(context.vs_bridge_endpoint).await
         }
         _ => Err(format!("Unknown tool: {name}")),
     }
@@ -219,6 +252,105 @@ fn get_file_context_definition() -> Value {
     })
 }
 
+fn vs_current_solution_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_CURRENT_SOLUTION_TOOL_NAME,
+            "description": "Read the current Visual Studio solution through the connected VS Bridge. Requires Bridge Connected; returns bridge_not_connected when Visual Studio is not connected.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn vs_current_document_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_CURRENT_DOCUMENT_TOOL_NAME,
+            "description": "Read the active Visual Studio text document through the connected VS Bridge. Returns path, cursor line/column, language, text, totalLines, and textTruncated. Requires Bridge Connected; returned text may be truncated.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn vs_current_selection_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_CURRENT_SELECTION_TOOL_NAME,
+            "description": "Read the active Visual Studio text selection through the connected VS Bridge. Returns current selection text and start/end line/column, or isEmpty=true for an empty caret selection. Requires Bridge Connected.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn vs_list_projects_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_LIST_PROJECTS_TOOL_NAME,
+            "description": "List projects currently loaded in the active Visual Studio solution through the connected VS Bridge. Handles solution folders best-effort. Requires Bridge Connected.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn vs_list_project_files_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_LIST_PROJECT_FILES_TOOL_NAME,
+            "description": "Lightweight DTE ProjectItems file enumeration through the connected VS Bridge. This is not a full code graph or semantic index. Requires Bridge Connected and returns truncated=true if the file limit is hit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "projectName": {
+                        "type": "string",
+                        "description": "Optional Visual Studio project display name to enumerate. If omitted, all loaded projects are scanned."
+                    },
+                    "projectUniqueName": {
+                        "type": "string",
+                        "description": "Optional Visual Studio project UniqueName to enumerate."
+                    },
+                    "maxFiles": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 2000,
+                        "description": "Maximum files to return before truncating."
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn vs_get_error_list_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_GET_ERROR_LIST_TOOL_NAME,
+            "description": "Read Visual Studio Error List diagnostics through the connected VS Bridge when available. The current VSIX may return available=false and message=not_available; do not treat this as clangd, LSP, or full code graph analysis.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
 fn add(arguments: &Value) -> Result<Value, String> {
     let a = read_number(arguments, "a")?;
     let b = read_number(arguments, "b")?;
@@ -251,16 +383,17 @@ mod tests {
     fn test_context() -> ToolExecutionContext<'static> {
         ToolExecutionContext {
             workspace_root: ".",
+            vs_bridge_endpoint: None,
         }
     }
 
     #[test]
     fn calculator_add_returns_sum() {
-        let result = execute_tool(
+        let result = tauri::async_runtime::block_on(execute_tool(
             &test_context(),
             CALCULATOR_ADD_TOOL_NAME,
             &json!({ "a": 1, "b": 1 }),
-        )
+        ))
         .unwrap();
 
         assert_eq!(result, json!({ "result": 2 }));
@@ -268,11 +401,11 @@ mod tests {
 
     #[test]
     fn calculator_add_requires_numbers() {
-        let error = execute_tool(
+        let error = tauri::async_runtime::block_on(execute_tool(
             &test_context(),
             CALCULATOR_ADD_TOOL_NAME,
             &json!({ "a": "1", "b": 1 }),
-        )
+        ))
         .unwrap_err();
 
         assert!(error.contains("numeric field `a`"));
@@ -280,7 +413,12 @@ mod tests {
 
     #[test]
     fn unknown_tool_returns_error() {
-        let error = execute_tool(&test_context(), "missing.tool", &json!({})).unwrap_err();
+        let error = tauri::async_runtime::block_on(execute_tool(
+            &test_context(),
+            "missing.tool",
+            &json!({}),
+        ))
+        .unwrap_err();
 
         assert!(error.contains("Unknown tool: missing.tool"));
     }
@@ -302,5 +440,25 @@ mod tests {
         assert!(names.contains(&SEARCH_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&SEARCH_CONTENT_TOOL_NAME.to_string()));
         assert!(names.contains(&GET_FILE_CONTEXT_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_CURRENT_SOLUTION_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_CURRENT_DOCUMENT_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_CURRENT_SELECTION_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_LIST_PROJECTS_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_LIST_PROJECT_FILES_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_GET_ERROR_LIST_TOOL_NAME.to_string()));
+    }
+
+    #[test]
+    fn vs_tool_returns_bridge_not_connected_when_endpoint_missing() {
+        let result = tauri::async_runtime::block_on(execute_tool(
+            &test_context(),
+            VS_CURRENT_DOCUMENT_TOOL_NAME,
+            &json!({}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["ok"], json!(false));
+        assert_eq!(result["status"], json!("bridge_not_connected"));
+        assert_eq!(result["source"], json!("vsix"));
     }
 }

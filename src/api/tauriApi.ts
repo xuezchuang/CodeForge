@@ -19,6 +19,11 @@ import type {
 } from '../types/vs'
 import type { ProviderModel } from '../types/provider'
 
+export interface ToolDefinitionSummary {
+  name: string
+  description: string
+}
+
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: unknown
@@ -79,6 +84,10 @@ export function heartbeatVsInstance(instanceId: string): Promise<VSInstance> {
 
 export function listVsInstances(): Promise<VSInstance[]> {
   return call<VSInstance[]>('list_vs_instances')
+}
+
+export function listTools(): Promise<ToolDefinitionSummary[]> {
+  return call<ToolDefinitionSummary[]>('list_tools')
 }
 
 export function runMockAgent(

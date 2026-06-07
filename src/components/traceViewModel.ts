@@ -13,6 +13,10 @@ export interface TraceStepViewModel {
   title: string
   shortSummary: string
   status: TraceStatus
+  eventType: ToolTraceEvent['type']
+  toolName: string | null
+  startedAt: string
+  endedAt: string | null
   durationMs: number | null
   summaryItems: TraceSummaryItem[]
   inputSummary: TraceSummaryItem[]
@@ -107,8 +111,10 @@ function toTraceStepViewModel(event: ToolTraceEvent): TraceStepViewModel {
   if (event.type === 'llm_response') {
     const request = asRecord(input.request)
     const choice = firstChoice(output)
+    const tokens = readTokenUsage(output)
     return {
       ...baseStep(event, 'LLM', rawInput, rawOutput),
+      shortSummary: llmTokenShortSummary(tokens),
       summaryItems: compactItems([
         item('Model', stringValue(request.model)),
         item('Tools', String(arrayCount(request.tools))),
@@ -138,6 +144,7 @@ function toTraceStepViewModel(event: ToolTraceEvent): TraceStepViewModel {
     const argumentsValue = asRecord(input.arguments)
     return {
       ...baseStep(event, 'Tool', rawInput, rawOutput),
+      shortSummary: toolStatusSummary(event, output),
       summaryItems: compactItems([
         item('Tool', event.toolName ?? ''),
       ]),
@@ -156,8 +163,10 @@ function toTraceStepViewModel(event: ToolTraceEvent): TraceStepViewModel {
     const response = asRecord(output.response)
     const choice = firstChoice(response)
     const message = extractMessage(event.output) ?? event.outputSummary ?? ''
+    const tokens = readTokenUsage(response)
     return {
       ...baseStep(event, 'LLM', rawInput, rawOutput),
+      shortSummary: llmTokenShortSummary(tokens),
       summaryItems: compactItems([
         item('Model', stringValue(request.model)),
         item('Tools', String(arrayCount(request.tools))),
@@ -232,6 +241,7 @@ function createChatCompletionStep(
   const tokens = readTokenUsage(output)
   return {
     ...baseStep(event, 'LLM', rawInput, rawOutput),
+    shortSummary: llmTokenShortSummary(tokens),
     summaryItems: compactItems([
       item('Provider', stringValue(input.provider)),
       item('Model', stringValue(request.model ?? input.model ?? output.model)),
@@ -266,6 +276,10 @@ function baseStep(
     title,
     shortSummary: event.outputSummary ? sanitizeModelMessage(event.outputSummary) : '',
     status: event.status,
+    eventType: event.type,
+    toolName: event.toolName,
+    startedAt: event.startedAt,
+    endedAt: event.endedAt,
     durationMs: event.durationMs,
     summaryItems: compactItems([item('Duration', formatDuration(event.durationMs))]),
     inputSummary: [],
@@ -337,6 +351,22 @@ function compactJson(value: unknown): string {
   }
 }
 
+function toolStatusSummary(
+  event: ToolTraceEvent,
+  output: Record<string, unknown>,
+): string {
+  if (event.status === 'running') {
+    return 'running'
+  }
+  if (event.status === 'failed' || output.ok === false || output.error) {
+    return 'failed'
+  }
+  if (event.status === 'warning') {
+    return 'warning'
+  }
+  return 'success'
+}
+
 function extractMessage(value: unknown): string | null {
   const record = asRecord(value)
   const message = record.message
@@ -347,6 +377,8 @@ function readTokenUsage(record: Record<string, unknown>): {
   inputTokens: string
   outputTokens: string
   totalTokens: string
+  inputCachedTokens: string
+  inputUncachedTokens: string
   display: string
 } {
   const inputTokens = tokenValue(record, ['inputTokens', 'promptTokens', 'prompt_tokens'])
@@ -355,6 +387,23 @@ function readTokenUsage(record: Record<string, unknown>): {
     'completionTokens',
     'completion_tokens',
   ])
+  const promptTokenDetails = tokenDetailRecords(record)
+  const inputCachedTokens =
+    tokenValue(record, [
+      'inputCachedTokens',
+      'input_cached_tokens',
+      'cachedInputTokens',
+      'cached_input_tokens',
+      'cacheReadInputTokens',
+      'cache_read_input_tokens',
+    ]) || tokenValueFromSources(promptTokenDetails, ['cachedTokens', 'cached_tokens'])
+  const inputUncachedTokens =
+    tokenValue(record, [
+      'inputUncachedTokens',
+      'input_uncached_tokens',
+      'uncachedInputTokens',
+      'uncached_input_tokens',
+    ]) || subtractTokenStrings(inputTokens, inputCachedTokens)
   const totalTokens =
     tokenValue(record, ['totalTokens', 'total_tokens']) ||
     sumTokenStrings(inputTokens, outputTokens)
@@ -368,18 +417,61 @@ function readTokenUsage(record: Record<string, unknown>): {
     inputTokens,
     outputTokens,
     totalTokens,
+    inputCachedTokens,
+    inputUncachedTokens,
     display: displayParts.join(' / ') || 'not reported',
   }
 }
 
+function llmTokenShortSummary(tokens: ReturnType<typeof readTokenUsage>): string {
+  const parts = compactStrings([
+    tokens.inputTokens ?
+      `in ${formatTokenString(tokens.inputTokens)}${inputCacheSuffix(tokens)}`
+    : '',
+    tokens.outputTokens ? `out ${formatTokenString(tokens.outputTokens)}` : '',
+  ])
+  return parts.join(', ') || 'tokens not reported'
+}
+
+function inputCacheSuffix(tokens: ReturnType<typeof readTokenUsage>): string {
+  if (!tokens.inputTokens) {
+    return ''
+  }
+  const cachedTokens = tokens.inputCachedTokens || '0'
+  const uncachedTokens =
+    tokens.inputUncachedTokens || subtractTokenStrings(tokens.inputTokens, cachedTokens)
+  return ` (cached ${formatTokenString(cachedTokens)}, uncached ${formatTokenString(
+    uncachedTokens,
+  )})`
+}
+
 function tokenValue(record: Record<string, unknown>, keys: string[]): string {
-  const tokenSources = [
+  return tokenValueFromSources(tokenSourceRecords(record), keys)
+}
+
+function tokenSourceRecords(record: Record<string, unknown>): Record<string, unknown>[] {
+  return [
     record,
     asRecord(record.tokens),
     asRecord(record.usage),
     asRecord(record.tokenUsage),
   ]
-  for (const source of tokenSources) {
+}
+
+function tokenDetailRecords(record: Record<string, unknown>): Record<string, unknown>[] {
+  return tokenSourceRecords(record).flatMap((source) => [
+    asRecord(source.promptTokensDetails),
+    asRecord(source.prompt_tokens_details),
+    asRecord(source.inputTokensDetails),
+    asRecord(source.input_tokens_details),
+  ])
+}
+
+function tokenValueFromSources(
+  sources: Record<string, unknown>[],
+  keys: string[],
+): string {
+  for (const source of sources) {
     for (const key of keys) {
       const value = source[key]
       if (value !== null && value !== undefined && value !== '') {
@@ -400,6 +492,29 @@ function sumTokenStrings(left: string, right: string): string {
     return ''
   }
   return String(leftValue + rightValue)
+}
+
+function subtractTokenStrings(left: string, right: string): string {
+  if (!left || !right) {
+    return ''
+  }
+  const leftValue = Number(left)
+  const rightValue = Number(right)
+  if (!Number.isFinite(leftValue) || !Number.isFinite(rightValue)) {
+    return ''
+  }
+  return String(Math.max(0, leftValue - rightValue))
+}
+
+function formatTokenString(value: string): string {
+  if (!value) {
+    return '-'
+  }
+  const numericValue = Number(value)
+  if (!Number.isFinite(numericValue)) {
+    return value
+  }
+  return new Intl.NumberFormat().format(numericValue)
 }
 
 function compactStrings(values: string[]): string[] {

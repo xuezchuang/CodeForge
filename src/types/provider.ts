@@ -1,4 +1,5 @@
 export type ProviderType =
+  | 'codex-cli'
   | 'openai-compatible'
   | 'codebuddy'
   | 'claude'
@@ -39,6 +40,7 @@ export interface ProviderModel {
 }
 
 export const providerTypeLabels: Record<ProviderType, string> = {
+  'codex-cli': 'Codex CLI',
   'openai-compatible': 'OpenAI-Compatible',
   codebuddy: 'CodeBuddy',
   claude: 'Claude',

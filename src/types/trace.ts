@@ -35,6 +35,14 @@ export interface MockAgentRun {
 export interface AgentConversationMessage {
   role: 'user' | 'assistant'
   content: string
+  attachments?: AgentMessageAttachment[]
+}
+
+export interface AgentMessageAttachment {
+  kind: 'image'
+  name: string
+  mimeType: string
+  dataUrl: string
 }
 
 export interface AgentRunInput {

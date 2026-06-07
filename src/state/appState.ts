@@ -31,6 +31,19 @@ export const defaultUiPreferences: UiPreferences = {
 
 export const defaultProviders: ProviderConfig[] = [
   {
+    id: 'codex-cli',
+    type: 'codex-cli',
+    name: 'Codex CLI',
+    enabled: true,
+    baseUrl: '',
+    baseUrlLocked: true,
+    defaultCredentialId: '',
+    defaultModel: 'default',
+    temperature: 0.2,
+    credentials: [],
+    models: [],
+  },
+  {
     id: 'openai-compatible',
     type: 'openai-compatible',
     name: 'OpenAI-Compatible',
@@ -231,22 +244,25 @@ export function persistWorkspaceState(state: AppState): void {
 
 function mergeProviders(providers: ProviderConfig[]): ProviderConfig[] {
   const providedById = new Map(providers.map((provider) => [provider.id, provider]))
-  const mergedDefaults = defaultProviders.map((provider) => ({
-    ...provider,
-    ...(providedById.get(provider.id) ?? {}),
-    baseUrl:
-      provider.id === 'minimax'
-        ? minimaxOpenAiBaseUrl
-        : provider.id === 'codebuddy'
-          ? codeBuddyOpenAiBaseUrl
-        : providedById.get(provider.id)?.baseUrl ?? provider.baseUrl,
-    baseUrlLocked:
-      provider.id === 'minimax' || provider.id === 'codebuddy'
-        ? true
-        : providedById.get(provider.id)?.baseUrlLocked ?? provider.baseUrlLocked,
-    credentials: normalizeProviderCredentials(providedById.get(provider.id) ?? provider),
-    models: providedById.get(provider.id)?.models ?? provider.models,
-  }))
+  const mergedDefaults = defaultProviders.map((provider) => {
+    const storedProvider = providedById.get(provider.id)
+    return {
+      ...provider,
+      ...(storedProvider ?? {}),
+      baseUrl:
+        provider.id === 'minimax'
+          ? minimaxOpenAiBaseUrl
+          : provider.id === 'codebuddy'
+            ? codeBuddyOpenAiBaseUrl
+          : storedProvider?.baseUrl ?? provider.baseUrl,
+      baseUrlLocked:
+        provider.id === 'minimax' || provider.id === 'codebuddy' || provider.id === 'codex-cli'
+          ? true
+          : storedProvider?.baseUrlLocked ?? provider.baseUrlLocked,
+      credentials: normalizeProviderCredentials(storedProvider ?? provider),
+      models: storedProvider?.models?.length ? storedProvider.models : provider.models,
+    }
+  })
   const customProviders = providers.filter(
     (provider) => !defaultProviders.some((defaultProvider) => defaultProvider.id === provider.id),
   )
@@ -254,6 +270,9 @@ function mergeProviders(providers: ProviderConfig[]): ProviderConfig[] {
 }
 
 function normalizeProviderCredentials(provider: ProviderConfig): ProviderConfig['credentials'] {
+  if (provider.type === 'codex-cli') {
+    return []
+  }
   if (provider.credentials?.length > 0) {
     return provider.credentials.map((credential, index) => ({
       ...credential,

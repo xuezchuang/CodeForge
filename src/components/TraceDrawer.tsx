@@ -9,7 +9,6 @@ import {
   CircleCheck,
   CircleX,
   Clock3,
-  Copy,
   Download,
   FileText,
   Search,
@@ -21,7 +20,6 @@ import {
   createTraceStepViewModels,
   type TraceStepViewModel,
 } from './traceViewModel'
-import { JsonTree } from './TraceEventRow'
 
 interface TraceDrawerProps {
   open: boolean
@@ -30,12 +28,9 @@ interface TraceDrawerProps {
   onClose: () => void
 }
 
-type TraceDetailTab = 'input' | 'output'
-
 function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
   const dialogRef = useRef<HTMLElement>(null)
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null)
-  const [detailTab, setDetailTab] = useState<TraceDetailTab>('input')
   const steps = useMemo(() => createTraceStepViewModels(traceEvents), [traceEvents])
   const tokenSummary = useMemo(() => createTraceTokenSummary(traceEvents), [traceEvents])
   const runSummary = useMemo(
@@ -116,11 +111,7 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
             onSelectStep={setSelectedStepId}
             runSummary={runSummary}
           />
-          <TraceDetailPanel
-            step={selectedStep}
-            tab={detailTab}
-            onTabChange={setDetailTab}
-          />
+          <TraceDetailPanel step={selectedStep} />
         </section>
 
         <TraceWorkbenchFooter
@@ -272,7 +263,7 @@ function TraceStepNavigator({
           >
             <StatusGlyph status={step.status} />
             <span>{step.index}</span>
-            <strong>{step.title}</strong>
+            <strong>{readableTraceTitle(step)}</strong>
             <small>{formatDurationShort(step.durationMs)}</small>
           </button>
         ))}
@@ -298,118 +289,53 @@ function TraceStepNavigator({
   )
 }
 
-function TraceDetailPanel({
-  step,
-  tab,
-  onTabChange,
-}: {
-  step: TraceStepViewModel | null
-  tab: TraceDetailTab
-  onTabChange: (tab: TraceDetailTab) => void
-}) {
-  const tabs: Array<{ id: TraceDetailTab; label: string }> = [
-    { id: 'input', label: '请求输入' },
-    { id: 'output', label: '响应输出' },
-  ]
-
+function TraceDetailPanel({ step }: { step: TraceStepViewModel | null }) {
   return (
     <section className="trace-detail-panel" aria-label="Trace detail">
-      <div className="trace-detail-tabs" role="tablist" aria-label="Trace detail tabs">
-        {tabs.map((item) => (
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === item.id}
-            className={tab === item.id ? 'trace-detail-tab active' : 'trace-detail-tab'}
-            onClick={() => onTabChange(item.id)}
-            key={item.id}
-          >
-            {item.label}
-          </button>
-        ))}
-      </div>
-
       {!step ? (
         <div className="trace-detail-empty">No trace step selected.</div>
       ) : (
-        <TraceDetailContent step={step} tab={tab} />
+        <TraceDetailContent step={step} />
       )}
     </section>
   )
 }
 
-function TraceDetailContent({
-  step,
-  tab,
-}: {
-  step: TraceStepViewModel
-  tab: TraceDetailTab
-}) {
-  if (tab === 'output') {
-    return (
-      <div className="trace-json-single-pane">
-        <JsonCodePanel
-          title="响应输出"
-          subtitle={formatTimestamp(step.endedAt)}
-          value={step.rawOutput}
-          badge={statusLabel(step.status)}
-        />
-      </div>
-    )
-  }
+function TraceDetailContent({ step }: { step: TraceStepViewModel }) {
+  const argumentsText = readableTraceArguments(step)
+  const thinkingText = readableTraceThinking(step)
+  const resultText = readableTraceResult(step)
 
   return (
-    <div className="trace-json-single-pane">
-      <JsonCodePanel
-        title="请求输入"
-        subtitle={formatTimestamp(step.startedAt)}
-        value={step.rawInput}
-        badge={step.title}
-      />
-    </div>
-  )
-}
-
-function JsonCodePanel({
-  title,
-  subtitle,
-  value,
-  badge,
-}: {
-  title: string
-  subtitle?: string
-  value: unknown
-  badge?: string
-}) {
-  const [copied, setCopied] = useState(false)
-  const text = formatJsonForPanel(value)
-  const treeValue = useMemo(() => normalizeJsonForPanel(value), [value])
-
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(text)
-    } catch {
-      return
-    }
-    setCopied(true)
-    window.setTimeout(() => setCopied(false), 1200)
-  }
-
-  return (
-    <section className="trace-json-pane">
-      <header className="trace-json-pane-header">
-        <span>
-          {badge ? <small>{badge}</small> : null}
-          <strong>{title}</strong>
-          {subtitle ? <em>{subtitle}</em> : null}
-        </span>
-        <button type="button" className="trace-copy-button" onClick={copy}>
-          <Copy size={14} aria-hidden="true" />
-          {copied ? '已复制' : '复制 JSON'}
-        </button>
+    <section className="trace-readable-pane">
+      <header className="trace-readable-header">
+        <div>
+          <strong>{readableTraceTitle(step)}</strong>
+          <span>
+            {statusLabel(step.status)} · {formatDurationShort(step.durationMs)} ·{' '}
+            {formatTimestamp(step.startedAt)}
+          </span>
+        </div>
       </header>
-      <div className="trace-json-pane-body" aria-label={`${title} JSON`}>
-        <JsonTree value={treeValue} />
+      <div className="trace-readable-body">
+        {thinkingText ? (
+          <pre className="trace-readable-thinking">{thinkingText}</pre>
+        ) : null}
+        {argumentsText ? (
+          <div className="trace-readable-row">
+            <span>Arguments</span>
+            <code>{argumentsText}</code>
+          </div>
+        ) : null}
+        {resultText ? (
+          <div className="trace-readable-row">
+            <span>{step.status === 'failed' ? 'Error' : 'Result'}</span>
+            <code>{resultText}</code>
+          </div>
+        ) : null}
+        {!thinkingText && !argumentsText && !resultText ? (
+          <div className="trace-readable-empty">No readable trace content for this step.</div>
+        ) : null}
       </div>
     </section>
   )
@@ -487,6 +413,100 @@ function preferredInitialStep(steps: TraceStepViewModel[]): TraceStepViewModel |
   )
 }
 
+function readableTraceTitle(step: TraceStepViewModel): string {
+  if (
+    step.toolName &&
+    ['tool_call', 'tool_result', 'error'].includes(step.eventType)
+  ) {
+    return step.toolName
+  }
+  if (readableTraceThinking(step)) {
+    return 'Model thinking'
+  }
+  if (step.eventType === 'llm_response' || step.eventType === 'final_response') {
+    return 'Model'
+  }
+  return step.title
+}
+
+function readableTraceArguments(step: TraceStepViewModel): string {
+  if (!['tool_call', 'tool_result', 'error'].includes(step.eventType)) {
+    return ''
+  }
+
+  const input = recordOrEmpty(step.rawInput)
+  const argumentsValue = recordOrEmpty(input.arguments)
+  if (Object.keys(argumentsValue).length === 0) {
+    return ''
+  }
+
+  const path = stringValue(argumentsValue.path)
+  if (path) {
+    const pathText = lineRangeText(
+      path,
+      argumentsValue.start_line ?? argumentsValue.line,
+      argumentsValue.end_line,
+    )
+    const rest = Object.fromEntries(
+      Object.entries(argumentsValue).filter(
+        ([key]) => !['path', 'start_line', 'end_line', 'line'].includes(key),
+      ),
+    )
+    return [pathText, Object.keys(rest).length ? compactTraceJson(rest) : '']
+      .filter(Boolean)
+      .join(' ')
+  }
+
+  return compactTraceJson(argumentsValue)
+}
+
+function readableTraceThinking(step: TraceStepViewModel): string {
+  const output = recordOrEmpty(step.rawOutput)
+  const response = recordOrEmpty(output.response)
+  const choice = firstTraceChoice(response) ?? firstTraceChoice(output)
+  const message = recordOrEmpty(choice?.message)
+  const directThinking = firstReadableText([
+    output.reasoning_content,
+    output.reasoningContent,
+    output.reasoning,
+    response.reasoning_content,
+    response.reasoningContent,
+    response.reasoning,
+    message.reasoning_content,
+    message.reasoningContent,
+    message.reasoning,
+  ])
+
+  if (directThinking) {
+    return normalizeReadableText(directThinking)
+  }
+
+  const thinkBlock = extractThinkBlock(
+    firstReadableText([message.content, output.content, output.message, step.shortSummary]),
+  )
+  if (thinkBlock) {
+    return normalizeReadableText(thinkBlock)
+  }
+
+  if (step.eventType === 'model_message') {
+    return normalizeReadableText(firstReadableText([output.message, step.shortSummary]))
+  }
+
+  return ''
+}
+
+function readableTraceResult(step: TraceStepViewModel): string {
+  if (!['tool_result', 'error'].includes(step.eventType)) {
+    return ''
+  }
+
+  const output = recordOrEmpty(step.rawOutput)
+  if (step.status === 'failed') {
+    return firstReadableText([output.error, step.shortSummary])
+  }
+  return step.shortSummary || compactTraceJson(output)
+}
+
 function StatusGlyph({ status }: { status: TraceStepViewModel['status'] }) {
   if (status === 'failed') {
     return <CircleAlert className="trace-status-glyph failed" size={15} aria-hidden="true" />
@@ -528,40 +548,63 @@ function exportTraceEvents(traceEvents: ToolTraceEvent[], taskId: string | null)
   URL.revokeObjectURL(url)
 }
 
-function formatJsonForPanel(value: unknown): string {
-  if (value === null || value === undefined || value === '') {
-    return '{\n}'
-  }
-
-  if (typeof value === 'string') {
-    try {
-      return JSON.stringify(JSON.parse(value), null, 2)
-    } catch {
-      return JSON.stringify(value, null, 2)
-    }
-  }
-
-  try {
-    return JSON.stringify(value, null, 2)
-  } catch {
-    return JSON.stringify(String(value), null, 2)
-  }
+function recordOrEmpty(value: unknown): Record<string, unknown> {
+  return asRecord(value) ?? {}
 }
 
-function normalizeJsonForPanel(value: unknown): unknown {
-  if (value === null || value === undefined || value === '') {
-    return {}
+function firstTraceChoice(record: Record<string, unknown>): Record<string, unknown> | null {
+  const choices = record.choices
+  if (!Array.isArray(choices)) {
+    return null
   }
+  return asRecord(choices[0])
+}
 
-  if (typeof value === 'string') {
-    try {
-      return JSON.parse(value)
-    } catch {
+function firstReadableText(values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim().length > 0) {
       return value
     }
   }
+  return ''
+}
 
+function extractThinkBlock(value: string): string {
+  const match = value.match(/<think>([\s\S]*?)<\/think>/i)
+  return match?.[1] ?? ''
+}
+
+function normalizeReadableText(value: string): string {
   return value
+    .replace(/\\n/g, '\n')
+    .replace(/\r\n/g, '\n')
+    .replace(/sk-[A-Za-z0-9_-]{10,}/g, 'sk-***')
+    .replace(/(api[_-]?key["']?\s*[:=]\s*["']?)[^"',\s}]+/gi, '$1***')
+    .replace(/(bearer\s+)[A-Za-z0-9._-]{10,}/gi, '$1***')
+    .trim()
+}
+
+function compactTraceJson(value: unknown): string {
+  if (value === null || value === undefined) {
+    return ''
+  }
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function lineRangeText(path: string, start: unknown, end: unknown): string {
+  const startText = stringValue(start)
+  const endText = stringValue(end)
+  if (startText && endText) {
+    return `${path} L${startText}-${endText}`
+  }
+  if (startText) {
+    return `${path} L${startText}`
+  }
+  return path
 }
 
 function formatTimestamp(value: string | null): string {

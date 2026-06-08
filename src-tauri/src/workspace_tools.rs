@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
@@ -17,6 +18,9 @@ const DEFAULT_FILE_CONTEXT_BEFORE: usize = 30;
 const DEFAULT_FILE_CONTEXT_AFTER: usize = 30;
 const MAX_CONTEXT_LINES: usize = 200;
 const BINARY_SAMPLE_BYTES: usize = 8192;
+const SEARCH_FILE_SCAN_LIMIT: usize = 50_000;
+const SEARCH_CONTENT_SCAN_LIMIT: usize = 25_000;
+const SEARCH_SCAN_TIMEOUT_MS: u128 = 12_000;
 
 const IGNORED_DIRS: &[&str] = &[
     ".git",
@@ -133,17 +137,24 @@ pub fn search_file(workspace_root: &str, arguments: &Value) -> Result<Value, Str
     }
 
     let mut matches = Vec::new();
-    walk_files(&workspace, &root, &mut |path| {
+    let started = Instant::now();
+    let mut scan_limited = false;
+    let scanned_files = walk_files_until(&workspace, &root, &mut |path, scanned| {
+        if scanned > SEARCH_FILE_SCAN_LIMIT || started.elapsed().as_millis() >= SEARCH_SCAN_TIMEOUT_MS
+        {
+            scan_limited = true;
+            return Ok(WalkControl::Stop);
+        }
         let rel = relative_path(&workspace, path);
         if let Some(score) = file_match_score(&rel, pattern) {
             matches.push((score, rel));
         }
-        Ok(())
+        Ok(WalkControl::Continue)
     })?;
 
     matches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     let total_matches = matches.len();
-    let truncated = total_matches > max_results;
+    let truncated = total_matches > max_results || scan_limited;
     let paths = matches
         .into_iter()
         .take(max_results)
@@ -156,9 +167,15 @@ pub fn search_file(workspace_root: &str, arguments: &Value) -> Result<Value, Str
         "matches": paths,
         "count": cmp::min(total_matches, max_results),
         "totalMatches": total_matches,
+        "scannedFiles": scanned_files,
+        "complete": !scan_limited,
         "maxResults": max_results,
         "truncated": truncated,
-        "message": if truncated {
+        "message": if scan_limited {
+            Some(format!(
+                "search_limited: scanned {scanned_files} files before returning partial results; narrow root or pattern"
+            ))
+        } else if truncated {
             Some(format!("too_many_results: returned first {max_results} of {total_matches} matches"))
         } else {
             None
@@ -186,29 +203,16 @@ pub fn search_content(workspace_root: &str, arguments: &Value) -> Result<Value, 
         None
     };
 
-    if ripgrep_available() {
-        search_content_with_rg(
-            &workspace,
-            &root,
-            &query,
-            file_glob.as_deref(),
-            max_results,
-            context_lines,
-            case_sensitive,
-            regex,
-        )
-    } else {
-        search_content_with_fallback(
-            &workspace,
-            &root,
-            &query,
-            file_glob.as_deref(),
-            max_results,
-            context_lines,
-            case_sensitive,
-            compiled_regex.as_ref(),
-        )
-    }
+    search_content_with_fallback(
+        &workspace,
+        &root,
+        &query,
+        file_glob.as_deref(),
+        max_results,
+        context_lines,
+        case_sensitive,
+        compiled_regex.as_ref(),
+    )
 }
 
 pub fn get_file_context(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
@@ -391,18 +395,30 @@ fn search_content_with_fallback(
 ) -> Result<Value, String> {
     let mut matches = Vec::new();
     let mut truncated = false;
+    let mut scan_limited = false;
+    let started = Instant::now();
     let normalized_query = if case_sensitive {
         query.to_string()
     } else {
         query.to_ascii_lowercase()
     };
 
-    walk_files(workspace, root, &mut |path| {
+    let scanned_files = walk_files_until(workspace, root, &mut |path, scanned| {
+        if matches.len() >= max_results {
+            truncated = true;
+            return Ok(WalkControl::Stop);
+        }
+        if scanned > SEARCH_CONTENT_SCAN_LIMIT
+            || started.elapsed().as_millis() >= SEARCH_SCAN_TIMEOUT_MS
+        {
+            scan_limited = true;
+            return Ok(WalkControl::Stop);
+        }
         if !content_file_allowed(workspace, path, file_glob) {
-            return Ok(());
+            return Ok(WalkControl::Continue);
         }
         if is_binary_file(path)? {
-            return Ok(());
+            return Ok(WalkControl::Continue);
         }
 
         let mut line_number = 0usize;
@@ -425,7 +441,7 @@ fn search_content_with_fallback(
             for column in columns {
                 if matches.len() >= max_results {
                     truncated = true;
-                    return Ok(());
+                    return Ok(WalkControl::Stop);
                 }
                 let (before, after) =
                     read_before_after(path, line_number, context_lines, context_lines)?;
@@ -440,7 +456,7 @@ fn search_content_with_fallback(
             }
             bytes.clear();
         }
-        Ok(())
+        Ok(WalkControl::Continue)
     })?;
 
     Ok(json!({
@@ -454,8 +470,14 @@ fn search_content_with_fallback(
         "engine": "fallback",
         "matches": matches,
         "count": matches.len(),
-        "truncated": truncated,
-        "message": if truncated {
+        "scannedFiles": scanned_files,
+        "complete": !truncated && !scan_limited,
+        "truncated": truncated || scan_limited,
+        "message": if scan_limited {
+            Some(format!(
+                "search_limited: scanned {scanned_files} files before returning partial results; narrow root or file_glob"
+            ))
+        } else if truncated {
             Some(format!("too_many_results: returned first {max_results} matches"))
         } else {
             None
@@ -568,12 +590,30 @@ fn sorted_read_dir(path: &Path) -> Result<Vec<fs::DirEntry>, String> {
     Ok(entries)
 }
 
+enum WalkControl {
+    Continue,
+    Stop,
+}
+
 fn walk_files(
     workspace: &Path,
     root: &Path,
     visit: &mut impl FnMut(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
+    walk_files_until(workspace, root, &mut |path, _scanned| {
+        visit(path)?;
+        Ok(WalkControl::Continue)
+    })
+    .map(|_| ())
+}
+
+fn walk_files_until(
+    workspace: &Path,
+    root: &Path,
+    visit: &mut impl FnMut(&Path, usize) -> Result<WalkControl, String>,
+) -> Result<usize, String> {
     let mut stack = vec![root.to_path_buf()];
+    let mut scanned = 0usize;
     while let Some(dir) = stack.pop() {
         for entry in sorted_read_dir(&dir)? {
             let path = entry.path();
@@ -589,11 +629,14 @@ fn walk_files(
                 let canonical = canonicalize_path(&path)
                     .map_err(|error| format!("file_not_found: {}: {error}", path.display()))?;
                 ensure_inside_workspace(workspace, &canonical, &path.to_string_lossy())?;
-                visit(&canonical)?;
+                scanned += 1;
+                if matches!(visit(&canonical, scanned)?, WalkControl::Stop) {
+                    return Ok(scanned);
+                }
             }
         }
     }
-    Ok(())
+    Ok(scanned)
 }
 
 fn is_ignored_dir(path: &Path) -> bool {

@@ -135,6 +135,7 @@ struct OpenAiChoice {
 struct OpenAiMessage {
     role: Option<String>,
     content: Option<String>,
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<OpenAiToolCall>>,
 }
 
@@ -520,6 +521,16 @@ async fn run_openai_tool_agent_loop(
             }
         };
 
+        if !tool_calls.is_empty() {
+            push_assistant_model_message_trace(
+                task_id,
+                traces,
+                step_index,
+                &completion.response_body,
+                on_trace,
+            );
+        }
+
         if tool_calls.is_empty() {
             push_final_response_trace(
                 task_id,
@@ -535,19 +546,98 @@ async fn run_openai_tool_agent_loop(
         if round_index >= max_tool_rounds {
             push_trace(
                 traces,
-                error_trace(
+                trace(
                     task_id,
                     *step_index,
-                    "max_tool_rounds exceeded",
+                    TraceEventType::SystemEvent,
+                    None,
+                    "tool_round_budget_reached",
                     Some(json!({
                         "maxToolRounds": max_tool_rounds,
-                        "response": completion.response_body,
+                        "requestedToolCalls": tool_calls,
                     })),
-                    "max_tool_rounds exceeded before the model produced a final response",
+                    None,
+                    Some("Tool round budget reached; asking the model to answer with available evidence.".to_string()),
+                    TraceStatus::Warning,
+                    0,
                 ),
                 on_trace,
             );
             *step_index += 1;
+
+            let mut final_messages = messages.clone();
+            final_messages.push(json!({
+                "role": "system",
+                "content": "Tool round budget reached. Do not call more tools. Answer the user's question now using the available tool results. If evidence is incomplete, state what is missing instead of requesting more tools.",
+            }));
+            let final_request = build_chat_completion_request(selected, final_messages, None);
+            let final_request_title = format!("llm_request:{}:final", round_index + 1);
+            push_trace(
+                traces,
+                trace(
+                    task_id,
+                    *step_index,
+                    TraceEventType::LlmRequest,
+                    None,
+                    &final_request_title,
+                    Some(redact_trace_value(&final_request)),
+                    None,
+                    Some(request_summary(&final_request)),
+                    TraceStatus::Success,
+                    0,
+                ),
+                on_trace,
+            );
+            *step_index += 1;
+
+            let final_completion = match send_chat_completion(selected, &final_request).await {
+                Ok(completion) => completion,
+                Err(error) => {
+                    push_trace(
+                        traces,
+                        error_trace(
+                            task_id,
+                            *step_index,
+                            &format!("{final_request_title} failed"),
+                            Some(redact_trace_value(&final_request)),
+                            &error,
+                        ),
+                        on_trace,
+                    );
+                    *step_index += 1;
+                    return Ok(());
+                }
+            };
+
+            let final_response_title = format!("llm_response:{}:final", round_index + 1);
+            push_trace(
+                traces,
+                trace(
+                    task_id,
+                    *step_index,
+                    TraceEventType::LlmResponse,
+                    None,
+                    &final_response_title,
+                    Some(json!({
+                        "request": redact_trace_value(&final_completion.request_body),
+                    })),
+                    Some(final_completion.response_body.clone()),
+                    Some(response_summary(&final_completion.response_body)),
+                    TraceStatus::Success,
+                    final_completion.duration_ms,
+                ),
+                on_trace,
+            );
+            *step_index += 1;
+
+            push_final_response_trace(
+                task_id,
+                traces,
+                step_index,
+                &final_completion,
+                false,
+                on_trace,
+            );
             return Ok(());
         }
 
@@ -677,6 +767,42 @@ async fn run_openai_tool_agent_loop(
     }
 
     Ok(())
+}
+
+fn push_assistant_model_message_trace(
+    task_id: &str,
+    traces: &mut Vec<ToolTraceEvent>,
+    step_index: &mut u32,
+    response_body: &Value,
+    on_trace: &mut impl FnMut(&ToolTraceEvent),
+) {
+    let message = extract_message_from_response(response_body)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if message.is_empty() {
+        return;
+    }
+
+    push_trace(
+        traces,
+        trace(
+            task_id,
+            *step_index,
+            TraceEventType::ModelMessage,
+            None,
+            "model_message",
+            None,
+            Some(json!({
+                "message": message.clone(),
+            })),
+            Some(message),
+            TraceStatus::Success,
+            0,
+        ),
+        on_trace,
+    );
+    *step_index += 1;
 }
 
 fn push_final_response_trace(
@@ -1311,6 +1437,7 @@ fn parse_streaming_chat_completion(body: &str) -> Result<Value, String> {
     let mut saw_data = false;
     let mut role = "assistant".to_string();
     let mut content = String::new();
+    let mut reasoning_content = String::new();
     let mut finish_reason: Option<String> = None;
     let mut usage: Option<Value> = None;
     let mut tool_calls = Vec::<StreamingToolCall>::new();
@@ -1348,6 +1475,14 @@ fn parse_streaming_chat_completion(body: &str) -> Result<Value, String> {
             if let Some(delta_content) = delta.get("content").and_then(Value::as_str) {
                 content.push_str(delta_content);
             }
+            if let Some(delta_reasoning) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoningContent"))
+                .or_else(|| delta.get("reasoning"))
+                .and_then(Value::as_str)
+            {
+                reasoning_content.push_str(delta_reasoning);
+            }
             if let Some(delta_tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for delta_tool_call in delta_tool_calls {
                     merge_streaming_tool_call(&mut tool_calls, delta_tool_call);
@@ -1363,7 +1498,7 @@ fn parse_streaming_chat_completion(body: &str) -> Result<Value, String> {
     }
 
     let tool_calls = streaming_tool_calls_json(&tool_calls);
-    let message = if tool_calls.is_empty() {
+    let mut message = if tool_calls.is_empty() {
         json!({
             "role": role,
             "content": content,
@@ -1375,6 +1510,9 @@ fn parse_streaming_chat_completion(body: &str) -> Result<Value, String> {
             "tool_calls": tool_calls,
         })
     };
+    if !reasoning_content.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning_content);
+    }
 
     let mut response_body = json!({
         "choices": [{
@@ -1694,33 +1832,49 @@ fn normalize_conversation_messages(
         .unwrap_or(&[])
         .iter()
         .filter_map(|message| {
+            if is_synthetic_continuation_reminder(&message.content) {
+                return None;
+            }
             let role = match message.role.as_str() {
                 "assistant" => "assistant",
                 "user" => "user",
                 _ => return None,
             };
-            if message.content.trim().is_empty() {
+            let content = message.content.trim().to_string();
+            if content.is_empty() {
                 if message.attachments.is_empty() {
                     return None;
                 }
             }
             Some(ChatMessage {
                 role: role.to_string(),
-                content: message.content.clone(),
+                content,
                 attachments: message.attachments.clone(),
             })
         })
         .collect::<Vec<_>>();
 
     if normalized.is_empty() {
+        let content = if is_synthetic_continuation_reminder(user_prompt) {
+            String::new()
+        } else {
+            user_prompt.trim().to_string()
+        };
         return vec![ChatMessage {
             role: "user".to_string(),
-            content: user_prompt.to_string(),
+            content,
             attachments: Vec::new(),
         }];
     }
 
     normalized
+}
+
+fn is_synthetic_continuation_reminder(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed.starts_with("[System reminder:")
+        && trimmed.contains("Output token limit hit")
+        && trimmed.contains("Resume directly")
 }
 
 fn sum_optional_tokens(left: Option<u64>, right: Option<u64>) -> Option<u64> {

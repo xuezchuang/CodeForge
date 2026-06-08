@@ -583,25 +583,33 @@ function appendTraceEventToSession(
     return state
   }
 
+  const nextTaskTraceEvents = appendTraceEvent(task.traceEvents, traceEvent)
+
   return {
     ...state,
     tasksById: {
       ...state.tasksById,
       [sessionTaskId]: {
         ...task,
-        traceEvents: appendTraceEvent(task.traceEvents, traceEvent),
+        traceEvents: nextTaskTraceEvents,
         messages:
           pendingAssistantMessageId ?
-            task.messages.map((message) =>
-              message.id === pendingAssistantMessageId ?
-                {
-                  ...message,
-                  taskId: traceEvent.taskId,
-                  traceEvents: appendTraceEvent(message.traceEvents ?? [], traceEvent),
-                  status: 'running',
-                }
-              : message,
-            )
+            task.messages.map((message) => {
+              if (message.id !== pendingAssistantMessageId) {
+                return message
+              }
+              const nextMessageTraceEvents = appendTraceEvent(
+                message.traceEvents ?? [],
+                traceEvent,
+              )
+              return {
+                ...message,
+                taskId: traceEvent.taskId,
+                content: createRunningAssistantContent(nextMessageTraceEvents),
+                traceEvents: nextMessageTraceEvents,
+                status: 'running',
+              }
+            })
           : task.messages,
       },
     },
@@ -662,18 +670,56 @@ function createConversationMessages(messages: ChatMessage[]): AgentConversationM
   return messages
     .filter(
       (message): message is ChatMessage & { role: 'user' | 'assistant' } =>
-        message.role === 'user' || message.role === 'assistant',
+        (message.role === 'user' || message.role === 'assistant') &&
+        !isTransientConversationMessage(message),
     )
-    .map((message) => ({
-      role: message.role,
-      content: message.content,
-      attachments: message.attachments?.map(({ kind, name, mimeType, dataUrl }) => ({
-        kind,
-        name,
-        mimeType,
-        dataUrl,
-      })),
-    }))
+    .map((message) => {
+      const content = sanitizeConversationContent(message.content)
+      return {
+        role: message.role,
+        content,
+        attachments: message.attachments?.map(({ kind, name, mimeType, dataUrl }) => ({
+          kind,
+          name,
+          mimeType,
+          dataUrl,
+        })),
+      }
+    })
+    .filter(
+      (message) =>
+        message.content.trim().length > 0 ||
+        Boolean(message.attachments && message.attachments.length > 0),
+    )
+}
+
+function isTransientConversationMessage(message: ChatMessage): boolean {
+  if (isSyntheticContinuationReminder(message.content)) {
+    return true
+  }
+  if (message.role !== 'assistant') {
+    return false
+  }
+  return (
+    message.status === 'running' ||
+    message.status === 'failed' ||
+    message.content.startsWith('Thinking...\n\n') ||
+    message.content.startsWith('Run failed:')
+  )
+}
+
+function sanitizeConversationContent(content: string): string {
+  const trimmed = content.trim()
+  return isSyntheticContinuationReminder(trimmed) ? '' : content
+}
+
+function isSyntheticContinuationReminder(content: string): boolean {
+  const trimmed = content.trim()
+  return (
+    trimmed.startsWith('[System reminder:') &&
+    trimmed.includes('Output token limit hit') &&
+    trimmed.includes('Resume directly')
+  )
 }
 
 function createMessage(
@@ -694,10 +740,124 @@ function createMessage(
 
 function createPendingAssistantMessage(taskId: string): ChatMessage {
   return {
-    ...createMessage(taskId, 'assistant', 'Working...'),
+    ...createMessage(taskId, 'assistant', createRunningAssistantContent([])),
     status: 'running',
     traceEvents: [],
   }
+}
+
+function createRunningAssistantContent(traces: ToolTraceEvent[]): string {
+  const latestTrace = traces.at(-1)
+  if (!latestTrace) {
+    return 'Thinking...\n\nWaiting for the first trace event.'
+  }
+  return `Thinking...\n\n${describeRunningTrace(latestTrace)}`
+}
+
+function describeRunningTrace(event: ToolTraceEvent): string {
+  const detail = runningTraceDetail(event)
+
+  if (event.status === 'failed' || event.type === 'error') {
+    return appendRunningDetail('Step failed', detail)
+  }
+  if (event.type === 'llm_request') {
+    return appendRunningDetail('Sending model request', detail)
+  }
+  if (event.type === 'llm_response') {
+    return appendRunningDetail(
+      'Received model response; updating the thinking trace',
+      detail,
+    )
+  }
+  if (event.type === 'tool_call') {
+    return appendRunningDetail(
+      `Running ${runningToolLabel(event.toolName)}`,
+      detail,
+    )
+  }
+  if (event.type === 'tool_result') {
+    if (event.toolName === 'chat_completion') {
+      return appendRunningDetail(
+        'Received model response; updating the thinking trace',
+        detail,
+      )
+    }
+    return appendRunningDetail(
+      `Completed ${runningToolLabel(event.toolName)}`,
+      detail,
+    )
+  }
+  if (event.type === 'final_response') {
+    return appendRunningDetail('Composing final response', detail)
+  }
+  if (event.type === 'model_message') {
+    return appendRunningDetail('Reading model message', detail)
+  }
+  return appendRunningDetail(event.outputSummary ?? event.title ?? 'Working', detail)
+}
+
+function runningToolLabel(toolName: string | null): string {
+  if (toolName === 'search_content') {
+    return 'content search'
+  }
+  if (toolName === 'search_file') {
+    return 'file search'
+  }
+  if (toolName === 'read_file') {
+    return 'file read'
+  }
+  if (toolName === 'list_dir') {
+    return 'directory listing'
+  }
+  if (toolName === 'get_file_context') {
+    return 'context read'
+  }
+  return toolName ?? 'tool step'
+}
+
+function runningTraceDetail(event: ToolTraceEvent): string {
+  const input = plainRecord(event.input)
+  const output = plainRecord(event.output)
+  const request = plainRecord(input.request)
+  const response = plainRecord(output.response)
+  const argumentsValue = plainRecord(input.arguments)
+
+  return firstRunningText([
+    argumentsValue.query,
+    argumentsValue.pattern,
+    argumentsValue.path,
+    input.model,
+    request.model,
+    output.model,
+    response.model,
+    event.outputSummary,
+    event.title,
+  ])
+}
+
+function appendRunningDetail(text: string, detail: string): string {
+  return detail ? `${text}: ${detail}` : text
+}
+
+function firstRunningText(values: unknown[]): string {
+  for (const value of values) {
+    const text = typeof value === 'string' ? compactRunningDetail(value) : ''
+    if (text) {
+      return text
+    }
+  }
+  return ''
+}
+
+function compactRunningDetail(value: string): string {
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  return normalized.length > 96 ? `${normalized.slice(0, 93)}...` : normalized
+}
+
+function plainRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ?
+      (value as Record<string, unknown>)
+    : {}
 }
 
 function createAssistantMessage(

@@ -177,7 +177,7 @@ fn search_content_definition() -> Value {
         "type": "function",
         "function": {
             "name": SEARCH_CONTENT_TOOL_NAME,
-            "description": "Search text content inside workspace files. Uses ripgrep when available and falls back to ordinary traversal. Returns structured matches with file, line, column, text, before, and after.",
+            "description": "Search text content inside workspace files with bounded traversal. Returns structured matches with file, line, column, text, before, and after. Narrow root or file_glob for large repositories.",
             "parameters": {
                 "type": "object",
                 "properties": {

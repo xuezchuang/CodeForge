@@ -68,6 +68,8 @@ pub struct ProviderConfig {
     pub base_url: String,
     #[serde(default)]
     pub base_url_locked: bool,
+    #[serde(default)]
+    pub supports_tool_call: Option<bool>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub api_key: String,
     #[serde(default)]
@@ -221,6 +223,7 @@ fn default_providers() -> Vec<ProviderConfig> {
             enabled: false,
             base_url: CODEBUDDY_OPENAI_BASE_URL.to_string(),
             base_url_locked: true,
+            supports_tool_call: None,
             api_key: String::new(),
             default_credential_id: String::new(),
             default_model: "glm-5.1".to_string(),
@@ -238,6 +241,7 @@ fn default_providers() -> Vec<ProviderConfig> {
             enabled: false,
             base_url: "http://127.0.0.1:11434".to_string(),
             base_url_locked: false,
+            supports_tool_call: None,
             api_key: String::new(),
             default_credential_id: String::new(),
             default_model: "llama3.1".to_string(),
@@ -262,6 +266,7 @@ fn codex_cli_provider() -> ProviderConfig {
         enabled: true,
         base_url: String::new(),
         base_url_locked: true,
+        supports_tool_call: None,
         api_key: String::new(),
         default_credential_id: String::new(),
         default_model: CODEX_CLI_DEFAULT_MODEL.to_string(),
@@ -285,6 +290,7 @@ fn provider(id: &str, provider_type: &str, name: &str, default_model: &str) -> P
             String::new()
         },
         base_url_locked: id == "minimax" || id == "codebuddy",
+        supports_tool_call: None,
         api_key: String::new(),
         default_credential_id: String::new(),
         default_model: default_model.to_string(),
@@ -352,6 +358,7 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                     enabled: provider.enabled,
                     base_url: String::new(),
                     base_url_locked: true,
+                    supports_tool_call: provider.supports_tool_call,
                     api_key: String::new(),
                     default_credential_id: String::new(),
                     default_model: if provider.default_model.trim().is_empty() {
@@ -421,6 +428,7 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                     || provider_type == "minimax"
                     || id == "codebuddy"
                     || provider_type == "codebuddy",
+                supports_tool_call: provider.supports_tool_call,
                 api_key: String::new(),
                 default_credential_id,
                 default_model: provider.default_model.trim().to_string(),

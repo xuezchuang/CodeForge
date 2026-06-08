@@ -4305,6 +4305,22 @@ pre {
   flex: 0 0 auto;
 }
 
+.trace-json-pane-body {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #080d12;
+}
+
+.trace-json-pane-body .trace-json-tree {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  background: #080d12;
+}
+
 .trace-code-list {
   min-width: 0;
   min-height: 0;

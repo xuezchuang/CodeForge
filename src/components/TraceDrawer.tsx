@@ -21,6 +21,7 @@ import {
   createTraceStepViewModels,
   type TraceStepViewModel,
 } from './traceViewModel'
+import { JsonTree } from './TraceEventRow'
 
 interface TraceDrawerProps {
   open: boolean
@@ -29,12 +30,12 @@ interface TraceDrawerProps {
   onClose: () => void
 }
 
-type TraceDetailTab = 'payload' | 'headers' | 'metadata' | 'events'
+type TraceDetailTab = 'input' | 'output'
 
 function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
   const dialogRef = useRef<HTMLElement>(null)
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null)
-  const [detailTab, setDetailTab] = useState<TraceDetailTab>('payload')
+  const [detailTab, setDetailTab] = useState<TraceDetailTab>('input')
   const steps = useMemo(() => createTraceStepViewModels(traceEvents), [traceEvents])
   const tokenSummary = useMemo(() => createTraceTokenSummary(traceEvents), [traceEvents])
   const runSummary = useMemo(
@@ -307,10 +308,8 @@ function TraceDetailPanel({
   onTabChange: (tab: TraceDetailTab) => void
 }) {
   const tabs: Array<{ id: TraceDetailTab; label: string }> = [
-    { id: 'payload', label: '请求输入' },
-    { id: 'headers', label: 'Headers' },
-    { id: 'metadata', label: 'Metadata' },
-    { id: 'events', label: 'Events' },
+    { id: 'input', label: '请求输入' },
+    { id: 'output', label: '响应输出' },
   ]
 
   return (
@@ -346,43 +345,26 @@ function TraceDetailContent({
   step: TraceStepViewModel
   tab: TraceDetailTab
 }) {
-  if (tab === 'headers') {
+  if (tab === 'output') {
     return (
       <div className="trace-json-single-pane">
-        <JsonCodePanel title="Headers" value={buildTraceHeaders(step)} />
-      </div>
-    )
-  }
-
-  if (tab === 'metadata') {
-    return (
-      <div className="trace-json-single-pane">
-        <JsonCodePanel title="Metadata" value={buildTraceMetadata(step)} />
-      </div>
-    )
-  }
-
-  if (tab === 'events') {
-    return (
-      <div className="trace-json-single-pane">
-        <JsonCodePanel title="Events" value={buildTraceEventPayload(step)} />
+        <JsonCodePanel
+          title="响应输出"
+          subtitle={formatTimestamp(step.endedAt)}
+          value={step.rawOutput}
+          badge={statusLabel(step.status)}
+        />
       </div>
     )
   }
 
   return (
-    <div className="trace-json-split">
+    <div className="trace-json-single-pane">
       <JsonCodePanel
         title="请求输入"
         subtitle={formatTimestamp(step.startedAt)}
         value={step.rawInput}
         badge={step.title}
-      />
-      <JsonCodePanel
-        title="响应输出"
-        subtitle={formatTimestamp(step.endedAt)}
-        value={step.rawOutput}
-        badge={statusLabel(step.status)}
       />
     </div>
   )
@@ -401,7 +383,7 @@ function JsonCodePanel({
 }) {
   const [copied, setCopied] = useState(false)
   const text = formatJsonForPanel(value)
-  const lines = text.split('\n')
+  const treeValue = useMemo(() => normalizeJsonForPanel(value), [value])
 
   const copy = async () => {
     try {
@@ -423,17 +405,12 @@ function JsonCodePanel({
         </span>
         <button type="button" className="trace-copy-button" onClick={copy}>
           <Copy size={14} aria-hidden="true" />
-          {copied ? '已复制' : '复制JSON'}
+          {copied ? '已复制' : '复制 JSON'}
         </button>
       </header>
-      <pre className="trace-code-list" aria-label={`${title} JSON`}>
-        {lines.map((line, index) => (
-          <span className="trace-code-line" key={`${index}-${line}`}>
-            <span className="trace-code-line-number">{index + 1}</span>
-            <code>{line || ' '}</code>
-          </span>
-        ))}
-      </pre>
+      <div className="trace-json-pane-body" aria-label={`${title} JSON`}>
+        <JsonTree value={treeValue} />
+      </div>
     </section>
   )
 }
@@ -536,45 +513,6 @@ function traceSearchText(step: TraceStepViewModel): string {
     .toLowerCase()
 }
 
-function buildTraceHeaders(step: TraceStepViewModel): unknown {
-  const input = asRecord(step.rawInput)
-  const output = asRecord(step.rawOutput)
-  const request = asRecord(input?.request)
-  const response = asRecord(output?.response)
-
-  return (
-    asRecord(input?.headers) ??
-    asRecord(request?.headers) ??
-    asRecord(output?.headers) ??
-    asRecord(response?.headers) ??
-    {}
-  )
-}
-
-function buildTraceMetadata(step: TraceStepViewModel): unknown {
-  return {
-    id: step.id,
-    index: step.index,
-    title: step.title,
-    eventType: step.eventType,
-    toolName: step.toolName,
-    status: step.status,
-    startedAt: step.startedAt,
-    endedAt: step.endedAt,
-    durationMs: step.durationMs,
-    summaryItems: step.summaryItems,
-  }
-}
-
-function buildTraceEventPayload(step: TraceStepViewModel): unknown {
-  return {
-    inputSummary: step.inputSummary,
-    outputSummary: step.outputSummary,
-    rawInput: step.rawInput,
-    rawOutput: step.rawOutput,
-  }
-}
-
 function exportTraceEvents(traceEvents: ToolTraceEvent[], taskId: string | null): void {
   const payload = JSON.stringify({ taskId, traceEvents }, null, 2)
   const blob = new Blob([payload], { type: 'application/json' })
@@ -608,6 +546,22 @@ function formatJsonForPanel(value: unknown): string {
   } catch {
     return JSON.stringify(String(value), null, 2)
   }
+}
+
+function normalizeJsonForPanel(value: unknown): unknown {
+  if (value === null || value === undefined || value === '') {
+    return {}
+  }
+
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value)
+    } catch {
+      return value
+    }
+  }
+
+  return value
 }
 
 function formatTimestamp(value: string | null): string {

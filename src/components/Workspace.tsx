@@ -191,10 +191,7 @@ function Workspace({
 
     setBusy(true)
     setSelectedTrace(null)
-    setState((current) => ({
-      ...addOrReplaceSessionTask(current, activeProject.id, pendingTask),
-      traceDrawerOpen: true,
-    }))
+    setState((current) => addOrReplaceSessionTask(current, activeProject.id, pendingTask))
 
     try {
       unlisten = await listen<ToolTraceEvent>(traceEventName, (event) => {
@@ -523,10 +520,7 @@ function completeSessionRun(
   return {
     ...state,
     currentWorkspaceTaskId: sessionTaskId,
-    traceDrawerOpen:
-      state.traceDrawerOpen ||
-      state.settings?.uiPreferences.defaultWorkspaceLayout === 'split-chat-trace' ||
-      (state.settings?.uiPreferences.autoOpenTraceOnErrors === true && failed),
+    traceDrawerOpen: state.traceDrawerOpen,
     tasksById: {
       ...state.tasksById,
       [sessionTaskId]: {

@@ -149,7 +149,7 @@ const preferredRawJsonKeyOrder = [
   'after',
 ]
 
-function JsonTree({ value }: { value: unknown }) {
+export function JsonTree({ value }: { value: unknown }) {
   const [expansionCommand, setExpansionCommand] = useState<JsonTreeExpansionCommand>({
     open: null,
     version: 0,

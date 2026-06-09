@@ -539,6 +539,7 @@ function updateTraceEventsForMessage(
   traces: ToolTraceEvent[],
 ): AppState {
   let changed = false
+  const failed = hasFailedTrace(traces)
   const tasksById: Record<string, AgentTask> = Object.fromEntries(
     Object.entries(state.tasksById).map(([sessionTaskId, task]) => {
       let taskChanged = false
@@ -550,6 +551,7 @@ function updateTraceEventsForMessage(
         return {
           ...message,
           traceEvents: traces,
+          status: failed ? 'failed' : message.status,
         }
       })
       const taskTraceMatches = task.traceEvents.some((event) => event.taskId === taskId)
@@ -563,7 +565,7 @@ function updateTraceEventsForMessage(
           ...task,
           messages: taskChanged ? messages : task.messages,
           traceEvents: taskTraceMatches || taskChanged ? traces : task.traceEvents,
-          status: hasFailedTrace(traces) ? 'failed' : task.status,
+          status: failed ? 'failed' : task.status,
         },
       ]
     }),

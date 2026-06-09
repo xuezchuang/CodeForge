@@ -320,13 +320,22 @@ function readTasksById(value: unknown): Record<string, AgentTask> {
 }
 
 function restorePersistedTask(task: AgentTask): AgentTask {
-  if (task.status !== 'running') {
+  if (task.status !== 'running' && task.status !== 'failed') {
+    return task
+  }
+
+  const messages = task.messages.map((message) =>
+    message.status === 'running' ? { ...message, status: 'failed' as const } : message,
+  )
+  const messagesChanged = messages.some((message, index) => message !== task.messages[index])
+  if (task.status === 'failed' && !messagesChanged) {
     return task
   }
 
   return {
     ...task,
     status: 'failed',
+    messages: messagesChanged ? messages : task.messages,
   }
 }
 

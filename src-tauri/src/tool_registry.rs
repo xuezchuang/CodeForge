@@ -1,3 +1,6 @@
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::vs_bridge_client;
@@ -8,6 +11,10 @@ pub const LIST_DIR_TOOL_NAME: &str = "list_dir";
 pub const READ_FILE_TOOL_NAME: &str = "read_file";
 pub const SEARCH_FILE_TOOL_NAME: &str = "search_file";
 pub const SEARCH_CONTENT_TOOL_NAME: &str = "search_content";
+pub const EDIT_FILE_TOOL_NAME: &str = "edit_file";
+pub const WRITE_FILE_TOOL_NAME: &str = "write_file";
+pub const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
+pub const APPLY_PATCH_RAW_TOOL_NAME: &str = "apply_patch_raw";
 pub const GET_FILE_CONTEXT_TOOL_NAME: &str = "get_file_context";
 pub const VS_CURRENT_SOLUTION_TOOL_NAME: &str = "vs.current_solution";
 pub const VS_CURRENT_DOCUMENT_TOOL_NAME: &str = "vs.current_document";
@@ -19,15 +26,46 @@ pub const VS_GET_ERROR_LIST_TOOL_NAME: &str = "vs.get_error_list";
 pub struct ToolExecutionContext<'a> {
     pub workspace_root: &'a str,
     pub vs_bridge_endpoint: Option<&'a str>,
+    pub allow_shell: bool,
+    pub assume_yes: bool,
+    pub cli_mode: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultStatus {
+    Ok,
+    Error,
+    Timeout,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolResult {
+    pub status: ToolResultStatus,
+    pub output: Option<Value>,
+    pub error: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+impl ToolResult {
+    pub fn to_model_value(&self) -> Value {
+        json!({
+            "status": self.status,
+            "ok": self.status == ToolResultStatus::Ok,
+            "output": self.output,
+            "error": self.error,
+            "elapsedMs": self.elapsed_ms,
+        })
+    }
 }
 
 pub fn tool_definitions() -> Vec<Value> {
-    vec![
-        calculator_add_definition(),
+    let mut tools = base_tool_definitions();
+    tools.extend([
         list_dir_definition(),
-        read_file_definition(),
         search_file_definition(),
-        search_content_definition(),
         get_file_context_definition(),
         vs_current_solution_definition(),
         vs_current_document_definition(),
@@ -35,10 +73,101 @@ pub fn tool_definitions() -> Vec<Value> {
         vs_list_projects_definition(),
         vs_list_project_files_definition(),
         vs_get_error_list_definition(),
+    ]);
+    tools
+}
+
+pub fn cli_tool_definitions(
+    provider_type: &str,
+    model_id: &str,
+    shell_enabled: bool,
+) -> Vec<Value> {
+    let mut tools = base_tool_definitions();
+    if shell_enabled {
+        tools.push(shell_command_definition());
+    }
+    if exposes_apply_patch_raw(provider_type, model_id) {
+        tools.push(apply_patch_raw_definition());
+    }
+    tools
+}
+
+fn base_tool_definitions() -> Vec<Value> {
+    vec![
+        calculator_add_definition(),
+        read_file_definition(),
+        search_content_definition(),
+        edit_file_definition(),
+        write_file_definition(),
     ]
 }
 
+pub fn exposes_apply_patch_raw(provider_type: &str, model_id: &str) -> bool {
+    let provider = provider_type.to_ascii_lowercase();
+    let model = model_id.to_ascii_lowercase();
+    (provider.contains("openai") || provider.contains("codex") || model.contains("codex"))
+        && !matches!(
+            provider.as_str(),
+            "minimax" | "deepseek" | "glm" | "codebuddy"
+        )
+}
+
 pub async fn execute_tool(
+    context: &ToolExecutionContext<'_>,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let result = execute_tool_result(context, name, arguments).await;
+    match result.status {
+        ToolResultStatus::Ok => Ok(result.output.unwrap_or(Value::Null)),
+        ToolResultStatus::Error | ToolResultStatus::Rejected | ToolResultStatus::Timeout => {
+            Err(result
+                .error
+                .unwrap_or_else(|| format!("tool failed: {name}")))
+        }
+    }
+}
+
+pub async fn execute_tool_result(
+    context: &ToolExecutionContext<'_>,
+    name: &str,
+    arguments: &Value,
+) -> ToolResult {
+    let started = Instant::now();
+    match execute_tool_inner(context, name, arguments).await {
+        Ok(output) => ToolResult {
+            status: ToolResultStatus::Ok,
+            output: Some(output),
+            error: None,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+        Err(error) => ToolResult {
+            status: if error.starts_with("rejected:") {
+                ToolResultStatus::Rejected
+            } else if error.starts_with("timeout:") {
+                ToolResultStatus::Timeout
+            } else {
+                ToolResultStatus::Error
+            },
+            output: None,
+            error: Some(error),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+    }
+}
+
+fn tool_timeout(name: &str) -> Duration {
+    match name {
+        READ_FILE_TOOL_NAME => Duration::from_secs(10),
+        SEARCH_CONTENT_TOOL_NAME | EDIT_FILE_TOOL_NAME | WRITE_FILE_TOOL_NAME => {
+            Duration::from_secs(30)
+        }
+        SHELL_COMMAND_TOOL_NAME => Duration::from_secs(60),
+        _ => Duration::from_secs(30),
+    }
+}
+
+async fn execute_tool_inner(
     context: &ToolExecutionContext<'_>,
     name: &str,
     arguments: &Value,
@@ -48,31 +177,22 @@ pub async fn execute_tool(
         LIST_DIR_TOOL_NAME => workspace_tools::list_dir(context.workspace_root, arguments),
         READ_FILE_TOOL_NAME => workspace_tools::read_file(context.workspace_root, arguments),
         SEARCH_FILE_TOOL_NAME => workspace_tools::search_file(context.workspace_root, arguments),
-        SEARCH_CONTENT_TOOL_NAME => {
-            workspace_tools::search_content(context.workspace_root, arguments)
-        }
-        GET_FILE_CONTEXT_TOOL_NAME => {
-            workspace_tools::get_file_context(context.workspace_root, arguments)
-        }
-        VS_CURRENT_SOLUTION_TOOL_NAME => {
-            vs_bridge_client::call_vs_current_solution(context.vs_bridge_endpoint).await
-        }
-        VS_CURRENT_DOCUMENT_TOOL_NAME => {
-            vs_bridge_client::call_vs_current_document(context.vs_bridge_endpoint).await
-        }
-        VS_CURRENT_SELECTION_TOOL_NAME => {
-            vs_bridge_client::call_vs_current_selection(context.vs_bridge_endpoint).await
-        }
-        VS_LIST_PROJECTS_TOOL_NAME => {
-            vs_bridge_client::call_vs_list_projects(context.vs_bridge_endpoint).await
-        }
-        VS_LIST_PROJECT_FILES_TOOL_NAME => {
-            vs_bridge_client::call_vs_list_project_files(context.vs_bridge_endpoint, arguments)
-                .await
-        }
-        VS_GET_ERROR_LIST_TOOL_NAME => {
-            vs_bridge_client::call_vs_get_error_list(context.vs_bridge_endpoint).await
-        }
+        SEARCH_CONTENT_TOOL_NAME => workspace_tools::search_content(context.workspace_root, arguments),
+        EDIT_FILE_TOOL_NAME => workspace_tools::edit_file(context.workspace_root, arguments),
+        WRITE_FILE_TOOL_NAME => workspace_tools::write_file(context.workspace_root, arguments),
+        SHELL_COMMAND_TOOL_NAME => workspace_tools::shell_command(
+            context.workspace_root,
+            arguments,
+            context.allow_shell,
+            context.assume_yes,
+        ).await,
+        APPLY_PATCH_RAW_TOOL_NAME => Err("rejected: apply_patch_raw is reserved for compatible Codex/OpenAI adapters and is not implemented in the CLI runtime".to_string()),
+        VS_CURRENT_SOLUTION_TOOL_NAME => vs_bridge_client::call_vs_current_solution(context.vs_bridge_endpoint).await,
+        VS_CURRENT_DOCUMENT_TOOL_NAME => vs_bridge_client::call_vs_current_document(context.vs_bridge_endpoint).await,
+        VS_CURRENT_SELECTION_TOOL_NAME => vs_bridge_client::call_vs_current_selection(context.vs_bridge_endpoint).await,
+        VS_LIST_PROJECTS_TOOL_NAME => vs_bridge_client::call_vs_list_projects(context.vs_bridge_endpoint).await,
+        VS_LIST_PROJECT_FILES_TOOL_NAME => vs_bridge_client::call_vs_list_project_files(context.vs_bridge_endpoint, arguments).await,
+        VS_GET_ERROR_LIST_TOOL_NAME => vs_bridge_client::call_vs_get_error_list(context.vs_bridge_endpoint).await,
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -213,6 +333,78 @@ fn search_content_definition() -> Value {
                     }
                 },
                 "required": ["query"]
+            }
+        }
+    })
+}
+
+fn edit_file_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": EDIT_FILE_TOOL_NAME,
+            "description": "Edit a text file inside the workspace by replacing one exact text block. Prefer this over raw patch tools for third-party models.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "description": "Workspace-relative file path." },
+                    "search": { "type": "string", "description": "Exact text to replace. Must occur exactly once." },
+                    "replace": { "type": "string", "description": "Replacement text." }
+                },
+                "required": ["file", "search", "replace"]
+            }
+        }
+    })
+}
+
+fn write_file_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": WRITE_FILE_TOOL_NAME,
+            "description": "Write UTF-8 text to a workspace-relative file. Creates parent directories inside the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "description": "Workspace-relative file path." },
+                    "content": { "type": "string", "description": "Full new file contents." }
+                },
+                "required": ["file", "content"]
+            }
+        }
+    })
+}
+
+fn shell_command_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": SHELL_COMMAND_TOOL_NAME,
+            "description": "Run a bounded command in the workspace. Dangerous commands are rejected; install commands require explicit confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Command line to execute." },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "default": 60000 }
+                },
+                "required": ["command"]
+            }
+        }
+    })
+}
+
+fn apply_patch_raw_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": APPLY_PATCH_RAW_TOOL_NAME,
+            "description": "Compatibility-only raw patch tool for Codex/OpenAI-style models. Other providers should use edit_file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": { "type": "string" }
+                },
+                "required": ["patch"]
             }
         }
     })
@@ -384,6 +576,9 @@ mod tests {
         ToolExecutionContext {
             workspace_root: ".",
             vs_bridge_endpoint: None,
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
         }
     }
 
@@ -460,5 +655,83 @@ mod tests {
         assert_eq!(result["ok"], json!(false));
         assert_eq!(result["status"], json!("bridge_not_connected"));
         assert_eq!(result["source"], json!("vsix"));
+    }
+}
+
+#[cfg(test)]
+mod cli_runtime_tests {
+    use super::*;
+    use std::fs;
+
+    fn workspace() -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("codeforge-tool-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn context(root: &str, allow_shell: bool) -> ToolExecutionContext<'_> {
+        ToolExecutionContext {
+            workspace_root: root,
+            vs_bridge_endpoint: None,
+            allow_shell,
+            assume_yes: true,
+            cli_mode: true,
+        }
+    }
+
+    #[test]
+    fn unknown_tool_returns_error_result() {
+        let root = workspace();
+        let result = tauri::async_runtime::block_on(execute_tool_result(
+            &context(root.to_str().unwrap(), false),
+            "missing.tool",
+            &json!({}),
+        ));
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert!(result.error.unwrap().contains("Unknown tool"));
+    }
+
+    #[test]
+    fn minimax_profile_does_not_expose_apply_patch_raw() {
+        let tools = cli_tool_definitions("minimax", "MiniMax-M2.7", false);
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.get("function")?.get("name")?.as_str())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&APPLY_PATCH_RAW_TOOL_NAME));
+        assert!(names.contains(&EDIT_FILE_TOOL_NAME));
+    }
+
+    #[test]
+    fn edit_file_search_replace_modifies_file() {
+        let root = workspace();
+        fs::write(root.join("sample.txt"), "alpha\nbeta\n").unwrap();
+        let result = tauri::async_runtime::block_on(execute_tool_result(
+            &context(root.to_str().unwrap(), false),
+            EDIT_FILE_TOOL_NAME,
+            &json!({ "file": "sample.txt", "search": "beta", "replace": "gamma" }),
+        ));
+        assert_eq!(result.status, ToolResultStatus::Ok);
+        assert_eq!(
+            fs::read_to_string(root.join("sample.txt")).unwrap(),
+            "alpha\ngamma\n"
+        );
+    }
+
+    #[test]
+    fn shell_command_timeout_returns_timeout_result() {
+        let root = workspace();
+        let command = if cfg!(windows) {
+            "ping 127.0.0.1 -n 3 > nul"
+        } else {
+            "sleep 2"
+        };
+        let result = tauri::async_runtime::block_on(execute_tool_result(
+            &context(root.to_str().unwrap(), true),
+            SHELL_COMMAND_TOOL_NAME,
+            &json!({ "command": command, "timeout_ms": 1 }),
+        ));
+        assert_eq!(result.status, ToolResultStatus::Timeout);
     }
 }

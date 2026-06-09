@@ -26,6 +26,12 @@ pub struct AgentRunInput {
     pub provider_id: Option<String>,
     pub credential_id: Option<String>,
     pub model_id: Option<String>,
+    #[serde(default)]
+    pub allow_shell: bool,
+    #[serde(default)]
+    pub assume_yes: bool,
+    #[serde(default)]
+    pub cli_mode: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -297,6 +303,9 @@ pub async fn run_agent(
         let tool_context = ToolExecutionContext {
             workspace_root: &project.repo_root,
             vs_bridge_endpoint: project.vs_bridge_endpoint.as_deref(),
+            allow_shell: input.allow_shell,
+            assume_yes: input.assume_yes,
+            cli_mode: input.cli_mode,
         };
         run_openai_tool_agent_loop(
             &task_id,
@@ -410,6 +419,9 @@ pub async fn run_tool_call_test(
     let tool_context = ToolExecutionContext {
         workspace_root: &project.repo_root,
         vs_bridge_endpoint: project.vs_bridge_endpoint.as_deref(),
+        allow_shell: false,
+        assume_yes: false,
+        cli_mode: false,
     };
     run_openai_tool_agent_loop(
         &task_id,
@@ -438,7 +450,15 @@ async fn run_openai_tool_agent_loop(
     require_tool_call: bool,
     on_trace: &mut impl FnMut(&ToolTraceEvent),
 ) -> Result<(), String> {
-    let tools = tool_registry::tool_definitions();
+    let tools = if tool_context.cli_mode {
+        tool_registry::cli_tool_definitions(
+            &selected.provider.provider_type,
+            &selected.model_id,
+            tool_context.allow_shell,
+        )
+    } else {
+        tool_registry::tool_definitions()
+    };
 
     for round_index in 0..=max_tool_rounds {
         let request =
@@ -705,40 +725,22 @@ async fn run_openai_tool_agent_loop(
             );
             *step_index += 1;
 
-            let started = Instant::now();
-            let tool_result = match tool_registry::execute_tool(
+            let result = tool_registry::execute_tool_result(
                 tool_context,
                 &tool_call.function.name,
                 &arguments,
             )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    let tool_result = tool_error_result(&error);
-                    push_trace(
-                        traces,
-                        trace(
-                            task_id,
-                            *step_index,
-                            TraceEventType::Error,
-                            Some(&tool_call.function.name),
-                            "tool execution failed",
-                            Some(json!({
-                                "toolName": tool_call.function.name.clone(),
-                                "arguments": arguments.clone(),
-                            })),
-                            Some(tool_result.clone()),
-                            Some(error),
-                            TraceStatus::Failed,
-                            started.elapsed().as_millis() as u64,
-                        ),
-                        on_trace,
-                    );
-                    *step_index += 1;
-                    messages.push(build_tool_result_message(&tool_call, &tool_result));
-                    continue;
-                }
+            .await;
+            let tool_result = result.to_model_value();
+            let trace_status = if result.status == tool_registry::ToolResultStatus::Ok {
+                TraceStatus::Success
+            } else {
+                TraceStatus::Failed
+            };
+            let event_type = if result.status == tool_registry::ToolResultStatus::Ok {
+                TraceEventType::ToolResult
+            } else {
+                TraceEventType::Error
             };
 
             push_trace(
@@ -746,7 +748,7 @@ async fn run_openai_tool_agent_loop(
                 trace(
                     task_id,
                     *step_index,
-                    TraceEventType::ToolResult,
+                    event_type,
                     Some(&tool_call.function.name),
                     "tool_result",
                     Some(json!({
@@ -755,8 +757,8 @@ async fn run_openai_tool_agent_loop(
                     })),
                     Some(tool_result.clone()),
                     Some(tool_result_summary(&tool_result)),
-                    TraceStatus::Success,
-                    started.elapsed().as_millis() as u64,
+                    trace_status,
+                    result.elapsed_ms,
                 ),
                 on_trace,
             );
@@ -2047,6 +2049,9 @@ fn build_tool_result_message(tool_call: &OpenAiToolCall, result: &Value) -> Valu
 
 fn tool_error_result(error: &str) -> Value {
     json!({
+        "status": "error",
+        "ok": false,
+        "output": null,
         "error": error,
         "recoveryHint": "The tool failed. If a path was not found, use list_dir with path='.' or retry search_file/search_content with a valid workspace-relative root. If the requested file is outside the active workspace, explain that limitation."
     })
@@ -2376,6 +2381,9 @@ mod tests {
             provider_id: Some("provider".to_string()),
             credential_id: Some("default".to_string()),
             model_id: Some("test-model".to_string()),
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
         };
 
         let run =
@@ -2427,6 +2435,9 @@ mod tests {
             provider_id: Some("provider".to_string()),
             credential_id: Some("default".to_string()),
             model_id: Some("test-model".to_string()),
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
         };
         let mut streamed_titles = Vec::new();
 
@@ -2495,6 +2506,9 @@ mod tests {
             provider_id: Some("provider".to_string()),
             credential_id: Some("default".to_string()),
             model_id: Some("test-model".to_string()),
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
         };
 
         let run =

@@ -1,22 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod agent_runner;
-mod app_state;
-mod code_link;
-mod codex_cli_runner;
-mod commands;
-mod desktop_http_server;
-mod path_utils;
-mod process_manager;
-mod project_registry;
-mod tool_registry;
-mod tool_trace;
-mod vs_bridge_client;
-mod vs_bridge_service;
-mod vs_registry;
-mod workspace_tools;
-
-use app_state::AppState;
+use codeforge_desktop::app_state::AppState;
 use tauri::Manager;
 
 fn main() {
@@ -37,7 +21,7 @@ fn main() {
                 window.set_icon(icon)?;
             }
 
-            desktop_http_server::start(http_state.clone()).map_err(|error| {
+            codeforge_desktop::desktop_http_server::start(http_state.clone()).map_err(|error| {
                 Box::<dyn std::error::Error>::from(std::io::Error::new(
                     std::io::ErrorKind::AddrInUse,
                     error,
@@ -46,25 +30,25 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::list_projects,
-            commands::add_project,
-            commands::update_project,
-            commands::delete_project,
-            commands::get_project,
-            commands::open_visual_studio,
-            commands::register_vs_instance,
-            commands::unregister_vs_instance,
-            commands::heartbeat_vs_instance,
-            commands::list_vs_instances,
-            commands::list_tools,
-            commands::run_agent,
-            commands::run_tool_call_test,
-            commands::run_mock_agent,
-            commands::list_traces,
-            commands::open_code_link,
-            commands::get_settings,
-            commands::update_settings,
-            commands::fetch_minimax_models
+            codeforge_desktop::commands::list_projects,
+            codeforge_desktop::commands::add_project,
+            codeforge_desktop::commands::update_project,
+            codeforge_desktop::commands::delete_project,
+            codeforge_desktop::commands::get_project,
+            codeforge_desktop::commands::open_visual_studio,
+            codeforge_desktop::commands::register_vs_instance,
+            codeforge_desktop::commands::unregister_vs_instance,
+            codeforge_desktop::commands::heartbeat_vs_instance,
+            codeforge_desktop::commands::list_vs_instances,
+            codeforge_desktop::commands::list_tools,
+            codeforge_desktop::commands::run_agent,
+            codeforge_desktop::commands::run_tool_call_test,
+            codeforge_desktop::commands::run_mock_agent,
+            codeforge_desktop::commands::list_traces,
+            codeforge_desktop::commands::open_code_link,
+            codeforge_desktop::commands::get_settings,
+            codeforge_desktop::commands::update_settings,
+            codeforge_desktop::commands::fetch_minimax_models
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {

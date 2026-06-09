@@ -2,8 +2,9 @@ use std::cmp;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
@@ -140,7 +141,8 @@ pub fn search_file(workspace_root: &str, arguments: &Value) -> Result<Value, Str
     let started = Instant::now();
     let mut scan_limited = false;
     let scanned_files = walk_files_until(&workspace, &root, &mut |path, scanned| {
-        if scanned > SEARCH_FILE_SCAN_LIMIT || started.elapsed().as_millis() >= SEARCH_SCAN_TIMEOUT_MS
+        if scanned > SEARCH_FILE_SCAN_LIMIT
+            || started.elapsed().as_millis() >= SEARCH_SCAN_TIMEOUT_MS
         {
             scan_limited = true;
             return Ok(WalkControl::Stop);
@@ -213,6 +215,199 @@ pub fn search_content(workspace_root: &str, arguments: &Value) -> Result<Value, 
         case_sensitive,
         compiled_regex.as_ref(),
     )
+}
+
+pub fn edit_file(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let raw_file = required_string(arguments, "file")?;
+    let search = required_string(arguments, "search")?;
+    let replace = required_string(arguments, "replace")?;
+    if search.is_empty() {
+        return Err("invalid_arguments: search must not be empty".to_string());
+    }
+    let file = resolve_existing_path(&workspace, &raw_file)?;
+    ensure_regular_text_file(&workspace, &file)?;
+    let original = fs::read_to_string(&file).map_err(|error| {
+        format!(
+            "read_failed: {}: {error}",
+            relative_or_display(&workspace, &file)
+        )
+    })?;
+    let count = original.matches(&search).count();
+    if count == 0 {
+        return Err(format!(
+            "edit_not_applied: search text not found in {}",
+            relative_path(&workspace, &file)
+        ));
+    }
+    if count > 1 {
+        return Err(format!("ambiguous_edit: search text matched {count} times in {}; provide a larger unique block", relative_path(&workspace, &file)));
+    }
+    let updated = original.replacen(&search, &replace, 1);
+    fs::write(&file, updated).map_err(|error| {
+        format!(
+            "write_failed: {}: {error}",
+            relative_or_display(&workspace, &file)
+        )
+    })?;
+    Ok(json!({
+        "file": relative_path(&workspace, &file),
+        "replacements": 1,
+    }))
+}
+
+pub fn write_file(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let raw_file = required_string(arguments, "file")?;
+    let content = required_string(arguments, "content")?;
+    let file = resolve_write_path(&workspace, &raw_file)?;
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create_dir_failed: {}: {error}", parent.display()))?;
+    }
+    fs::write(&file, content).map_err(|error| {
+        format!(
+            "write_failed: {}: {error}",
+            relative_or_display(&workspace, &file)
+        )
+    })?;
+    Ok(json!({
+        "file": relative_path(&workspace, &file),
+        "bytes": content.len(),
+    }))
+}
+
+pub async fn shell_command(
+    workspace_root: &str,
+    arguments: &Value,
+    allow_shell: bool,
+    assume_yes: bool,
+) -> Result<Value, String> {
+    if !allow_shell {
+        return Err("rejected: shell_command is disabled for this run".to_string());
+    }
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let command = required_string(arguments, "command")?;
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("invalid_arguments: command must not be empty".to_string());
+    }
+    assess_shell_command(command, assume_yes)?;
+    let timeout_ms = optional_usize(arguments, "timeout_ms", 60_000)?.min(60_000) as u64;
+
+    let mut process = if cfg!(windows) {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    };
+    process
+        .current_dir(&workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("shell_spawn_failed: {error}"))?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| format!("shell_wait_failed: {error}"))?
+            .is_some()
+        {
+            break;
+        }
+        if started.elapsed() >= Duration::from_millis(timeout_ms) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("timeout: shell command exceeded {timeout_ms}ms"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("shell_wait_failed: {error}"))?;
+    Ok(json!({
+        "command": command,
+        "statusCode": output.status.code(),
+        "success": output.status.success(),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr),
+    }))
+}
+
+fn resolve_write_path(workspace: &Path, raw_path: &str) -> Result<PathBuf, String> {
+    let normalized = normalize_display_path(raw_path);
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return Err("invalid_arguments: file must not be empty".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        return Err(format!(
+            "path_outside_workspace: {}",
+            display_input_path(raw_path)
+        ));
+    }
+    let candidate = workspace.join(path);
+    let parent = candidate.parent().unwrap_or(workspace);
+    let canonical_parent = if parent.exists() {
+        canonicalize_path(parent).map_err(|_| format!("path_not_found: {}", parent.display()))?
+    } else {
+        let existing = nearest_existing_parent(parent)?;
+        canonicalize_path(&existing)
+            .map_err(|_| format!("path_not_found: {}", existing.display()))?
+    };
+    ensure_inside_workspace(workspace, &canonical_parent, raw_path)?;
+    Ok(candidate)
+}
+
+fn nearest_existing_parent(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path;
+    loop {
+        if current.exists() {
+            return Ok(current.to_path_buf());
+        }
+        current = current
+            .parent()
+            .ok_or_else(|| format!("path_not_found: {}", path.display()))?;
+    }
+}
+
+fn assess_shell_command(command: &str, assume_yes: bool) -> Result<(), String> {
+    let lower = command.to_ascii_lowercase();
+    let compact = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let high_risk = [
+        "rm -rf",
+        "del /",
+        "format",
+        "shutdown",
+        "invoke-webrequest",
+        "| iex",
+        "curl",
+        "| sh",
+    ];
+    if compact.contains("rm -rf")
+        || compact.contains("del /s")
+        || compact.contains("del /q")
+        || compact.contains("format")
+        || compact.contains("shutdown")
+        || (compact.contains("invoke-webrequest") && compact.contains("| iex"))
+        || (compact.contains("curl") && compact.contains("| sh"))
+    {
+        return Err("rejected: high-risk shell command is blocked".to_string());
+    }
+    let install_like = ["npm install", "pip install", "cargo install"];
+    if install_like.iter().any(|pattern| compact.contains(pattern)) && !assume_yes {
+        return Err("rejected: install commands require --yes confirmation".to_string());
+    }
+    let _ = high_risk;
+    Ok(())
 }
 
 pub fn get_file_context(workspace_root: &str, arguments: &Value) -> Result<Value, String> {

@@ -6,9 +6,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::execute;
 use crossterm::queue;
 use crossterm::style::ResetColor;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -344,20 +342,39 @@ impl Drop for RawModeGuard {
     }
 }
 
-struct AlternateScreenGuard;
+struct InlineScreenGuard {
+    start_row: u16,
+}
 
-impl AlternateScreenGuard {
+impl InlineScreenGuard {
     fn enter() -> Result<Self, String> {
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, cursor::Hide).map_err(|e| e.to_string())?;
-        Ok(Self)
+        let (_, start_row) = cursor::position().unwrap_or((0, 0));
+        execute!(stdout, cursor::Hide).map_err(|e| e.to_string())?;
+        Ok(Self { start_row })
+    }
+
+    fn start_row(&self) -> u16 {
+        self.start_row
+    }
+
+    fn clear(&self) -> Result<(), String> {
+        let mut stdout = io::stdout();
+        queue!(
+            stdout,
+            ResetColor,
+            cursor::MoveTo(0, self.start_row),
+            Clear(ClearType::FromCursorDown)
+        )
+        .map_err(|e| e.to_string())?;
+        stdout.flush().map_err(|e| e.to_string())
     }
 }
 
-impl Drop for AlternateScreenGuard {
+impl Drop for InlineScreenGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, cursor::Show, LeaveAlternateScreen);
+        let _ = execute!(stdout, cursor::Show);
     }
 }
 
@@ -379,10 +396,16 @@ fn read_interactive_chat_input(
 ) -> Result<Option<String>, String> {
     enable_raw_mode().map_err(|e| e.to_string())?;
     let raw_mode = RawModeGuard;
-    let alternate_screen = AlternateScreenGuard::enter()?;
+    let inline_screen = InlineScreenGuard::enter()?;
     let mut line = String::new();
     let mut selected_command_index = 0usize;
-    render_chat_input(prompt, &line, selected_command_index, session)?;
+    render_chat_input(
+        prompt,
+        &line,
+        selected_command_index,
+        session,
+        inline_screen.start_row(),
+    )?;
 
     loop {
         match event::read().map_err(|e| e.to_string())? {
@@ -396,9 +419,13 @@ fn read_interactive_chat_input(
                     let submitted = selected_slash_command(&line, selected_command_index)
                         .map(str::to_string)
                         .unwrap_or_else(|| line.clone());
-                    drop(alternate_screen);
+                    let should_echo = !submitted.trim_start().starts_with('/');
+                    inline_screen.clear()?;
+                    drop(inline_screen);
                     drop(raw_mode);
-                    println!("{prompt}{submitted}");
+                    if should_echo {
+                        println!("{prompt}{submitted}");
+                    }
                     io::stdout().flush().map_err(|e| e.to_string())?;
                     if submitted == "/" {
                         return Ok(Some(String::new()));
@@ -408,7 +435,13 @@ fn read_interactive_chat_input(
                 KeyCode::Backspace => {
                     line.pop();
                     selected_command_index = 0;
-                    render_chat_input(prompt, &line, selected_command_index, session)?;
+                    render_chat_input(
+                        prompt,
+                        &line,
+                        selected_command_index,
+                        session,
+                        inline_screen.start_row(),
+                    )?;
                 }
                 KeyCode::Up => {
                     if let Some(count) = slash_command_match_count(&line) {
@@ -417,18 +450,45 @@ fn read_interactive_chat_input(
                         } else {
                             selected_command_index.saturating_sub(1)
                         };
-                        render_chat_input(prompt, &line, selected_command_index, session)?;
+                        render_chat_input(
+                            prompt,
+                            &line,
+                            selected_command_index,
+                            session,
+                            inline_screen.start_row(),
+                        )?;
                     }
                 }
                 KeyCode::Down => {
                     if let Some(count) = slash_command_match_count(&line) {
                         selected_command_index = (selected_command_index + 1) % count.max(1);
-                        render_chat_input(prompt, &line, selected_command_index, session)?;
+                        render_chat_input(
+                            prompt,
+                            &line,
+                            selected_command_index,
+                            session,
+                            inline_screen.start_row(),
+                        )?;
+                    }
+                }
+                KeyCode::Tab => {
+                    if let Some(command) = selected_slash_command(&line, selected_command_index) {
+                        line.clear();
+                        line.push_str(command);
+                        selected_command_index = 0;
+                        render_chat_input(
+                            prompt,
+                            &line,
+                            selected_command_index,
+                            session,
+                            inline_screen.start_row(),
+                        )?;
                     }
                 }
                 KeyCode::Esc => {
                     line.clear();
-                    drop(alternate_screen);
+                    inline_screen.clear()?;
+                    drop(inline_screen);
                     drop(raw_mode);
                     io::stdout().flush().map_err(|e| e.to_string())?;
                     return Ok(Some(line));
@@ -436,7 +496,8 @@ fn read_interactive_chat_input(
                 KeyCode::Char('c') | KeyCode::Char('C')
                     if modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    drop(alternate_screen);
+                    inline_screen.clear()?;
+                    drop(inline_screen);
                     drop(raw_mode);
                     io::stdout().flush().map_err(|e| e.to_string())?;
                     return Ok(None);
@@ -444,7 +505,8 @@ fn read_interactive_chat_input(
                 KeyCode::Char('d') | KeyCode::Char('D')
                     if modifiers.contains(KeyModifiers::CONTROL) && line.is_empty() =>
                 {
-                    drop(alternate_screen);
+                    inline_screen.clear()?;
+                    drop(inline_screen);
                     drop(raw_mode);
                     io::stdout().flush().map_err(|e| e.to_string())?;
                     return Ok(None);
@@ -458,7 +520,13 @@ fn read_interactive_chat_input(
                     }
                     line.push(ch);
                     selected_command_index = 0;
-                    render_chat_input(prompt, &line, selected_command_index, session)?;
+                    render_chat_input(
+                        prompt,
+                        &line,
+                        selected_command_index,
+                        session,
+                        inline_screen.start_row(),
+                    )?;
                 }
                 _ => {}
             },
@@ -473,9 +541,14 @@ fn render_chat_input(
     line: &str,
     selected_command_index: usize,
     session: &CliSession,
+    start_row: u16,
 ) -> Result<(), String> {
     let mut stdout = io::stdout();
     let (cols, rows) = crossterm::terminal::size().map_err(|e| e.to_string())?;
+    let rows = rows.saturating_sub(start_row).max(1);
+    let header_rows = codex_chat_header_height();
+    let composer_height = 3u16;
+    let top_gap = 1u16;
     let popup_lines = if line.starts_with('/') {
         slash_command_popup_lines(line, selected_command_index)
             .into_iter()
@@ -484,29 +557,42 @@ fn render_chat_input(
     } else {
         Vec::new()
     };
-    let max_popup_rows = rows.saturating_sub(6).max(1) as usize;
-    let visible_lines = popup_lines.into_iter().take(max_popup_rows).collect::<Vec<_>>();
-    let composer_height = 3u16;
-    let composer_start = rows.saturating_sub(composer_height + visible_lines.len() as u16);
-    let prompt_row = composer_start.saturating_add(1);
-    let popup_start = composer_start.saturating_add(composer_height);
-    queue!(stdout, Clear(ClearType::All), cursor::MoveTo(0, 0)).map_err(|e| e.to_string())?;
+    let max_popup_rows = rows
+        .saturating_sub(header_rows + top_gap + composer_height)
+        .max(1) as usize;
+    let visible_lines = popup_lines
+        .into_iter()
+        .take(max_popup_rows)
+        .collect::<Vec<_>>();
+    let composer_start = header_rows
+        .saturating_add(top_gap)
+        .min(rows.saturating_sub(composer_height + visible_lines.len() as u16));
+    let prompt_row = start_row.saturating_add(composer_start.saturating_add(1));
+    let popup_start = start_row.saturating_add(composer_start.saturating_add(composer_height));
+    queue!(
+        stdout,
+        cursor::MoveTo(0, start_row),
+        Clear(ClearType::FromCursorDown)
+    )
+    .map_err(|e| e.to_string())?;
     render_codex_chat_header(&mut stdout, cols, session)?;
 
-    queue!(stdout, cursor::MoveTo(0, prompt_row), Clear(ClearType::CurrentLine))
-        .map_err(|e| e.to_string())?;
-    write_composer_line(&mut stdout, cols, prompt, line)?;
+    render_composer_band(
+        &mut stdout,
+        cols,
+        start_row.saturating_add(composer_start),
+        composer_height,
+        prompt_row,
+        prompt,
+        line,
+    )?;
     let cursor_col = prompt
         .chars()
         .count()
         .saturating_add(line.chars().count())
         .min(cols.saturating_sub(1) as usize) as u16;
-    queue!(
-        stdout,
-        ResetColor,
-        cursor::MoveTo(cursor_col, prompt_row)
-    )
-    .map_err(|e| e.to_string())?;
+    queue!(stdout, ResetColor, cursor::MoveTo(cursor_col, prompt_row))
+        .map_err(|e| e.to_string())?;
     for (index, text) in visible_lines.iter().enumerate() {
         queue!(
             stdout,
@@ -517,12 +603,12 @@ fn render_chat_input(
         .map_err(|e| e.to_string())?;
         write!(stdout, "{text}").map_err(|e| e.to_string())?;
     }
-    queue!(
-        stdout,
-        cursor::MoveTo(cursor_col, prompt_row)
-    )
-    .map_err(|e| e.to_string())?;
+    queue!(stdout, cursor::MoveTo(cursor_col, prompt_row)).map_err(|e| e.to_string())?;
     stdout.flush().map_err(|e| e.to_string())
+}
+
+fn codex_chat_header_height() -> u16 {
+    9
 }
 
 fn render_codex_chat_header(
@@ -542,7 +628,10 @@ fn render_codex_chat_header(
     write_box_line(
         stdout,
         width,
-        &format!("model:     {}    /model to change", cli_session_model_label(session)),
+        &format!(
+            "model:     {}    /model to change",
+            cli_session_model_label(session)
+        ),
     )?;
     write_box_line(
         stdout,
@@ -551,11 +640,8 @@ fn render_codex_chat_header(
     )?;
     writeln!(stdout, "╰{border}╯").map_err(|e| e.to_string())?;
     writeln!(stdout).map_err(|e| e.to_string())?;
-    writeln!(
-        stdout,
-        "Tip: Type / to open commands. Type /exit to quit."
-    )
-    .map_err(|e| e.to_string())?;
+    writeln!(stdout, "Tip: Type / to open commands. Type /exit to quit.")
+        .map_err(|e| e.to_string())?;
     writeln!(
         stdout,
         "\x1b[33m! Heads up, CodeForge CLI does not track provider quota locally. Run /status for the current selection.\x1b[0m"
@@ -563,15 +649,32 @@ fn render_codex_chat_header(
     .map_err(|e| e.to_string())
 }
 
-fn write_composer_line(
+fn render_composer_band(
     stdout: &mut io::Stdout,
     cols: u16,
+    start_row: u16,
+    height: u16,
+    prompt_row: u16,
     prompt: &str,
     line: &str,
 ) -> Result<(), String> {
     let width = cols.max(1) as usize;
     let input = truncate_chars(&format!("{prompt}{line}"), width);
-    write!(stdout, "\x1b[48;5;236m{:<width$}\x1b[0m", input).map_err(|e| e.to_string())
+    let blank = " ".repeat(width);
+    for row in start_row..start_row.saturating_add(height) {
+        queue!(
+            stdout,
+            cursor::MoveTo(0, row),
+            Clear(ClearType::CurrentLine)
+        )
+        .map_err(|e| e.to_string())?;
+        if row == prompt_row {
+            write!(stdout, "\x1b[48;5;236m{:<width$}\x1b[0m", input).map_err(|e| e.to_string())?;
+        } else {
+            write!(stdout, "\x1b[48;5;236m{blank}\x1b[0m").map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn write_box_line(stdout: &mut io::Stdout, width: usize, text: &str) -> Result<(), String> {
@@ -582,7 +685,7 @@ fn write_box_line(stdout: &mut io::Stdout, width: usize, text: &str) -> Result<(
 
 fn codex_header_width(cols: u16) -> usize {
     let available = cols.saturating_sub(2).max(24) as usize;
-    available.min(64)
+    available.min(78)
 }
 
 fn cli_session_model_label(session: &CliSession) -> String {
@@ -870,9 +973,12 @@ fn choose_cli_model(
         let current_index = choices
             .iter()
             .enumerate()
-            .find_map(|(index, choice)| cli_choice_is_current(session, choice, index).then_some(index))
+            .find_map(|(index, choice)| {
+                cli_choice_is_current(session, choice, index).then_some(index)
+            })
             .unwrap_or(0);
         let Some(index) = run_cli_picker(
+            session,
             "Select Model and Effort",
             "Access legacy models by running codeforge --model <model_name> or editing ~/.codeforge/settings.json",
             &items,
@@ -914,8 +1020,7 @@ fn choose_cli_model(
     println!();
     println!("  Press enter to keep current or type a number.");
 
-    let Some(index) = read_number(stdin, "› ", choices.len())?
-    else {
+    let Some(index) = read_number(stdin, "› ", choices.len())? else {
         return Ok(());
     };
     let choice = &choices[index];
@@ -941,7 +1046,8 @@ fn choose_cli_reasoning(stdin: &io::Stdin, session: &mut CliSession) -> Result<(
             .iter()
             .position(|(value, _)| *value == current)
             .unwrap_or(0);
-        let Some(index) = run_cli_picker("Select Reasoning Effort", "", &items, current_index)?
+        let Some(index) =
+            run_cli_picker(session, "Select Reasoning Effort", "", &items, current_index)?
         else {
             return Ok(());
         };
@@ -986,6 +1092,7 @@ fn choose_cli_reasoning(stdin: &io::Stdin, session: &mut CliSession) -> Result<(
 }
 
 fn run_cli_picker(
+    session: &CliSession,
     title: &str,
     subtitle: &str,
     items: &[CliPickerItem],
@@ -997,9 +1104,17 @@ fn run_cli_picker(
 
     enable_raw_mode().map_err(|e| e.to_string())?;
     let raw_mode = RawModeGuard;
-    let alternate_screen = AlternateScreenGuard::enter()?;
+    let inline_screen = InlineScreenGuard::enter()?;
     let mut selected_index = current_index.min(items.len().saturating_sub(1));
-    render_cli_picker(title, subtitle, items, selected_index, current_index)?;
+    render_cli_picker(
+        session,
+        title,
+        subtitle,
+        items,
+        selected_index,
+        current_index,
+        inline_screen.start_row(),
+    )?;
 
     loop {
         match event::read().map_err(|e| e.to_string())? {
@@ -1015,26 +1130,45 @@ fn run_cli_picker(
                     } else {
                         selected_index.saturating_sub(1)
                     };
-                    render_cli_picker(title, subtitle, items, selected_index, current_index)?;
+                    render_cli_picker(
+                        session,
+                        title,
+                        subtitle,
+                        items,
+                        selected_index,
+                        current_index,
+                        inline_screen.start_row(),
+                    )?;
                 }
                 KeyCode::Down => {
                     selected_index = (selected_index + 1) % items.len();
-                    render_cli_picker(title, subtitle, items, selected_index, current_index)?;
+                    render_cli_picker(
+                        session,
+                        title,
+                        subtitle,
+                        items,
+                        selected_index,
+                        current_index,
+                        inline_screen.start_row(),
+                    )?;
                 }
                 KeyCode::Enter => {
-                    drop(alternate_screen);
+                    inline_screen.clear()?;
+                    drop(inline_screen);
                     drop(raw_mode);
                     return Ok(Some(selected_index));
                 }
                 KeyCode::Esc => {
-                    drop(alternate_screen);
+                    inline_screen.clear()?;
+                    drop(inline_screen);
                     drop(raw_mode);
                     return Ok(None);
                 }
                 KeyCode::Char('c') | KeyCode::Char('C')
                     if modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    drop(alternate_screen);
+                    inline_screen.clear()?;
+                    drop(inline_screen);
                     drop(raw_mode);
                     return Ok(None);
                 }
@@ -1047,61 +1181,125 @@ fn run_cli_picker(
 }
 
 fn render_cli_picker(
+    session: &CliSession,
     title: &str,
     subtitle: &str,
     items: &[CliPickerItem],
     selected_index: usize,
     current_index: usize,
+    start_row: u16,
 ) -> Result<(), String> {
     let mut stdout = io::stdout();
-    let (_cols, rows) = crossterm::terminal::size().map_err(|e| e.to_string())?;
-    let start_row = 2u16;
-    let max_items = rows.saturating_sub(start_row + 5).max(1) as usize;
-    queue!(stdout, Clear(ClearType::All), cursor::MoveTo(0, start_row))
-        .map_err(|e| e.to_string())?;
-    writeln!(stdout, "  \x1b[1m{title}\x1b[0m").map_err(|e| e.to_string())?;
-    if !subtitle.trim().is_empty() {
-        writeln!(stdout, "  \x1b[2m{subtitle}\x1b[0m").map_err(|e| e.to_string())?;
-    }
-    writeln!(stdout).map_err(|e| e.to_string())?;
+    let (cols, rows) = crossterm::terminal::size().map_err(|e| e.to_string())?;
+    let width = cols.max(1) as usize;
+    let panel_start = start_row
+        .saturating_add(codex_chat_header_height())
+        .saturating_add(1)
+        .min(rows.saturating_sub(1));
+    let available_panel_rows = rows.saturating_sub(panel_start).max(1);
+    let max_items = available_panel_rows.saturating_sub(5).max(1) as usize;
+    let visible_count = items.len().min(max_items);
+    let panel_height = (4 + visible_count as u16).min(available_panel_rows);
+    queue!(
+        stdout,
+        cursor::MoveTo(0, start_row),
+        Clear(ClearType::FromCursorDown)
+    )
+    .map_err(|e| e.to_string())?;
+    render_codex_chat_header(&mut stdout, cols, session)?;
+    render_panel_background(&mut stdout, cols, panel_start, panel_height)?;
 
-    for (index, item) in items.iter().take(max_items).enumerate() {
+    queue!(stdout, cursor::MoveTo(2, panel_start + 1)).map_err(|e| e.to_string())?;
+    write!(
+        stdout,
+        "\x1b[48;5;236m\x1b[1m{}\x1b[0m",
+        truncate_chars(title, width.saturating_sub(4))
+    )
+    .map_err(|e| e.to_string())?;
+    if !subtitle.trim().is_empty() && panel_height > 2 {
+        queue!(stdout, cursor::MoveTo(2, panel_start + 2)).map_err(|e| e.to_string())?;
+        write!(
+            stdout,
+            "\x1b[48;5;236m\x1b[2m{}\x1b[0m",
+            truncate_chars(subtitle, width.saturating_sub(4))
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    for (index, item) in items.iter().take(visible_count).enumerate() {
+        let row = panel_start + 4 + index as u16;
+        if row >= rows {
+            break;
+        }
         let marker = if index == selected_index { "›" } else { " " };
-        let current = if index == current_index { " (current)" } else { "" };
+        let current = if index == current_index {
+            " (current)"
+        } else {
+            ""
+        };
+        let label = truncate_chars(
+            &format!("{marker} {}. {}{}", index + 1, item.label, current),
+            28,
+        );
+        let description = truncate_chars(&item.description, width.saturating_sub(34));
+        queue!(
+            stdout,
+            cursor::MoveTo(0, row),
+            Clear(ClearType::CurrentLine)
+        )
+        .map_err(|e| e.to_string())?;
         if index == selected_index {
-            writeln!(
+            write!(
                 stdout,
-                "\x1b[36;1m{marker} {}. {}{}\x1b[0m    \x1b[36;1m{}\x1b[0m",
-                index + 1,
-                item.label,
-                current,
-                item.description
+                "\x1b[48;5;236m\x1b[36;1m{:<28}  {}\x1b[0m",
+                label, description
             )
             .map_err(|e| e.to_string())?;
         } else {
-            writeln!(
+            write!(
                 stdout,
-                "{marker} {}. {}{}    \x1b[2m{}\x1b[0m",
-                index + 1,
-                item.label,
-                current,
-                item.description
+                "\x1b[48;5;236m{:<28}  \x1b[2m{}\x1b[0m",
+                label, description
             )
             .map_err(|e| e.to_string())?;
         }
     }
 
-    let footer_row = rows.saturating_sub(2);
+    let footer_row = panel_start
+        .saturating_add(panel_height)
+        .min(rows.saturating_sub(1));
     queue!(
         stdout,
         cursor::MoveTo(0, footer_row),
         Clear(ClearType::CurrentLine)
     )
     .map_err(|e| e.to_string())?;
-    write!(stdout, "  \x1b[2mPress enter to confirm or esc to go back\x1b[0m")
-        .map_err(|e| e.to_string())?;
+    write!(
+        stdout,
+        "  \x1b[2mPress enter to confirm or esc to go back\x1b[0m"
+    )
+    .map_err(|e| e.to_string())?;
     queue!(stdout, ResetColor, cursor::MoveTo(0, footer_row)).map_err(|e| e.to_string())?;
     stdout.flush().map_err(|e| e.to_string())
+}
+
+fn render_panel_background(
+    stdout: &mut io::Stdout,
+    cols: u16,
+    start_row: u16,
+    height: u16,
+) -> Result<(), String> {
+    let blank = " ".repeat(cols.max(1) as usize);
+    for row in start_row..start_row.saturating_add(height) {
+        queue!(
+            stdout,
+            cursor::MoveTo(0, row),
+            Clear(ClearType::CurrentLine)
+        )
+        .map_err(|e| e.to_string())?;
+        write!(stdout, "\x1b[48;5;236m{blank}\x1b[0m").map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn cli_choice_is_current(session: &CliSession, choice: &CliModelChoice, index: usize) -> bool {
@@ -1119,7 +1317,10 @@ fn cli_model_display_name(choice: &CliModelChoice) -> String {
     }
     match choice.credential_name.as_deref() {
         Some(credential) if !credential.trim().is_empty() => {
-            format!("{} / {} / {}", choice.provider_name, credential, choice.model_name)
+            format!(
+                "{} / {} / {}",
+                choice.provider_name, credential, choice.model_name
+            )
         }
         _ => format!("{} / {}", choice.provider_name, choice.model_name),
     }
@@ -1131,9 +1332,7 @@ fn cli_model_description(choice: &CliModelChoice) -> &'static str {
         "gpt-5.4" => "Strong model for everyday coding.",
         "gpt-5.4-mini" => "Small, fast, and cost-efficient model for simpler coding tasks.",
         "gpt-5.3-codex-spark" => "Ultra-fast coding model.",
-        "default" if choice.provider_id == "codex-cli" => {
-            "Use the model configured by Codex CLI."
-        }
+        "default" if choice.provider_id == "codex-cli" => "Use the model configured by Codex CLI.",
         _ if choice.provider_id == "codex-cli" => "Codex CLI model.",
         _ => "Configured provider model from ~/.codeforge/settings.json.",
     }
@@ -1221,8 +1420,7 @@ fn credential_model_choices(
         .iter()
         .filter(|model| {
             model.enabled
-                && (model.credential_id.trim().is_empty()
-                    || model.credential_id == credential.id)
+                && (model.credential_id.trim().is_empty() || model.credential_id == credential.id)
         })
         .map(|model| CliModelChoice {
             provider_id: provider.id.clone(),
@@ -1274,11 +1472,7 @@ fn normalize_cli_reasoning(value: Option<&str>) -> Option<String> {
     Some(value.to_ascii_lowercase())
 }
 
-fn read_number(
-    stdin: &io::Stdin,
-    prompt: &str,
-    max: usize,
-) -> Result<Option<usize>, String> {
+fn read_number(stdin: &io::Stdin, prompt: &str, max: usize) -> Result<Option<usize>, String> {
     let Some(line) = read_prompt(stdin, prompt)? else {
         return Ok(None);
     };
@@ -1371,9 +1565,14 @@ fn select_project(state: &AppState, requested: Option<&str>) -> Result<ProjectSe
         .map_err(|e| e.to_string())?
         .canonicalize()
         .map_err(|e| e.to_string())?;
-    projects.iter().find(|project| Path::new(&project.repo_root).canonicalize().ok().as_ref() == Some(&cwd)).cloned()
+    projects
+        .iter()
+        .find(|project| Path::new(&project.repo_root).canonicalize().ok().as_ref() == Some(&cwd))
+        .cloned()
         .or_else(|| projects.first().cloned())
-        .ok_or_else(|| "No projects registered. Run `codeforge projects add <workspace>` first.".to_string())
+        .ok_or_else(|| {
+            "No projects registered. Run `codeforge projects add <workspace>` first.".to_string()
+        })
 }
 
 fn final_response(run: &MockAgentRun) -> Option<String> {
@@ -1408,4 +1607,3 @@ fn save_trace(repo_root: &str, run: &MockAgentRun) -> Result<(), String> {
     )
     .map_err(|e| format!("trace write failed {}: {e}", file.display()))
 }
-

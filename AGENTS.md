@@ -43,6 +43,32 @@ src\types\trace.ts
 src\api\tauriApi.ts
 ```
 
+## CLI Coding Reference
+
+For CLI implementation work in this repository, use `D:\code\CodeForge` as the local reference checkout for Codex CLI style and structure, especially:
+
+```text
+D:\code\CodeForge\AGENTS.md
+D:\code\CodeForge\codex-rs\cli\
+D:\code\CodeForge\codex-rs\cli\src\main.rs
+D:\code\CodeForge\codex-rs\cli\tests\
+```
+
+Reference that code for command organization, argument parsing shape, human-vs-JSON output separation, exit/error behavior, and focused CLI tests. Do not add a direct dependency on the reference checkout, vendor copied files, or change `D:\code\CodeForge` unless the user explicitly asks.
+
+Current local CLI entry points are:
+
+```text
+src-tauri\src\bin\codeforge.rs
+src-tauri\src\cli.rs
+src-tauri\src\agent_runner.rs
+src-tauri\src\codex_cli_runner.rs
+src-tauri\src\tool_registry.rs
+build-codeforge-cli.bat
+```
+
+Keep CLI changes aligned with this repository's Rust/Tauri ownership model. The CLI may share desktop state and agent orchestration, but it must not bypass trace creation, provider selection rules, credential masking, workspace boundaries, or the agent safety policy above. If a CLI feature needs build, test, shell, or IDE automation, implement it as an explicit safe tool with fixed command templates, workspace confinement, trace output, and user confirmation instead of exposing generic shell execution.
+
 ## Product Direction
 
 CodeForge is a local C++ / Visual Studio coding agent with VSIX semantic integration, workspace cache, build-error repair loop, and traceable tool execution.

@@ -2735,6 +2735,7 @@ mod tests {
                 default_credential_id: "default".to_string(),
                 default_model: "test-model".to_string(),
                 enabled: true,
+                supports_tool_call: Some(false),
                 credentials: vec![ProviderCredential {
                     id: "default".to_string(),
                     name: "Default Key".to_string(),

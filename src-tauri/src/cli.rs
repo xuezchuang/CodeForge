@@ -16,7 +16,8 @@ use crossterm::execute;
 use crossterm::queue;
 use crossterm::style::ResetColor;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, Clear, ClearType, ScrollUp,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+    LeaveAlternateScreen, ScrollUp,
 };
 use std::path::{Path, PathBuf};
 
@@ -35,7 +36,7 @@ const CHAT_PROMPT: &str = "› ";
 const CLI_TRANSCRIPT_MAX_MESSAGES: usize = 20;
 const CODEX_COMPOSER_MIN_ROWS: u16 = 3;
 const CODEX_COMPOSER_MAX_ROWS: u16 = 8;
-const CODEX_COMPOSER_FOOTER_GAP: u16 = 0;
+const CODEX_COMPOSER_FOOTER_GAP: u16 = 1;
 const CODEX_FOOTER_HEIGHT: u16 = 1;
 const CODEX_POPUP_MAX_ROWS: u16 = 8;
 const CODEX_COMPOSER_BG: &str = "\x1b[48;5;236m";
@@ -52,6 +53,71 @@ pub struct Cli {
     pub json: bool,
     pub verbose: bool,
     pub command: Command,
+}
+
+#[derive(Clone, Debug)]
+enum RenderedBlock {
+    UserInput(String),
+    AssistantReply(String),
+}
+
+impl RenderedBlock {
+    fn lines_for(&self, width: usize) -> Vec<String> {
+        let width = width.max(1);
+        match self {
+            RenderedBlock::UserInput(text) => wrap_block("▌ user", text, width),
+            RenderedBlock::AssistantReply(text) => wrap_block("◂ assistant", text, width),
+        }
+    }
+}
+
+fn wrap_block(prefix: &str, body: &str, width: usize) -> Vec<String> {
+    let prefix = truncate_display_width(prefix, width);
+    let prefix_width = terminal_display_width(&prefix).min(width);
+    let body_indent = " ".repeat(prefix_width.saturating_add(1));
+    let body_width = width.saturating_sub(prefix_width.saturating_add(1)).max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut first = true;
+    for raw_line in body.split('\n') {
+        for wrapped in wrap_text(raw_line, body_width) {
+            if first {
+                out.push(format!("{prefix} {wrapped}"));
+                first = false;
+            } else {
+                out.push(format!("{body_indent}{wrapped}"));
+            }
+        }
+        if raw_line.is_empty() && !first {
+            out.push(String::new());
+        }
+    }
+    if out.is_empty() {
+        out.push(format!("{prefix} "));
+    }
+    out
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in text.chars() {
+        let ch_width = terminal_char_width(ch).max(1);
+        if current_width.saturating_add(ch_width) > width && !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width = current_width.saturating_add(ch_width);
+    }
+    if !current.is_empty() || out.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -682,6 +748,12 @@ async fn run_chat(state: &AppState, cli: &Cli, mut session: CliSession) -> Resul
     let mut handled_input = false;
     let mut history = Vec::new();
     let mut transcript: Vec<AgentConversationMessage> = Vec::new();
+    // `blocks` is the rendered shadow of the chat history. We keep the
+    // last CLI_TRANSCRIPT_MAX_MESSAGES user/assistant messages so that on
+    // resize (or any other full re-render) we can repaint the whole
+    // transcript above the composer without depending on the terminal's
+    // scrollback buffer.
+    let mut blocks: Vec<RenderedBlock> = Vec::new();
     let mut show_header = true;
     let project = select_project(state, cli.project.as_deref())?;
     session.workspace_label = Some(cli_project_label(&project));
@@ -709,6 +781,8 @@ async fn run_chat(state: &AppState, cli: &Cli, mut session: CliSession) -> Resul
                 &mut history,
                 show_header,
                 current_input_start_row,
+                screen_origin_row,
+                &blocks,
             )?
         else {
             break;
@@ -750,6 +824,7 @@ async fn run_chat(state: &AppState, cli: &Cli, mut session: CliSession) -> Resul
             ChatCommandResult::Exit => break,
             ChatCommandResult::NewSession => {
                 transcript.clear();
+                blocks.clear();
                 if !stdin_is_terminal {
                     println!("Started a new chat.");
                 }
@@ -765,6 +840,9 @@ async fn run_chat(state: &AppState, cli: &Cli, mut session: CliSession) -> Resul
             }
             ChatCommandResult::NotCommand => {}
         }
+        // Record the user's submitted input into the rendered history so
+        // resize / full re-render can repaint it from memory.
+        blocks.push(RenderedBlock::UserInput(task.to_string()));
         let mut run_messages = transcript.clone();
         run_messages.push(cli_conversation_message("user", task));
         transcript.push(cli_conversation_message("user", task));
@@ -777,12 +855,18 @@ async fn run_chat(state: &AppState, cli: &Cli, mut session: CliSession) -> Resul
                 parts.content.clone()
             };
             if !visible_text.trim().is_empty() {
-                transcript.push(cli_conversation_message("assistant", visible_text.trim()));
+                let assistant_text = visible_text.trim().to_string();
+                blocks.push(RenderedBlock::AssistantReply(assistant_text.clone()));
+                transcript.push(cli_conversation_message("assistant", &assistant_text));
             }
         }
         if transcript.len() > CLI_TRANSCRIPT_MAX_MESSAGES {
             let remove_count = transcript.len().saturating_sub(CLI_TRANSCRIPT_MAX_MESSAGES);
             transcript.drain(0..remove_count);
+        }
+        if blocks.len() > CLI_TRANSCRIPT_MAX_MESSAGES {
+            let remove_count = blocks.len().saturating_sub(CLI_TRANSCRIPT_MAX_MESSAGES);
+            blocks.drain(0..remove_count);
         }
         if stdin_is_terminal {
             input_start_row = next_chat_input_start_row()?;
@@ -826,8 +910,16 @@ impl CliScreenGuard {
             stdout.flush().map_err(|e| e.to_string())?;
             origin_row = cursor::position().map_err(|e| e.to_string())?.1;
         }
+        // Switch to the alternate screen so the main screen's scrollback is
+        // frozen while the chat session is active. This mirrors how
+        // codex-rs/tui runs (see codex-rs/tui/src/tui.rs — they call
+        // `EnterAlternateScreen` on entry and `LeaveAlternateScreen` on
+        // exit). Without this, every line we write to the chat lives in the
+        // host terminal's scrollback; a later resize / scroll would re-
+        // surface the old layout on top of the freshly-rendered one.
         execute!(
             stdout,
+            EnterAlternateScreen,
             ResetColor,
             cursor::MoveTo(0, origin_row),
             cursor::SetCursorStyle::BlinkingBar,
@@ -849,7 +941,8 @@ impl Drop for CliScreenGuard {
             stdout,
             ResetColor,
             cursor::SetCursorStyle::DefaultUserShape,
-            cursor::Show
+            cursor::Show,
+            LeaveAlternateScreen
         );
     }
 }
@@ -920,12 +1013,14 @@ fn read_chat_input(
     history: &mut Vec<String>,
     header_visible: bool,
     start_row: u16,
+    origin_row: u16,
+    blocks: &[RenderedBlock],
 ) -> Result<Option<(String, bool, u16)>, String> {
     if !stdin.is_terminal() {
         return read_stdin_line(stdin).map(|line| line.map(|line| (line, header_visible, start_row)));
     }
 
-    read_interactive_chat_input(prompt, session, history, header_visible, start_row)
+    read_interactive_chat_input(prompt, session, history, header_visible, start_row, origin_row, blocks)
 }
 
 fn read_interactive_chat_input(
@@ -934,6 +1029,8 @@ fn read_interactive_chat_input(
     history: &mut Vec<String>,
     mut active_header_visible: bool,
     start_row: u16,
+    origin_row: u16,
+    blocks: &[RenderedBlock],
 ) -> Result<Option<(String, bool, u16)>, String> {
     enable_raw_mode().map_err(|e| e.to_string())?;
     let raw_mode = RawModeGuard;
@@ -953,6 +1050,7 @@ fn read_interactive_chat_input(
         inline_screen.start_row(),
                         active_header_visible,
         active_header_visible,
+        blocks,
     )?);
 
     loop {
@@ -977,6 +1075,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Enter => {
@@ -1021,6 +1120,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Up | KeyCode::Char('p') | KeyCode::Char('P')
@@ -1042,6 +1142,7 @@ fn read_interactive_chat_input(
                             inline_screen.start_row(),
                         active_header_visible,
                             false,
+                            blocks,
                         )?);
                     } else if !history.is_empty() {
                         let next_index = match history_index {
@@ -1064,6 +1165,7 @@ fn read_interactive_chat_input(
                             inline_screen.start_row(),
                         active_header_visible,
                             false,
+                            blocks,
                         )?);
                     }
                 }
@@ -1082,6 +1184,7 @@ fn read_interactive_chat_input(
                             inline_screen.start_row(),
                         active_header_visible,
                             false,
+                            blocks,
                         )?);
                     } else if let Some(index) = history_index {
                         if index + 1 < history.len() {
@@ -1104,6 +1207,7 @@ fn read_interactive_chat_input(
                             inline_screen.start_row(),
                         active_header_visible,
                             false,
+                            blocks,
                         )?);
                     }
                 }
@@ -1122,6 +1226,7 @@ fn read_interactive_chat_input(
                             inline_screen.start_row(),
                         active_header_visible,
                             false,
+                            blocks,
                         )?);
                     }
                 }
@@ -1141,6 +1246,7 @@ fn read_interactive_chat_input(
                             inline_screen.start_row(),
                         active_header_visible,
                             false,
+                            blocks,
                         )?);
                     }
                 }
@@ -1160,6 +1266,7 @@ fn read_interactive_chat_input(
                             inline_screen.start_row(),
                         active_header_visible,
                             false,
+                            blocks,
                         )?);
                     }
                 }
@@ -1177,6 +1284,7 @@ fn read_interactive_chat_input(
                             inline_screen.start_row(),
                         active_header_visible,
                             false,
+                            blocks,
                         )?);
                         continue;
                     }
@@ -1194,6 +1302,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Char('c') | KeyCode::Char('C')
@@ -1222,6 +1331,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Char('d') | KeyCode::Char('D')
@@ -1251,6 +1361,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Char('a') | KeyCode::Char('A')
@@ -1266,6 +1377,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Char('e') | KeyCode::Char('E')
@@ -1281,6 +1393,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Char('u') | KeyCode::Char('U')
@@ -1299,6 +1412,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Char('k') | KeyCode::Char('K')
@@ -1317,6 +1431,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Char('l') | KeyCode::Char('L')
@@ -1343,6 +1458,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         true,
                         true,
+                        blocks,
                     )?);
                 }
                 KeyCode::Char('w') | KeyCode::Char('W')
@@ -1362,6 +1478,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Left => {
@@ -1381,6 +1498,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Right => {
@@ -1400,6 +1518,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Home => {
@@ -1417,6 +1536,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::End => {
@@ -1434,6 +1554,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Delete => {
@@ -1455,6 +1576,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 KeyCode::Char(ch)
@@ -1480,6 +1602,7 @@ fn read_interactive_chat_input(
                         inline_screen.start_row(),
                         active_header_visible,
                         false,
+                        blocks,
                     )?);
                 }
                 _ => {}
@@ -1500,10 +1623,19 @@ fn read_interactive_chat_input(
                     inline_screen.start_row(),
                         active_header_visible,
                     false,
+                    blocks,
                 )?);
             }
             Event::Resize(_, _) => {
-                inline_screen.set_start_row(start_row);
+                // Resize: re-anchor the composer at the session's origin
+                // row and let `render_chat_input` repaint the layout into
+                // the alternate screen buffer. This mirrors how codex-rs/tui
+                // handles resize: it maps the event to a redraw trigger and
+                // re-emits the whole frame. The alt-screen (entered in
+                // `CliScreenGuard::enter`) is the only reason this is
+                // sufficient — the host terminal's scrollback never sees any
+                // of the chat output, so resize can't surface stale cells.
+                inline_screen.set_start_row(origin_row);
                 inline_screen.set_start_row(render_chat_input(
                     prompt,
                     &line,
@@ -1511,8 +1643,9 @@ fn read_interactive_chat_input(
                     selected_command_index,
                     session,
                     inline_screen.start_row(),
-                        active_header_visible,
                     active_header_visible,
+                    true,
+                    blocks,
                 )?);
             }
             Event::Key(_) => {}
@@ -1530,6 +1663,7 @@ fn render_chat_input(
     start_row: u16,
     header_visible: bool,
     redraw_header: bool,
+    blocks: &[RenderedBlock],
 ) -> Result<u16, String> {
     let mut stdout = io::stdout();
     let popup_lines = if line.starts_with('/') {
@@ -1573,6 +1707,17 @@ fn render_chat_input(
         .cloned()
         .collect::<Vec<_>>();
 
+    // Pre-compute the per-block line breakdown for the rendered transcript
+    // history. We compute the lines for every block first, then later decide
+    // which tail to display inside the visible viewport.
+    let width = (cols as usize).max(1);
+    let block_lines: Vec<Vec<String>> = blocks
+        .iter()
+        .map(|block| block.lines_for(width))
+        .collect();
+    let block_line_counts: Vec<usize> = block_lines.iter().map(|lines| lines.len()).collect();
+    let total_block_lines: usize = block_line_counts.iter().sum();
+
     let layout_height = header_rows
         .saturating_add(visible_popup_rows as u16)
         .saturating_add(composer_height)
@@ -1588,21 +1733,14 @@ fn render_chat_input(
         .saturating_add(visible_popup_rows as u16)
         .saturating_add(CODEX_COMPOSER_FOOTER_GAP)
         .min(safe_rows.saturating_sub(1));
-    let clear_start_row = layout_start.min(start_row);
-    let clear_from = if redraw_header {
-        clear_start_row
-    } else {
-        clear_start_row.saturating_add(header_rows)
-    };
-    let max_clear_height = header_rows
-        .saturating_add(CODEX_COMPOSER_MAX_ROWS)
-        .saturating_add(CODEX_POPUP_MAX_ROWS)
-        .saturating_add(CODEX_COMPOSER_FOOTER_GAP)
-        .saturating_add(CODEX_FOOTER_HEIGHT)
-        .max(layout_height);
-    let clear_to = layout_start
-        .saturating_add(max_clear_height)
-        .min(safe_rows);
+    // Wipe the area we're about to repaint. The blocks band lives between
+    // row 0 and `layout_start`, so the default ("composer band only")
+    // cleanup would leave stale block text on screen across renders. We
+    // therefore always wipe from row 0 through the bottom of the viewport
+    // — it's a single pass, the rest of the layout paint below writes on
+    // top, and we avoid the "ghost blocks" bug.
+    let clear_from: u16 = 0;
+    let clear_to: u16 = terminal_rows;
     for row in clear_from..clear_to {
         queue!(
             stdout,
@@ -1611,6 +1749,41 @@ fn render_chat_input(
             Clear(ClearType::CurrentLine)
         )
         .map_err(|e| e.to_string())?;
+    }
+
+    // Paint blocks above the composer. If the transcript history would push
+    // the composer past the bottom of the viewport, we drop the oldest
+    // blocks (from the front) so only the most recent ones render. The
+    // dropped blocks remain in `block_line_counts` for the caller to use
+    // when computing the next `input_start_row`.
+    let blocks_band_height: u16 = composer_start.min(safe_rows);
+    let mut consumed: usize = 0;
+    let mut blocks_to_render: Vec<&[String]> = Vec::new();
+    for lines in block_lines.iter().rev() {
+        if consumed.saturating_add(lines.len()) > blocks_band_height as usize {
+            break;
+        }
+        consumed = consumed.saturating_add(lines.len());
+        blocks_to_render.push(lines.as_slice());
+    }
+    blocks_to_render.reverse();
+    let mut row_cursor: u16 = 0;
+    for lines in blocks_to_render {
+        for text in lines {
+            let row = row_cursor;
+            if row >= blocks_band_height {
+                break;
+            }
+            queue!(
+                stdout,
+                ResetColor,
+                cursor::MoveTo(0, row),
+                Clear(ClearType::CurrentLine)
+            )
+            .map_err(|e| e.to_string())?;
+            write!(stdout, "{text}").map_err(|e| e.to_string())?;
+            row_cursor = row_cursor.saturating_add(1);
+        }
     }
 
     if header_visible && redraw_header {
@@ -1705,15 +1878,24 @@ fn finalize_submitted_input(
         )
         .map_err(|e| e.to_string())?;
     }
+    let fill = " ".repeat(width);
+    for offset in 0..composer_height {
+        let row = composer_start.saturating_add(offset);
+        if row >= safe_rows {
+            break;
+        }
+        queue!(stdout, cursor::MoveTo(0, row)).map_err(|e| e.to_string())?;
+        write!(stdout, "{CODEX_COMPOSER_BG}{fill}\x1b[0m").map_err(|e| e.to_string())?;
+    }
     for (index, text) in band_lines.iter().enumerate() {
-        let row = composer_start.saturating_add(index as u16);
+        let row = composer_start.saturating_add(1).saturating_add(index as u16);
         if row >= safe_rows {
             break;
         }
         queue!(stdout, cursor::MoveTo(0, row)).map_err(|e| e.to_string())?;
         write_user_band_line(&mut stdout, text, width)?;
     }
-    let next_row = composer_start.saturating_add(band_lines.len() as u16);
+    let next_row = composer_start.saturating_add(composer_height);
     move_to_append_row(&mut stdout, next_row.min(safe_rows))
 }
 
@@ -1758,7 +1940,11 @@ fn current_append_row() -> Result<u16, String> {
 }
 
 fn next_chat_input_start_row() -> Result<u16, String> {
-    Ok(current_append_row()?.saturating_add(1))
+    Ok(compute_next_chat_input_start_row(current_append_row()?))
+}
+
+fn compute_next_chat_input_start_row(current_row: u16) -> u16 {
+    current_row.saturating_add(1)
 }
 
 fn reserve_terminal_rows(start_row: u16, required_rows: u16) -> Result<u16, String> {
@@ -1766,10 +1952,16 @@ fn reserve_terminal_rows(start_row: u16, required_rows: u16) -> Result<u16, Stri
     let (_, terminal_rows) = crossterm::terminal::size().map_err(|e| e.to_string())?;
     let terminal_rows = terminal_rows.max(1);
     let required_rows = required_rows.max(1).min(terminal_rows);
-    let start_row = start_row.min(terminal_rows.saturating_sub(1));
     // Use terminal_rows - 1 as effective height to keep the bottom row blank,
     // so content never renders flush against the terminal bottom edge.
     let effective_rows = terminal_rows.saturating_sub(1).max(1);
+    // Clamp start_row to the largest value that still fits `required_rows`
+    // inside the new viewport. Without this, a start_row computed against the
+    // old (larger) height would push the composer below the new viewport and
+    // trigger a ScrollUp that consumes the chat history sitting in the
+    // terminal's scrollback buffer.
+    let max_start = effective_rows.saturating_sub(required_rows);
+    let start_row = start_row.min(max_start);
     let overflow_rows = start_row
         .saturating_add(required_rows)
         .saturating_sub(effective_rows);
@@ -2148,6 +2340,36 @@ fn codex_composer_height_for_input(
     (display.lines.len() as u16).saturating_add(2)
         .max(CODEX_COMPOSER_MIN_ROWS)
         .min(codex_composer_height())
+}
+
+/// Pure model of "where does the next composer start, after an agent reply".
+///
+/// `submitted_start_row` is the row the previous composer started on (0-indexed).
+/// `agent_response_lines` is how many lines the agent reply printed.
+/// `old_composer_height` is how many rows the previous composer occupied.
+/// `println_trailing_newline` is whether `print_cli_visible_response` ends
+/// with a `println!()` (true) or not (false).
+///
+/// The cursor is moved by `finalize_submitted_input` to
+/// `submitted_start_row + old_composer_height` (1 line past old composer).
+/// Then agent reply prints `agent_response_lines` lines from that cursor.
+/// If `println_trailing_newline`, cursor moves down 1 more line.
+/// `next_chat_input_start_row` adds 1 more line.
+///
+/// Returns the row the new composer should start on.
+fn predict_next_composer_row(
+    submitted_start_row: u16,
+    old_composer_height: u16,
+    agent_response_lines: u16,
+    println_trailing_newline: bool,
+) -> u16 {
+    let mut row = submitted_start_row.saturating_add(old_composer_height);
+    row = row.saturating_add(agent_response_lines);
+    if println_trailing_newline {
+        row = row.saturating_add(1);
+    }
+    row = row.saturating_add(1); // next_chat_input_start_row = current + 1
+    row
 }
 
 fn codex_inline_reserved_height_for_popup(header_visible: bool, popup_rows: usize) -> u16 {
@@ -2591,7 +2813,8 @@ fn print_cli_visible_response(
     if !trimmed_content.is_empty() {
         println!("• {}", trimmed_content);
     }
-    println!();
+    // No trailing println!() — keep the cursor on the agent reply's last
+    // line so the next composer renders with 0 blank lines of gap.
 }
 
 
@@ -4647,6 +4870,57 @@ fn response_content_and_reasoning(
         .and_then(|value| value.as_str())
         .map(ToString::to_string);
     (content, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_input_start_row_is_current_plus_one() {
+        // The current implementation: next_chat_input_start_row = current + 1.
+        assert_eq!(compute_next_chat_input_start_row(0), 1);
+        assert_eq!(compute_next_chat_input_start_row(10), 11);
+        assert_eq!(compute_next_chat_input_start_row(100), 101);
+    }
+
+    #[test]
+    fn composer_height_is_at_least_three() {
+        // Empty input + short input both produce a 3-row composer.
+        let cols = 80;
+        let empty = codex_composer_height_for_input(cols, CHAT_PROMPT, "", 0);
+        let short = codex_composer_height_for_input(cols, CHAT_PROMPT, "hello", 5);
+        assert!(empty >= CODEX_COMPOSER_MIN_ROWS);
+        assert!(short >= CODEX_COMPOSER_MIN_ROWS);
+    }
+
+    #[test]
+    fn predict_next_composer_row_baseline_has_1_gap() {
+        // Baseline: finalize +1, agent 3 lines, println!() +1, next_chat +1
+        // → old composer end at N+2, agent 3 lines N+3..N+5, println to N+6,
+        // next_chat N+7. So 1 line gap between agent's last line (N+5) and
+        // new composer (N+7).
+        let old_composer_start = 6;
+        let old_composer_height = 3;
+        let agent_lines = 3;
+        let with_println = true;
+        let row = predict_next_composer_row(
+            old_composer_start,
+            old_composer_height,
+            agent_lines,
+            with_println,
+        );
+        // 6 + 3 + 3 + 1 + 1 = 14
+        assert_eq!(row, 14);
+    }
+
+    #[test]
+    fn predict_next_composer_row_without_println_has_0_gap() {
+        // If we remove the trailing println!(), the gap drops by 1.
+        let row = predict_next_composer_row(6, 3, 3, false);
+        // 6 + 3 + 3 + 0 + 1 = 13
+        assert_eq!(row, 13);
+    }
 }
 
 fn save_trace(repo_root: &str, run: &MockAgentRun) -> Result<(), String> {

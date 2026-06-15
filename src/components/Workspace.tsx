@@ -17,7 +17,7 @@ import Toast, { type ToastState } from './Toast'
 import TraceDrawer from './TraceDrawer'
 import WorkspaceHeader from './WorkspaceHeader'
 import { extractCodeLinksFromText } from './codeLinkText'
-import { sanitizeModelMessage } from './traceViewModel'
+import { aggregateTokenUsage, sanitizeModelMessage } from './traceViewModel'
 
 interface WorkspaceProps {
   state: AppState
@@ -168,6 +168,10 @@ function Workspace({
       await showToolsCommand(activeProject.id, prompt)
       return
     }
+    if (isStatusCommand(prompt)) {
+      await showStatusCommand(activeProject.id, prompt)
+      return
+    }
 
     const sessionTaskId = currentTask?.id ?? crypto.randomUUID()
     const userMessage = createMessage(sessionTaskId, 'user', prompt, attachments)
@@ -275,6 +279,48 @@ function Workspace({
         sessionTaskId,
         'assistant',
         formatToolsListMessage(tools),
+      )
+      setSelectedTrace(null)
+      setState((current) => ({
+        ...appendMessagesToSession(
+          current,
+          projectId,
+          sessionTaskId,
+          [userMessage, assistantMessage],
+          'completed',
+        ),
+        traceDrawerOpen: false,
+      }))
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught)
+      const errorMessage = createMessage(sessionTaskId, 'system', message)
+      setState((current) =>
+        appendMessagesToSession(
+          current,
+          projectId,
+          sessionTaskId,
+          [userMessage, errorMessage],
+          'failed',
+        ),
+      )
+      showWorkspaceToast('error', message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const showStatusCommand = async (projectId: string, prompt: string) => {
+    const sessionTaskId = currentTask?.id ?? crypto.randomUUID()
+    const userMessage = createMessage(sessionTaskId, 'user', prompt)
+
+    setBusy(true)
+    try {
+      const traceEvents = currentTask?.traceEvents ?? []
+      const aggregated = aggregateTokenUsage(traceEvents)
+      const assistantMessage = createMessage(
+        sessionTaskId,
+        'assistant',
+        formatStatusCommandMessage(aggregated),
       )
       setSelectedTrace(null)
       setState((current) => ({
@@ -914,6 +960,36 @@ function replaceMessageById(
 function isListToolsCommand(prompt: string): boolean {
   const command = prompt.trim().toLowerCase()
   return command === '/skill' || command === '/skills'
+}
+
+function isStatusCommand(prompt: string): boolean {
+  const command = prompt.trim().toLowerCase()
+  return command === '/status' || command === '/usage'
+}
+
+function formatStatusCommandMessage(usage: {
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  inputCachedTokens: number
+  inputUncachedTokens: number
+  eventCount: number
+  hasAny: boolean
+}): string {
+  if (!usage.hasAny) {
+    return 'No token usage reported for the current task yet. Token usage is captured per LLM response in the trace drawer.'
+  }
+  const formatNumber = (value: number) => value.toLocaleString('en-US')
+  const cacheLine = usage.inputTokens
+    ? `, cached ${formatNumber(usage.inputCachedTokens)} (uncached ${formatNumber(usage.inputUncachedTokens)})`
+    : ''
+  return [
+    `Token usage (current task, ${formatNumber(usage.eventCount)} LLM step${usage.eventCount === 1 ? '' : 's'}):`,
+    '',
+    `- Input: ${formatNumber(usage.inputTokens)}${cacheLine}`,
+    `- Output: ${formatNumber(usage.outputTokens)}`,
+    `- Total: ${formatNumber(usage.totalTokens)}`,
+  ].join('\n')
 }
 
 function formatToolsListMessage(tools: ToolDefinitionSummary[]): string {

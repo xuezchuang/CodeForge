@@ -105,6 +105,7 @@ struct ChatCompletionResult {
     duration_ms: u64,
     request_body: Value,
     response_body: Value,
+    token_usage: TokenUsage,
 }
 
 #[derive(Debug, Default)]
@@ -519,6 +520,7 @@ async fn run_openai_tool_agent_loop(
                 &response_title,
                 Some(json!({
                     "request": redact_trace_value(&completion.request_body),
+                    "tokenUsage": serde_json::to_value(&completion.token_usage).unwrap_or_default(),
                 })),
                 Some(completion.response_body.clone()),
                 Some(response_summary(&completion.response_body)),
@@ -863,6 +865,7 @@ fn push_final_response_trace(
                 } else {
                     None
                 },
+                "tokenUsage": serde_json::to_value(&completion.token_usage).unwrap_or_default(),
             })),
             Some(final_summary),
             status,
@@ -1524,15 +1527,43 @@ async fn send_chat_completion(
             .map_err(|error| format!("Model response parse failed: {error}; body={}", body))?
     };
 
+    let token_usage = extract_token_usage_from_response(&response_body);
     Ok(ChatCompletionResult {
         duration_ms,
         request_body: request_body.clone(),
         response_body,
+        token_usage,
     })
 }
 
 fn is_codebuddy_provider(selected: &SelectedModel) -> bool {
     selected.provider.id == "codebuddy" || selected.provider.provider_type == "codebuddy"
+}
+
+fn extract_token_usage_from_response(body: &Value) -> TokenUsage {
+    let Some(usage) = body.get("usage").and_then(Value::as_object) else {
+        return TokenUsage::default();
+    };
+    let prompt = usage.get("prompt_tokens").and_then(Value::as_u64);
+    let completion = usage.get("completion_tokens").and_then(Value::as_u64);
+    let total = usage.get("total_tokens").and_then(Value::as_u64).or_else(|| {
+        prompt.zip(completion).map(|(p, c)| p + c)
+    });
+    let cached = usage.get("cached_tokens").and_then(Value::as_u64).or_else(|| {
+        usage
+            .get("prompt_tokens_details")
+            .and_then(Value::as_object)
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64)
+    });
+    let uncached = prompt.zip(cached).map(|(p, c)| p.saturating_sub(c));
+    TokenUsage {
+        input_tokens: prompt,
+        output_tokens: completion,
+        total_tokens: total,
+        input_cached_tokens: cached,
+        input_uncached_tokens: uncached,
+    }
 }
 
 fn add_codebuddy_vscode_headers(headers: &mut HeaderMap) {
@@ -2449,6 +2480,7 @@ mod tests {
                     }
                 }]
             }),
+            token_usage: TokenUsage::default(),
         };
         let mut traces = Vec::new();
         let mut step_index = 1;
@@ -2485,6 +2517,7 @@ mod tests {
                     }
                 }]
             }),
+            token_usage: TokenUsage::default(),
         };
         let mut traces = Vec::new();
         let mut step_index = 1;

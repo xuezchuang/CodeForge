@@ -530,3 +530,116 @@ function normalizeTraceTitle(title: string): string {
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (value) => value.toUpperCase())
 }
+
+export interface AggregatedTokenUsage {
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  inputCachedTokens: number
+  inputUncachedTokens: number
+  eventCount: number
+  hasAny: boolean
+  display: string
+}
+
+export function aggregateTokenUsage(events: ToolTraceEvent[]): AggregatedTokenUsage {
+  let inputTokens = 0
+  let outputTokens = 0
+  let totalTokens = 0
+  let inputCachedTokens = 0
+  let inputUncachedTokens = 0
+  let eventCount = 0
+  let hasAny = false
+
+  const addNumber = (target: { value: number }, value: string) => {
+    const numeric = Number(value)
+    if (Number.isFinite(numeric) && numeric > 0) {
+      target.value += numeric
+      hasAny = true
+    }
+  }
+
+  for (const event of events) {
+    if (
+      event.type !== 'llm_response' &&
+      event.type !== 'final_response' &&
+      event.type !== 'tool_result'
+    ) {
+      continue
+    }
+    const input = asRecord(event.input)
+    const output = asRecord(event.output)
+    let tokens: ReturnType<typeof readTokenUsage> | null = null
+
+    if (event.type === 'llm_response') {
+      tokens = readTokenUsage(output)
+      if (!tokens.inputTokens && !tokens.outputTokens) {
+        const inputTokensRecord = asRecord(input.tokenUsage)
+        if (inputTokensRecord) {
+          tokens = readTokenUsage(inputTokensRecord)
+        }
+      }
+    } else if (event.type === 'final_response') {
+      const responseRecord = asRecord(output.response)
+      tokens = readTokenUsage(responseRecord)
+      if (!tokens.inputTokens && !tokens.outputTokens) {
+        const outputTokensRecord = asRecord(output.tokenUsage)
+        if (outputTokensRecord) {
+          tokens = readTokenUsage(outputTokensRecord)
+        }
+      }
+    } else if (event.type === 'tool_result') {
+      tokens = readTokenUsage(output)
+    }
+
+    if (!tokens) {
+      continue
+    }
+
+    const inputBucket = { value: 0 }
+    const outputBucket = { value: 0 }
+    const totalBucket = { value: 0 }
+    const cachedBucket = { value: 0 }
+    const uncachedBucket = { value: 0 }
+    addNumber(inputBucket, tokens.inputTokens)
+    addNumber(outputBucket, tokens.outputTokens)
+    addNumber(totalBucket, tokens.totalTokens)
+    addNumber(cachedBucket, tokens.inputCachedTokens)
+    addNumber(uncachedBucket, tokens.inputUncachedTokens)
+
+    if (inputBucket.value || outputBucket.value || totalBucket.value || cachedBucket.value) {
+      eventCount += 1
+    }
+
+    inputTokens += inputBucket.value
+    outputTokens += outputBucket.value
+    totalTokens += totalBucket.value
+    inputCachedTokens += cachedBucket.value
+    inputUncachedTokens += uncachedBucket.value
+  }
+
+  if (!totalTokens && inputTokens + outputTokens > 0) {
+    totalTokens = inputTokens + outputTokens
+  }
+  if (!inputUncachedTokens && inputTokens > 0) {
+    inputUncachedTokens = Math.max(0, inputTokens - inputCachedTokens)
+  }
+
+  const formatNumber = (value: number) => value.toLocaleString('en-US')
+  const displayParts = [
+    inputTokens ? `${formatNumber(inputTokens)} in` : '',
+    outputTokens ? `${formatNumber(outputTokens)} out` : '',
+    totalTokens ? `${formatNumber(totalTokens)} total` : '',
+  ].filter((part) => part.length > 0)
+
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    inputCachedTokens,
+    inputUncachedTokens,
+    eventCount,
+    hasAny,
+    display: displayParts.join(' / ') || 'not reported',
+  }
+}

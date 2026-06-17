@@ -521,4 +521,3 @@ fn model_reasoning_mode(model_id: &str) -> &'static str {
 fn model_default_reasoning(_reasoning_mode: &str) -> &'static str {
     "off"
 }
-

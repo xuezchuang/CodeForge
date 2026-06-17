@@ -15,10 +15,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::queue;
 use crossterm::style::ResetColor;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-    LeaveAlternateScreen, ScrollUp,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType, ScrollUp};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -28,8 +25,10 @@ use uuid::Uuid;
 
 use crate::agent_runner::{self, AgentConversationMessage, AgentRunInput};
 use crate::app_state::{current_settings, AppState};
+use crate::goal_state::GoalState;
 use crate::project_registry::{ProjectInput, ProjectSession};
 use crate::tool_trace::{MockAgentRun, ToolTraceEvent, TraceEventType};
+use crate::tui::AppEvent;
 use crate::vs_registry::{AppSettings, ProviderConfig, ProviderCredential};
 
 const CHAT_PROMPT: &str = "› ";
@@ -38,6 +37,7 @@ const CODEX_COMPOSER_MIN_ROWS: u16 = 3;
 const CODEX_COMPOSER_MAX_ROWS: u16 = 8;
 const CODEX_COMPOSER_FOOTER_GAP: u16 = 1;
 const CODEX_FOOTER_HEIGHT: u16 = 1;
+const CODEX_STARTUP_TIP_ROWS: u16 = 3;
 const CODEX_POPUP_MAX_ROWS: u16 = 8;
 const CODEX_COMPOSER_BG: &str = "\x1b[48;5;236m";
 
@@ -130,6 +130,8 @@ struct CliSession {
     reasoning_effort: Option<String>,
     workspace_label: Option<String>,
     shell_allowed: bool,
+    goal: Option<GoalState>,
+    goal_traces: Option<Vec<ToolTraceEvent>>,
 }
 
 #[derive(Clone, Debug)]
@@ -305,8 +307,8 @@ fn first_positional_arg(args: &[String]) -> Option<&str> {
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
-            "--project" | "-C" | "--provider" | "--credential" | "--model" | "-m" | "--reasoning"
-            | "--reason" | "--reasion" => {
+            "--project" | "-C" | "--provider" | "--credential" | "--model" | "-m"
+            | "--reasoning" | "--reason" | "--reasion" => {
                 index += 2;
             }
             "--no-shell" | "--allow-shell" | "--shell" | "--yes" | "--json" | "--verbose"
@@ -445,7 +447,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
         Command::Run { task } => {
             let task = cli_run_task_text(task)?;
             hydrate_cli_session_defaults(&state, &mut session)?;
-            run_task(&state, &cli, &session, &task, None, false)
+            run_task(&state, &cli, &session, &task, None, false, true)
                 .await
                 .map(|_| ())
         }
@@ -570,6 +572,8 @@ impl CliSession {
             reasoning_effort: normalize_cli_reasoning(cli.reasoning.as_deref()),
             workspace_label: None,
             shell_allowed: !cli.no_shell,
+            goal: None,
+            goal_traces: None,
         }
     }
 }
@@ -640,26 +644,24 @@ fn run_projects(
 }
 
 fn cli_projects_json(projects: &[ProjectSession]) -> serde_json::Value {
-    json!(
-        projects
-            .iter()
-            .map(|project| {
-                json!({
-                    "id": project.id,
-                    "name": project.name,
-                    "root": project.repo_root,
-                    "repoRoot": project.repo_root,
-                    "solutionPath": project.solution_path,
-                    "uprojectPath": project.uproject_path,
-                    "buildCommand": project.build_command,
-                    "vsBridgeEndpoint": project.vs_bridge_endpoint,
-                    "vsProcessId": project.vs_process_id,
-                    "createdAt": project.created_at,
-                    "updatedAt": project.updated_at,
-                })
+    json!(projects
+        .iter()
+        .map(|project| {
+            json!({
+                "id": project.id,
+                "name": project.name,
+                "root": project.repo_root,
+                "repoRoot": project.repo_root,
+                "solutionPath": project.solution_path,
+                "uprojectPath": project.uproject_path,
+                "buildCommand": project.build_command,
+                "vsBridgeEndpoint": project.vs_bridge_endpoint,
+                "vsProcessId": project.vs_process_id,
+                "createdAt": project.created_at,
+                "updatedAt": project.updated_at,
             })
-            .collect::<Vec<_>>()
-    )
+        })
+        .collect::<Vec<_>>())
 }
 
 fn run_models(state: &AppState, command: &ModelsCommand, json_output: bool) -> Result<(), String> {
@@ -693,66 +695,60 @@ fn run_models(state: &AppState, command: &ModelsCommand, json_output: bool) -> R
 }
 
 fn cli_models_json(settings: &AppSettings) -> serde_json::Value {
-    json!(
-        settings
-            .providers
-            .iter()
-            .map(|provider| {
-                json!({
-                    "id": provider.id,
-                    "type": provider.provider_type,
-                    "name": provider.name,
-                    "enabled": provider.enabled,
-                    "baseUrl": provider.base_url,
-                    "baseUrlLocked": provider.base_url_locked,
-                    "supportsToolCall": provider.supports_tool_call,
-                    "defaultCredentialId": provider.default_credential_id,
-                    "defaultModel": provider.default_model,
-                    "temperature": provider.temperature,
-                    "credentials": provider
-                        .credentials
-                        .iter()
-                        .map(|credential| {
-                            json!({
-                                "id": credential.id,
-                                "name": credential.name,
-                                "enabled": credential.enabled,
-                            })
+    json!(settings
+        .providers
+        .iter()
+        .map(|provider| {
+            json!({
+                "id": provider.id,
+                "type": provider.provider_type,
+                "name": provider.name,
+                "enabled": provider.enabled,
+                "baseUrl": provider.base_url,
+                "baseUrlLocked": provider.base_url_locked,
+                "supportsToolCall": provider.supports_tool_call,
+                "defaultCredentialId": provider.default_credential_id,
+                "defaultModel": provider.default_model,
+                "temperature": provider.temperature,
+                "credentials": provider
+                    .credentials
+                    .iter()
+                    .map(|credential| {
+                        json!({
+                            "id": credential.id,
+                            "name": credential.name,
+                            "enabled": credential.enabled,
                         })
-                        .collect::<Vec<_>>(),
-                    "models": provider
-                        .models
-                        .iter()
-                        .map(|model| {
-                            json!({
-                                "id": model.id,
-                                "name": model.name,
-                                "enabled": model.enabled,
-                                "credentialId": model.credential_id,
-                                "reasoningMode": model.reasoning_mode,
-                                "defaultReasoning": model.default_reasoning,
-                                "ownedBy": model.owned_by,
-                                "created": model.created,
-                            })
+                    })
+                    .collect::<Vec<_>>(),
+                "models": provider
+                    .models
+                    .iter()
+                    .map(|model| {
+                        json!({
+                            "id": model.id,
+                            "name": model.name,
+                            "enabled": model.enabled,
+                            "credentialId": model.credential_id,
+                            "reasoningMode": model.reasoning_mode,
+                            "defaultReasoning": model.default_reasoning,
+                            "ownedBy": model.owned_by,
+                            "created": model.created,
                         })
-                        .collect::<Vec<_>>(),
-                })
+                    })
+                    .collect::<Vec<_>>(),
             })
-            .collect::<Vec<_>>()
-    )
+        })
+        .collect::<Vec<_>>())
 }
 
+/// CodeForge chat loop.
 async fn run_chat(state: &AppState, cli: &Cli, mut session: CliSession) -> Result<(), String> {
     let stdin = io::stdin();
     let stdin_is_terminal = stdin.is_terminal();
     let mut handled_input = false;
     let mut history = Vec::new();
     let mut transcript: Vec<AgentConversationMessage> = Vec::new();
-    // `blocks` is the rendered shadow of the chat history. We keep the
-    // last CLI_TRANSCRIPT_MAX_MESSAGES user/assistant messages so that on
-    // resize (or any other full re-render) we can repaint the whole
-    // transcript above the composer without depending on the terminal's
-    // scrollback buffer.
     let mut blocks: Vec<RenderedBlock> = Vec::new();
     let mut show_header = true;
     let project = select_project(state, cli.project.as_deref())?;
@@ -773,17 +769,16 @@ async fn run_chat(state: &AppState, cli: &Cli, mut session: CliSession) -> Resul
         } else {
             input_start_row
         };
-        let Some((line, input_header_visible, submitted_start_row)) =
-            read_chat_input(
-                &stdin,
-                CHAT_PROMPT,
-                &session,
-                &mut history,
-                show_header,
-                current_input_start_row,
-                screen_origin_row,
-                &blocks,
-            )?
+        let Some((line, input_header_visible, submitted_start_row)) = read_chat_input(
+            &stdin,
+            CHAT_PROMPT,
+            &session,
+            &mut history,
+            show_header,
+            current_input_start_row,
+            screen_origin_row,
+            &blocks,
+        )?
         else {
             break;
         };
@@ -840,13 +835,20 @@ async fn run_chat(state: &AppState, cli: &Cli, mut session: CliSession) -> Resul
             }
             ChatCommandResult::NotCommand => {}
         }
-        // Record the user's submitted input into the rendered history so
-        // resize / full re-render can repaint it from memory.
         blocks.push(RenderedBlock::UserInput(task.to_string()));
         let mut run_messages = transcript.clone();
         run_messages.push(cli_conversation_message("user", task));
         transcript.push(cli_conversation_message("user", task));
-        let run = run_task(state, cli, &session, task, Some(run_messages), stdin_is_terminal).await?;
+        let run = run_task(
+            state,
+            cli,
+            &session,
+            task,
+            Some(run_messages),
+            stdin_is_terminal,
+            true,
+        )
+        .await?;
         if let Some(parts) = final_response(&run) {
             let hide_thinking = cli_should_hide_thinking(&session);
             let visible_text = if hide_thinking {
@@ -881,6 +883,389 @@ async fn run_chat(state: &AppState, cli: &Cli, mut session: CliSession) -> Resul
     Ok(())
 }
 
+#[derive(Debug)]
+enum SubmitRequest {
+    Submit(String),
+    Exit,
+}
+
+async fn handle_tui_submit(
+    event_tx: &std::sync::mpsc::Sender<AppEvent>,
+    state: &AppState,
+    cli: &Cli,
+    project: &ProjectSession,
+    session: &mut CliSession,
+    transcript: std::sync::Arc<std::sync::Mutex<Vec<AgentConversationMessage>>>,
+    text: String,
+) -> Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    // Slash commands are dispatched locally.
+    if trimmed.starts_with('/') {
+        if let Some(parsed) = crate::slash_command::parse_slash_command(trimmed) {
+            match parsed {
+                Ok(crate::slash_command::SlashCommand::Quit) => {
+                    let _ = event_tx.send(AppEvent {
+                        append_user: Some(trimmed.to_string()),
+                        ..AppEvent::default()
+                    });
+                    let _ = event_tx.send(AppEvent {
+                        quit: true,
+                        ..AppEvent::default()
+                    });
+                    return Ok(());
+                }
+                Ok(crate::slash_command::SlashCommand::New) => {
+                    transcript.lock().expect("transcript lock").clear();
+                    let _ = event_tx.send(AppEvent {
+                        clear_transcript: true,
+                        append_assistant: Some("Started a new chat.".to_string()),
+                        ..AppEvent::default()
+                    });
+                    return Ok(());
+                }
+                Ok(crate::slash_command::SlashCommand::Clear) => {
+                    let _ = event_tx.send(AppEvent {
+                        clear_transcript: true,
+                        ..AppEvent::default()
+                    });
+                    return Ok(());
+                }
+                Ok(crate::slash_command::SlashCommand::Help) => {
+                    let _ = event_tx.send(AppEvent {
+                        append_user: Some(trimmed.to_string()),
+                        ..AppEvent::default()
+                    });
+                    let text = crate::slash_command::builtin_slash_commands()
+                        .iter()
+                        .map(|(name, desc)| format!("{name:<8} {desc}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let _ = event_tx.send(AppEvent {
+                        append_assistant: Some(text),
+                        ..AppEvent::default()
+                    });
+                    return Ok(());
+                }
+                Ok(crate::slash_command::SlashCommand::Status) => {
+                    let _ = event_tx.send(AppEvent {
+                        append_user: Some(trimmed.to_string()),
+                        append_assistant: Some(tui_status_summary(session, project)),
+                        ..AppEvent::default()
+                    });
+                    return Ok(());
+                }
+                Ok(crate::slash_command::SlashCommand::Model)
+                | Ok(crate::slash_command::SlashCommand::Reason) => {
+                    let _ = event_tx.send(AppEvent {
+                        append_user: Some(trimmed.to_string()),
+                        ..AppEvent::default()
+                    });
+                    let _ = event_tx.send(AppEvent {
+                        append_assistant: Some(format!(
+                            "Run `codeforge {trimmed}` to change model/reasoning."
+                        )),
+                        ..AppEvent::default()
+                    });
+                    return Ok(());
+                }
+                Ok(crate::slash_command::SlashCommand::Goal(sub)) => {
+                    let _ = event_tx.send(AppEvent {
+                        append_user: Some(trimmed.to_string()),
+                        ..AppEvent::default()
+                    });
+                    let (new_goal, message) = match sub {
+                        crate::slash_command::GoalSubcommand::Set { objective } => {
+                            let goal = crate::goal_state::GoalState::new(objective);
+                            let message = tui_goal_summary(Some(&goal));
+                            (Some(goal), message)
+                        }
+                        crate::slash_command::GoalSubcommand::Clear => {
+                            (None, "Goal cleared.".to_string())
+                        }
+                        crate::slash_command::GoalSubcommand::Show => (
+                            session.goal.clone(),
+                            tui_goal_summary(session.goal.as_ref()),
+                        ),
+                        crate::slash_command::GoalSubcommand::Pause => {
+                            if let Some(mut goal) = session.goal.clone() {
+                                goal.pause();
+                                let message = tui_goal_summary(Some(&goal));
+                                (Some(goal), message)
+                            } else {
+                                (None, "No active goal.".to_string())
+                            }
+                        }
+                        crate::slash_command::GoalSubcommand::Resume => {
+                            if let Some(mut goal) = session.goal.clone() {
+                                goal.resume();
+                                let message = tui_goal_summary(Some(&goal));
+                                (Some(goal), message)
+                            } else {
+                                (None, "No active goal.".to_string())
+                            }
+                        }
+                    };
+                    session.goal = new_goal.clone();
+                    let _ = event_tx.send(AppEvent {
+                        set_goal: Some(new_goal),
+                        append_assistant: Some(message),
+                        ..AppEvent::default()
+                    });
+                    return Ok(());
+                }
+                Err(err) => {
+                    let _ = event_tx.send(AppEvent {
+                        append_user: Some(trimmed.to_string()),
+                        ..AppEvent::default()
+                    });
+                    let _ = event_tx.send(AppEvent {
+                        append_assistant: Some(format!("error: {err}")),
+                        ..AppEvent::default()
+                    });
+                    return Ok(());
+                }
+            }
+        } else {
+            let _ = event_tx.send(AppEvent {
+                append_user: Some(trimmed.to_string()),
+                append_assistant: Some(format!(
+                    "Unknown command: {trimmed}\nType /help to show available commands."
+                )),
+                ..AppEvent::default()
+            });
+            return Ok(());
+        }
+    }
+    // Regular task: run the agent.
+    let _ = event_tx.send(AppEvent {
+        append_user: Some(trimmed.to_string()),
+        ..AppEvent::default()
+    });
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .push(AgentConversationMessage {
+            role: "user".to_string(),
+            content: trimmed.to_string(),
+            attachments: Vec::new(),
+        });
+    let _ = event_tx.send(AppEvent {
+        task_started: Some(trimmed.to_string()),
+        ..AppEvent::default()
+    });
+    let prior_messages = {
+        let messages = transcript.lock().expect("transcript lock");
+        messages
+            .iter()
+            .take(messages.len().saturating_sub(1))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let run = run_task(
+        state,
+        cli,
+        session,
+        trimmed,
+        Some(prior_messages),
+        false,
+        false,
+    )
+    .await?;
+    if let Some(parts) = final_response(&run) {
+        let content = parts.content.trim().to_string();
+        let _ = event_tx.send(AppEvent {
+            append_assistant: Some(content.clone()),
+            task_finished: Some(()),
+            ..AppEvent::default()
+        });
+        transcript
+            .lock()
+            .expect("transcript lock")
+            .push(AgentConversationMessage {
+                role: "assistant".to_string(),
+                content,
+                attachments: Vec::new(),
+            });
+    } else if let Some(summary) = run
+        .traces
+        .last()
+        .and_then(|event| event.output_summary.clone())
+    {
+        let _ = event_tx.send(AppEvent {
+            append_assistant: Some(summary.clone()),
+            task_finished: Some(()),
+            ..AppEvent::default()
+        });
+        transcript
+            .lock()
+            .expect("transcript lock")
+            .push(AgentConversationMessage {
+                role: "assistant".to_string(),
+                content: summary,
+                attachments: Vec::new(),
+            });
+    } else {
+        let _ = event_tx.send(AppEvent {
+            task_finished: Some(()),
+            ..AppEvent::default()
+        });
+    }
+    let _ = project;
+    Ok(())
+}
+
+fn tui_status_summary(session: &CliSession, project: &ProjectSession) -> String {
+    let mut lines = vec![
+        format!("model: {}", cli_session_model_label(session)),
+        format!("provider: {}", cli_session_provider_label(session)),
+        format!("reasoning: {}", cli_session_reasoning_label(session)),
+        format!("workspace: {}", cli_project_label(project)),
+        format!(
+            "shell: {}",
+            if session.shell_allowed {
+                "allowed by policy"
+            } else {
+                "disabled by CodeForge safety policy"
+            }
+        ),
+    ];
+    if let Some(goal) = session.goal.as_ref() {
+        lines.push(format!(
+            "goal: [{}] {}",
+            goal.status.label(),
+            goal.objective
+        ));
+    } else {
+        lines.push("goal: none".to_string());
+    }
+    lines.join("\n")
+}
+
+fn tui_goal_summary(goal: Option<&crate::goal_state::GoalState>) -> String {
+    match goal {
+        Some(goal) if !goal.objective.trim().is_empty() => {
+            format!("Goal [{}]: {}", goal.status.label(), goal.objective)
+        }
+        Some(goal) => format!("Goal [{}]", goal.status.label()),
+        None => "No active goal.".to_string(),
+    }
+}
+
+/// Non-interactive fallback: read a single task from stdin and run it.
+/// Used when the user pipes input instead of running in a real TTY.
+async fn run_chat_non_interactive(
+    state: &AppState,
+    cli: &Cli,
+    mut session: CliSession,
+) -> Result<(), String> {
+    let project = select_project(state, cli.project.as_deref())?;
+    session.workspace_label = Some(cli_project_label(&project));
+    let mut buffer = String::new();
+    if io::stdin().read_to_string(&mut buffer).is_err() {
+        return Err("failed to read task from stdin".to_string());
+    }
+    let task = buffer.trim();
+    if task.is_empty() {
+        return Err(
+            "codeforge received an empty task from stdin. Use codeforge \"<task>\", codeforge run \"<task>\", or pipe a non-empty task."
+                .to_string(),
+        );
+    }
+    run_task(state, cli, &session, task, None, false, true).await?;
+    Ok(())
+}
+/// Run the ratatui TUI on a dedicated thread. Owns the terminal until the
+/// user quits or the event channel closes.
+fn run_tui_thread(
+    version: String,
+    submit_tx: std::sync::mpsc::Sender<SubmitRequest>,
+    event_rx: std::sync::mpsc::Receiver<AppEvent>,
+) -> Result<(), String> {
+    use std::sync::mpsc::TryRecvError;
+    use std::time::Duration;
+    let mut guard =
+        crate::tui::terminal::TuiGuard::enter().map_err(|e| format!("tui init failed: {e}"))?;
+    let mut app = crate::tui::App::new(version);
+    let mut exited = false;
+    loop {
+        // Drain any pending host events so the TUI reflects them before
+        // we draw the next frame.
+        loop {
+            match event_rx.try_recv() {
+                Ok(event) => {
+                    let is_quit = event.quit;
+                    app.apply(event);
+                    if is_quit {
+                        exited = true;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    exited = true;
+                    break;
+                }
+            }
+        }
+        if exited {
+            break;
+        }
+        guard
+            .terminal
+            .draw(|frame| app.draw(frame))
+            .map_err(|e| format!("tui draw failed: {e}"))?;
+        if let Some(outcome) = app.take_outcome() {
+            let request = match outcome {
+                crate::tui::AppOutcome::Submit(text) => SubmitRequest::Submit(text),
+                crate::tui::AppOutcome::Command { name: _, raw } => {
+                    // For now treat command submissions as plain text.
+                    SubmitRequest::Submit(raw)
+                }
+                crate::tui::AppOutcome::Exit => SubmitRequest::Exit,
+            };
+            let should_exit = matches!(request, SubmitRequest::Exit);
+            if submit_tx.send(request).is_err() {
+                break;
+            }
+            if should_exit {
+                break;
+            }
+        }
+        if crossterm::event::poll(Duration::from_millis(50))
+            .map_err(|e| format!("event poll failed: {e}"))?
+        {
+            if let crossterm::event::Event::Key(key) =
+                crossterm::event::read().map_err(|e| format!("event read failed: {e}"))?
+            {
+                if matches!(
+                    key.kind,
+                    crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+                ) {
+                    if let Some(outcome) = app.handle_key(key) {
+                        let request = match outcome {
+                            crate::tui::AppOutcome::Submit(text) => SubmitRequest::Submit(text),
+                            crate::tui::AppOutcome::Command { name: _, raw } => {
+                                SubmitRequest::Submit(raw)
+                            }
+                            crate::tui::AppOutcome::Exit => SubmitRequest::Exit,
+                        };
+                        let should_exit = matches!(request, SubmitRequest::Exit);
+                        if submit_tx.send(request).is_err() {
+                            break;
+                        }
+                        if should_exit {
+                            exited = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cli_conversation_message(role: &str, content: &str) -> AgentConversationMessage {
     AgentConversationMessage {
         role: role.to_string(),
@@ -910,16 +1295,8 @@ impl CliScreenGuard {
             stdout.flush().map_err(|e| e.to_string())?;
             origin_row = cursor::position().map_err(|e| e.to_string())?.1;
         }
-        // Switch to the alternate screen so the main screen's scrollback is
-        // frozen while the chat session is active. This mirrors how
-        // codex-rs/tui runs (see codex-rs/tui/src/tui.rs — they call
-        // `EnterAlternateScreen` on entry and `LeaveAlternateScreen` on
-        // exit). Without this, every line we write to the chat lives in the
-        // host terminal's scrollback; a later resize / scroll would re-
-        // surface the old layout on top of the freshly-rendered one.
         execute!(
             stdout,
-            EnterAlternateScreen,
             ResetColor,
             cursor::MoveTo(0, origin_row),
             cursor::SetCursorStyle::BlinkingBar,
@@ -941,8 +1318,7 @@ impl Drop for CliScreenGuard {
             stdout,
             ResetColor,
             cursor::SetCursorStyle::DefaultUserShape,
-            cursor::Show,
-            LeaveAlternateScreen
+            cursor::Show
         );
     }
 }
@@ -1017,10 +1393,19 @@ fn read_chat_input(
     blocks: &[RenderedBlock],
 ) -> Result<Option<(String, bool, u16)>, String> {
     if !stdin.is_terminal() {
-        return read_stdin_line(stdin).map(|line| line.map(|line| (line, header_visible, start_row)));
+        return read_stdin_line(stdin)
+            .map(|line| line.map(|line| (line, header_visible, start_row)));
     }
 
-    read_interactive_chat_input(prompt, session, history, header_visible, start_row, origin_row, blocks)
+    read_interactive_chat_input(
+        prompt,
+        session,
+        history,
+        header_visible,
+        start_row,
+        origin_row,
+        blocks,
+    )
 }
 
 fn read_interactive_chat_input(
@@ -1048,7 +1433,7 @@ fn read_interactive_chat_input(
         selected_command_index,
         session,
         inline_screen.start_row(),
-                        active_header_visible,
+        active_header_visible,
         active_header_visible,
         blocks,
     )?);
@@ -1096,7 +1481,11 @@ fn read_interactive_chat_input(
                     drop(raw_mode);
                     io::stdout().flush().map_err(|e| e.to_string())?;
                     record_chat_history(history, &submitted);
-                    return Ok(Some((submitted, active_header_visible, submitted_start_row)));
+                    return Ok(Some((
+                        submitted,
+                        active_header_visible,
+                        submitted_start_row,
+                    )));
                 }
                 KeyCode::Backspace => {
                     history_index = None;
@@ -1124,8 +1513,7 @@ fn read_interactive_chat_input(
                     )?);
                 }
                 KeyCode::Up | KeyCode::Char('p') | KeyCode::Char('P')
-                    if matches!(code, KeyCode::Up)
-                        || modifiers.contains(KeyModifiers::CONTROL) =>
+                    if matches!(code, KeyCode::Up) || modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     if let Some(count) = slash_command_match_count(&line) {
                         selected_command_index = if selected_command_index == 0 {
@@ -1140,7 +1528,7 @@ fn read_interactive_chat_input(
                             selected_command_index,
                             session,
                             inline_screen.start_row(),
-                        active_header_visible,
+                            active_header_visible,
                             false,
                             blocks,
                         )?);
@@ -1163,7 +1551,7 @@ fn read_interactive_chat_input(
                             selected_command_index,
                             session,
                             inline_screen.start_row(),
-                        active_header_visible,
+                            active_header_visible,
                             false,
                             blocks,
                         )?);
@@ -1182,7 +1570,7 @@ fn read_interactive_chat_input(
                             selected_command_index,
                             session,
                             inline_screen.start_row(),
-                        active_header_visible,
+                            active_header_visible,
                             false,
                             blocks,
                         )?);
@@ -1205,7 +1593,7 @@ fn read_interactive_chat_input(
                             selected_command_index,
                             session,
                             inline_screen.start_row(),
-                        active_header_visible,
+                            active_header_visible,
                             false,
                             blocks,
                         )?);
@@ -1216,7 +1604,8 @@ fn read_interactive_chat_input(
                         let page_size =
                             chat_popup_page_size(inline_screen.start_row(), active_header_visible);
                         selected_command_index = selected_command_index.saturating_sub(page_size);
-                        selected_command_index = selected_command_index.min(count.saturating_sub(1));
+                        selected_command_index =
+                            selected_command_index.min(count.saturating_sub(1));
                         inline_screen.set_start_row(render_chat_input(
                             prompt,
                             &line,
@@ -1224,7 +1613,7 @@ fn read_interactive_chat_input(
                             selected_command_index,
                             session,
                             inline_screen.start_row(),
-                        active_header_visible,
+                            active_header_visible,
                             false,
                             blocks,
                         )?);
@@ -1244,7 +1633,7 @@ fn read_interactive_chat_input(
                             selected_command_index,
                             session,
                             inline_screen.start_row(),
-                        active_header_visible,
+                            active_header_visible,
                             false,
                             blocks,
                         )?);
@@ -1264,7 +1653,7 @@ fn read_interactive_chat_input(
                             selected_command_index,
                             session,
                             inline_screen.start_row(),
-                        active_header_visible,
+                            active_header_visible,
                             false,
                             blocks,
                         )?);
@@ -1282,7 +1671,7 @@ fn read_interactive_chat_input(
                             selected_command_index,
                             session,
                             inline_screen.start_row(),
-                        active_header_visible,
+                            active_header_visible,
                             false,
                             blocks,
                         )?);
@@ -1308,7 +1697,11 @@ fn read_interactive_chat_input(
                 KeyCode::Char('c') | KeyCode::Char('C')
                     if modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    inline_screen.clear_interaction(false)?;
+                    clear_chat_runtime_area(
+                        inline_screen.start_row(),
+                        active_header_visible,
+                        blocks.is_empty(),
+                    )?;
                     drop(inline_screen);
                     drop(raw_mode);
                     println!();
@@ -1337,7 +1730,11 @@ fn read_interactive_chat_input(
                 KeyCode::Char('d') | KeyCode::Char('D')
                     if modifiers.contains(KeyModifiers::CONTROL) && line.is_empty() =>
                 {
-                    inline_screen.clear_interaction(false)?;
+                    clear_chat_runtime_area(
+                        inline_screen.start_row(),
+                        active_header_visible,
+                        blocks.is_empty(),
+                    )?;
                     drop(inline_screen);
                     drop(raw_mode);
                     println!();
@@ -1621,7 +2018,7 @@ fn read_interactive_chat_input(
                     selected_command_index,
                     session,
                     inline_screen.start_row(),
-                        active_header_visible,
+                    active_header_visible,
                     false,
                     blocks,
                 )?);
@@ -1652,6 +2049,20 @@ fn read_interactive_chat_input(
             _ => {}
         }
     }
+}
+
+fn render_codex_startup_tip(stdout: &mut io::Stdout, cols: u16, row: u16) -> Result<(), String> {
+    let width = (cols as usize).max(1);
+    let tip = "Tip: Type / for commands. Use /model to change model.";
+    let line = truncate_display_width(tip, width);
+    queue!(
+        stdout,
+        ResetColor,
+        cursor::MoveTo(0, row),
+        Clear(ClearType::CurrentLine)
+    )
+    .map_err(|e| e.to_string())?;
+    write!(stdout, "\x1b[1mTip:\x1b[22m {}", &line[5.min(line.len())..]).map_err(|e| e.to_string())
 }
 
 fn render_chat_input(
@@ -1711,36 +2122,49 @@ fn render_chat_input(
     // history. We compute the lines for every block first, then later decide
     // which tail to display inside the visible viewport.
     let width = (cols as usize).max(1);
-    let block_lines: Vec<Vec<String>> = blocks
-        .iter()
-        .map(|block| block.lines_for(width))
-        .collect();
+    let block_lines: Vec<Vec<String>> = blocks.iter().map(|block| block.lines_for(width)).collect();
     let block_line_counts: Vec<usize> = block_lines.iter().map(|lines| lines.len()).collect();
     let total_block_lines: usize = block_line_counts.iter().sum();
 
-    let layout_height = header_rows
+    let blocks_are_empty = total_block_lines == 0;
+    let compact_startup = blocks_are_empty && header_visible && visible_popup_rows == 0;
+    let tip_rows = if compact_startup {
+        CODEX_STARTUP_TIP_ROWS
+    } else {
+        0
+    };
+    let top_rows = header_rows.saturating_add(tip_rows);
+    let layout_height = top_rows
         .saturating_add(visible_popup_rows as u16)
         .saturating_add(composer_height)
         .saturating_add(CODEX_COMPOSER_FOOTER_GAP)
         .saturating_add(CODEX_FOOTER_HEIGHT)
         .max(1);
     let layout_start = reserve_terminal_rows(start_row, layout_height)?;
-    let composer_start = layout_start.saturating_add(header_rows);
+    let safe_rows = terminal_rows.saturating_sub(1).max(1);
+    let bottom_start = safe_rows.saturating_sub(
+        composer_height
+            .saturating_add(visible_popup_rows as u16)
+            .saturating_add(CODEX_COMPOSER_FOOTER_GAP)
+            .saturating_add(CODEX_FOOTER_HEIGHT),
+    );
+    let composer_start = if compact_startup {
+        layout_start.saturating_add(top_rows)
+    } else {
+        bottom_start
+    };
     let popup_start = composer_start.saturating_add(composer_height);
-    let safe_rows = terminal_rows.saturating_sub(1);
     let footer_row = composer_start
         .saturating_add(composer_height)
         .saturating_add(visible_popup_rows as u16)
         .saturating_add(CODEX_COMPOSER_FOOTER_GAP)
         .min(safe_rows.saturating_sub(1));
-    // Wipe the area we're about to repaint. The blocks band lives between
-    // row 0 and `layout_start`, so the default ("composer band only")
-    // cleanup would leave stale block text on screen across renders. We
-    // therefore always wipe from row 0 through the bottom of the viewport
-    // — it's a single pass, the rest of the layout paint below writes on
-    // top, and we avoid the "ghost blocks" bug.
-    let clear_from: u16 = 0;
-    let clear_to: u16 = terminal_rows;
+    let clear_from = layout_start;
+    let clear_to: u16 = if compact_startup {
+        footer_row.saturating_add(1).min(terminal_rows)
+    } else {
+        terminal_rows
+    };
     for row in clear_from..clear_to {
         queue!(
             stdout,
@@ -1756,7 +2180,8 @@ fn render_chat_input(
     // blocks (from the front) so only the most recent ones render. The
     // dropped blocks remain in `block_line_counts` for the caller to use
     // when computing the next `input_start_row`.
-    let blocks_band_height: u16 = composer_start.min(safe_rows);
+    let blocks_start = layout_start.saturating_add(top_rows);
+    let blocks_band_height: u16 = composer_start.saturating_sub(blocks_start).min(safe_rows);
     let mut consumed: usize = 0;
     let mut blocks_to_render: Vec<&[String]> = Vec::new();
     for lines in block_lines.iter().rev() {
@@ -1767,11 +2192,11 @@ fn render_chat_input(
         blocks_to_render.push(lines.as_slice());
     }
     blocks_to_render.reverse();
-    let mut row_cursor: u16 = 0;
+    let mut row_cursor: u16 = blocks_start;
     for lines in blocks_to_render {
         for text in lines {
             let row = row_cursor;
-            if row >= blocks_band_height {
+            if row >= blocks_start.saturating_add(blocks_band_height) {
                 break;
             }
             queue!(
@@ -1786,8 +2211,15 @@ fn render_chat_input(
         }
     }
 
-    if header_visible && redraw_header {
+    if header_visible && (redraw_header || compact_startup) {
         render_codex_chat_header(&mut stdout, cols, layout_start, session)?;
+    }
+    if tip_rows > 0 {
+        render_codex_startup_tip(
+            &mut stdout,
+            cols,
+            layout_start.saturating_add(header_rows).saturating_add(1),
+        )?;
     }
 
     let scrollbar_col = cols.saturating_sub(2);
@@ -1833,17 +2265,12 @@ fn render_chat_input(
 fn finalize_submitted_input(
     prompt: &str,
     submitted: &str,
-    mut layout_start: u16,
+    layout_start: u16,
     header_visible: bool,
 ) -> Result<u16, String> {
     let mut stdout = io::stdout();
     let (cols, terminal_rows) = crossterm::terminal::size().map_err(|e| e.to_string())?;
     let width = cols.max(1) as usize;
-    let header_rows = if header_visible {
-        codex_chat_header_height()
-    } else {
-        0
-    };
     let composer_height =
         codex_composer_height_for_input(cols, prompt, submitted, submitted.chars().count());
     let visible_popup_rows = if submitted.starts_with('/') {
@@ -1859,12 +2286,14 @@ fn finalize_submitted_input(
         .saturating_add(CODEX_FOOTER_HEIGHT);
     let band_lines = user_band_lines(prompt, submitted, width);
     let redraw_rows = cleanup_rows.max(band_lines.len() as u16);
-    layout_start = reserve_terminal_rows(
-        layout_start,
-        header_rows.saturating_add(redraw_rows).max(1),
-    )?;
-    let composer_start = layout_start.saturating_add(header_rows);
-    let safe_rows = terminal_rows.saturating_sub(1);
+    let safe_rows = terminal_rows.saturating_sub(1).max(1);
+    let composer_start = if header_visible {
+        layout_start
+            .saturating_add(codex_chat_header_height())
+            .saturating_add(CODEX_STARTUP_TIP_ROWS)
+    } else {
+        safe_rows.saturating_sub(cleanup_rows)
+    };
     for offset in 0..redraw_rows {
         let row = composer_start.saturating_add(offset);
         if row >= safe_rows {
@@ -1888,7 +2317,9 @@ fn finalize_submitted_input(
         write!(stdout, "{CODEX_COMPOSER_BG}{fill}\x1b[0m").map_err(|e| e.to_string())?;
     }
     for (index, text) in band_lines.iter().enumerate() {
-        let row = composer_start.saturating_add(1).saturating_add(index as u16);
+        let row = composer_start
+            .saturating_add(1)
+            .saturating_add(index as u16);
         if row >= safe_rows {
             break;
         }
@@ -1896,19 +2327,19 @@ fn finalize_submitted_input(
         write_user_band_line(&mut stdout, text, width)?;
     }
     let next_row = composer_start.saturating_add(composer_height);
+    let _ = layout_start;
     move_to_append_row(&mut stdout, next_row.min(safe_rows))
 }
 
-fn clear_submitted_input_area(layout_start: u16, header_visible: bool) -> Result<u16, String> {
+fn clear_submitted_input_area(layout_start: u16, _header_visible: bool) -> Result<u16, String> {
     let mut stdout = io::stdout();
     let (_, terminal_rows) = crossterm::terminal::size().map_err(|e| e.to_string())?;
-    let header_rows = if header_visible {
-        codex_chat_header_height()
-    } else {
-        0
-    };
-    let start_row = layout_start.saturating_add(header_rows);
-    let safe_rows = terminal_rows.saturating_sub(1);
+    let safe_rows = terminal_rows.saturating_sub(1).max(1);
+    let start_row = safe_rows.saturating_sub(
+        CODEX_COMPOSER_MIN_ROWS
+            .saturating_add(CODEX_COMPOSER_FOOTER_GAP)
+            .saturating_add(CODEX_FOOTER_HEIGHT),
+    );
     for row in start_row..safe_rows {
         queue!(
             stdout,
@@ -1918,7 +2349,36 @@ fn clear_submitted_input_area(layout_start: u16, header_visible: bool) -> Result
         )
         .map_err(|e| e.to_string())?;
     }
+    let _ = layout_start;
     move_to_append_row(&mut stdout, start_row.min(safe_rows))
+}
+
+fn clear_chat_runtime_area(
+    layout_start: u16,
+    header_visible: bool,
+    blocks_are_empty: bool,
+) -> Result<u16, String> {
+    let mut stdout = io::stdout();
+    let (_, terminal_rows) = crossterm::terminal::size().map_err(|e| e.to_string())?;
+    let safe_rows = terminal_rows.saturating_sub(1).max(1);
+    let start_row = if header_visible && blocks_are_empty {
+        layout_start
+            .saturating_add(codex_chat_header_height())
+            .saturating_add(CODEX_STARTUP_TIP_ROWS)
+    } else {
+        layout_start
+    }
+    .min(safe_rows);
+    for row in start_row..safe_rows {
+        queue!(
+            stdout,
+            ResetColor,
+            cursor::MoveTo(0, row),
+            Clear(ClearType::CurrentLine)
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    move_to_append_row(&mut stdout, start_row)
 }
 
 fn user_band_lines(prompt: &str, content: &str, width: usize) -> Vec<String> {
@@ -1970,12 +2430,7 @@ fn reserve_terminal_rows(start_row: u16, required_rows: u16) -> Result<u16, Stri
         return Ok(start_row);
     }
 
-    queue!(
-        stdout,
-        ResetColor,
-        ScrollUp(overflow_rows)
-    )
-    .map_err(|e| e.to_string())?;
+    queue!(stdout, ResetColor, ScrollUp(overflow_rows)).map_err(|e| e.to_string())?;
     stdout.flush().map_err(|e| e.to_string())?;
     Ok(start_row.saturating_sub(overflow_rows))
 }
@@ -1991,12 +2446,7 @@ fn move_to_append_row(stdout: &mut io::Stdout, row: u16) -> Result<u16, String> 
         return Ok(row);
     }
     let scroll_rows = row.saturating_sub(safe_row).saturating_add(1);
-    queue!(
-        stdout,
-        ResetColor,
-        ScrollUp(scroll_rows)
-    )
-    .map_err(|e| e.to_string())?;
+    queue!(stdout, ResetColor, ScrollUp(scroll_rows)).map_err(|e| e.to_string())?;
     stdout.flush().map_err(|e| e.to_string())?;
     Ok(safe_row.saturating_sub(1))
 }
@@ -2053,8 +2503,13 @@ impl CliWorkingStatus {
             )
             .map_err(|e| e.to_string())?;
         }
-        queue!(stdout, ResetColor, cursor::Show, cursor::MoveTo(0, self.row))
-            .map_err(|e| e.to_string())?;
+        queue!(
+            stdout,
+            ResetColor,
+            cursor::Show,
+            cursor::MoveTo(0, self.row)
+        )
+        .map_err(|e| e.to_string())?;
         stdout.flush().map_err(|e| e.to_string())?;
         Ok(self.row)
     }
@@ -2269,9 +2724,23 @@ fn render_codex_chat_header(
     write_header_box_line(stdout, start_row, &format!("╭{horizontal}╮"))?;
     write_header_content_line(stdout, start_row.saturating_add(1), &title, inner_width)?;
     write_header_content_line(stdout, start_row.saturating_add(2), "", inner_width)?;
-    write_header_content_line(stdout, start_row.saturating_add(3), &model_line, inner_width)?;
-    write_header_content_line(stdout, start_row.saturating_add(4), &directory_line, inner_width)?;
-    write_header_box_line(stdout, start_row.saturating_add(5), &format!("╰{horizontal}╯"))
+    write_header_content_line(
+        stdout,
+        start_row.saturating_add(3),
+        &model_line,
+        inner_width,
+    )?;
+    write_header_content_line(
+        stdout,
+        start_row.saturating_add(4),
+        &directory_line,
+        inner_width,
+    )?;
+    write_header_box_line(
+        stdout,
+        start_row.saturating_add(5),
+        &format!("╰{horizontal}╯"),
+    )
 }
 
 fn write_header_box_line<W: Write>(stdout: &mut W, row: u16, text: &str) -> Result<(), String> {
@@ -2337,7 +2806,8 @@ fn codex_composer_height_for_input(
 ) -> u16 {
     let width = (cols as usize).max(1);
     let display = composer_display(prompt, line, cursor_index, width);
-    (display.lines.len() as u16).saturating_add(2)
+    (display.lines.len() as u16)
+        .saturating_add(2)
         .max(CODEX_COMPOSER_MIN_ROWS)
         .min(codex_composer_height())
 }
@@ -2392,8 +2862,8 @@ fn codex_inline_start_row(header_visible: bool) -> u16 {
 
 fn codex_inline_start_row_for_popup(header_visible: bool, popup_rows: usize) -> u16 {
     let (_, terminal_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let reserved_rows =
-        codex_inline_reserved_height_for_popup(header_visible, popup_rows).min(terminal_rows.max(1));
+    let reserved_rows = codex_inline_reserved_height_for_popup(header_visible, popup_rows)
+        .min(terminal_rows.max(1));
     terminal_rows.saturating_sub(reserved_rows)
 }
 
@@ -2456,7 +2926,12 @@ struct ComposerDisplay {
     cursor_col: usize,
 }
 
-fn composer_display(prompt: &str, line: &str, cursor_index: usize, width: usize) -> ComposerDisplay {
+fn composer_display(
+    prompt: &str,
+    line: &str,
+    cursor_index: usize,
+    width: usize,
+) -> ComposerDisplay {
     let width = width.max(1);
     let prompt_text = truncate_display_width(prompt, width);
     let prompt_width = terminal_display_width(&prompt_text).min(width);
@@ -2667,6 +3142,7 @@ async fn run_task(
     task: &str,
     messages: Option<Vec<AgentConversationMessage>>,
     show_working_status: bool,
+    emit_terminal_output: bool,
 ) -> Result<MockAgentRun, String> {
     let project = select_project(state, cli.project.as_deref())?;
     let settings_guard = state
@@ -2685,6 +3161,8 @@ async fn run_task(
         allow_shell: session.shell_allowed,
         assume_yes: cli.yes,
         cli_mode: true,
+        goal: session.goal.clone(),
+        goal_slot: None,
     };
 
     let mut working_status = if show_working_status && !cli.json {
@@ -2695,7 +3173,7 @@ async fn run_task(
     let mut terminal_events = Vec::new();
     let run_result = agent_runner::run_agent(&project, &settings, input, |event| {
         terminal_events.push(event.clone());
-        if !cli.json {
+        if emit_terminal_output && !cli.json {
             print_trace_event(event, cli.verbose);
         }
     })
@@ -2706,23 +3184,25 @@ async fn run_task(
     let run = run_result?;
     save_trace(&project.repo_root, &run)?;
 
-    if cli.json {
+    if emit_terminal_output && cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&cli_json_run_payload(session, &run, &terminal_events)?)
                 .map_err(|e| e.to_string())?
         );
-    } else if let Some(parts) = final_response(&run) {
-        print_cli_visible_response(session, &parts, !show_working_status);
-    } else if let Some(last) = terminal_events
-        .last()
-        .and_then(|event| event.output_summary.clone())
-    {
-        let parts = FinalResponseParts {
-            reasoning: None,
-            content: last,
-        };
-        print_cli_visible_response(session, &parts, !show_working_status);
+    } else if emit_terminal_output {
+        if let Some(parts) = final_response(&run) {
+            print_cli_visible_response(session, &parts, !show_working_status);
+        } else if let Some(last) = terminal_events
+            .last()
+            .and_then(|event| event.output_summary.clone())
+        {
+            let parts = FinalResponseParts {
+                reasoning: None,
+                content: last,
+            };
+            print_cli_visible_response(session, &parts, !show_working_status);
+        }
     }
     Ok(run)
 }
@@ -2740,11 +3220,21 @@ fn cli_json_run_payload(
     let hide_thinking = cli_should_hide_thinking(session);
     let visible_response = parts_response
         .as_ref()
-        .map(|parts| if hide_thinking { strip_think_blocks(&parts.content) } else { parts.content.clone() })
+        .map(|parts| {
+            if hide_thinking {
+                strip_think_blocks(&parts.content)
+            } else {
+                parts.content.clone()
+            }
+        })
         .or_else(|| {
-            fallback_summary
-                .as_ref()
-                .map(|text| if hide_thinking { strip_think_blocks(text) } else { text.clone() })
+            fallback_summary.as_ref().map(|text| {
+                if hide_thinking {
+                    strip_think_blocks(text)
+                } else {
+                    text.clone()
+                }
+            })
         });
     let visible_reasoning = parts_response
         .as_ref()
@@ -2791,9 +3281,7 @@ fn print_cli_visible_response(
     };
 
     if trimmed_content.is_empty() && reasoning_text.is_none() {
-        if hide_thinking
-            && find_ascii_case_insensitive(&parts.content, "<think>").is_some()
-        {
+        if hide_thinking && find_ascii_case_insensitive(&parts.content, "<think>").is_some() {
             if leading_blank {
                 println!();
             }
@@ -2816,10 +3304,6 @@ fn print_cli_visible_response(
     // No trailing println!() — keep the cursor on the agent reply's last
     // line so the next composer renders with 0 blank lines of gap.
 }
-
-
-
-
 
 fn cli_effective_reasoning_effort(session: &CliSession) -> Option<String> {
     match session.reasoning_effort.as_deref() {
@@ -2990,9 +3474,7 @@ async fn handle_chat_command(
             print_slash_commands();
             Ok(ChatCommandResult::Handled)
         }
-        "/exit" | "/quit" => {
-            Ok(ChatCommandResult::Exit)
-        }
+        "/exit" | "/quit" => Ok(ChatCommandResult::Exit),
         "/new" => Ok(ChatCommandResult::NewSession),
         "/model" | "/models" => {
             choose_cli_model(state, stdin, session)?;
@@ -3316,7 +3798,8 @@ fn choose_cli_model(
             "Access legacy models by running codeforge -m <model_name> or in your config.toml",
             &items,
             current_index,
-        )? else {
+        )?
+        else {
             return Ok(());
         };
         let choice = &choices[index];
@@ -3496,8 +3979,13 @@ fn choose_cli_reasoning(stdin: &io::Stdin, session: &mut CliSession) -> Result<(
             .iter()
             .position(|(value, _)| *value == current)
             .unwrap_or(0);
-        let Some(index) =
-            run_cli_picker(session, "Select Reasoning Effort", "", &items, current_index)?
+        let Some(index) = run_cli_picker(
+            session,
+            "Select Reasoning Effort",
+            "",
+            &items,
+            current_index,
+        )?
         else {
             return Ok(());
         };
@@ -3571,8 +4059,7 @@ fn run_cli_picker(
                 ..
             }) if matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat) => match code {
                 KeyCode::Up | KeyCode::Char('p') | KeyCode::Char('P')
-                    if matches!(code, KeyCode::Up)
-                        || modifiers.contains(KeyModifiers::CONTROL) =>
+                    if matches!(code, KeyCode::Up) || modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     selected_index = if selected_index == 0 {
                         items.len().saturating_sub(1)
@@ -3863,7 +4350,9 @@ fn cli_model_description(choice: &CliModelChoice) -> String {
         _ => choice.provider_name.clone(),
     };
     match choice.model_id.as_str() {
-        "gpt-5.5" => "Frontier model for complex coding, research, and real-world work.".to_string(),
+        "gpt-5.5" => {
+            "Frontier model for complex coding, research, and real-world work.".to_string()
+        }
         "gpt-5.4" => "Strong model for everyday coding.".to_string(),
         "gpt-5.4-mini" => {
             "Small, fast, and cost-efficient model for simpler coding tasks.".to_string()
@@ -3951,10 +4440,7 @@ fn cli_format_limit_row(
     (label.to_string(), value)
 }
 
-fn resolve_gateway_endpoint(
-    state: &AppState,
-    session: &CliSession,
-) -> Option<(String, String)> {
+fn resolve_gateway_endpoint(state: &AppState, session: &CliSession) -> Option<(String, String)> {
     let provider_id = session.provider_id.as_deref()?;
     if provider_id == "codex-cli" {
         return None;
@@ -3990,10 +4476,7 @@ fn resolve_gateway_endpoint(
     Some((base_url.to_string(), api_key))
 }
 
-async fn fetch_coding_plan_limits(
-    state: &AppState,
-    session: &CliSession,
-) -> CodingPlanLimits {
+async fn fetch_coding_plan_limits(state: &AppState, session: &CliSession) -> CodingPlanLimits {
     let Some((base_url, api_key)) = resolve_gateway_endpoint(state, session) else {
         return CodingPlanLimits::default();
     };
@@ -4154,7 +4637,9 @@ async fn fetch_coding_plan_limits(
 }
 
 fn coding_plan_reset_seconds(value: &Value) -> Option<i64> {
-    let raw = value.as_i64().or_else(|| value.as_f64().map(|n| n as i64))?;
+    let raw = value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|n| n as i64))?;
     // Upstream returns milliseconds; convert to seconds when the value
     // is clearly too large to be a direct seconds count.
     if raw > 24 * 3600 {
@@ -4178,7 +4663,11 @@ fn coding_plan_weekly_reset_seconds(model: &Value) -> Option<i64> {
         })?;
     // Upstream returns millisecond timestamps; a Unix-second timestamp
     // today is ~1.7e9, so anything above 1e11 is almost certainly ms.
-    let seconds = if raw > 100_000_000_000 { raw / 1000 } else { raw };
+    let seconds = if raw > 100_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    };
     let now = Utc::now().timestamp();
     Some((seconds - now).max(0))
 }
@@ -4189,8 +4678,8 @@ fn print_cli_session(
     limits: Option<&CodingPlanLimits>,
     reserve_followup_input: bool,
 ) {
-    let reasoning = cli_effective_reasoning_effort(session)
-        .unwrap_or_else(|| "default".to_string());
+    let reasoning =
+        cli_effective_reasoning_effort(session).unwrap_or_else(|| "default".to_string());
     let shell_label = if session.shell_allowed {
         "allowed (policy permits shell commands)".to_string()
     } else {
@@ -4240,10 +4729,7 @@ fn print_cli_session(
         "[░░░░░░░░░░░░░░░░░░░░] not tracked (local CLI)",
     );
     let usage: Vec<(&'static str, String)> = vec![
-        (
-            "Context window",
-            "100% left (0 used / unknown)".to_string(),
-        ),
+        ("Context window", "100% left (0 used / unknown)".to_string()),
         ("5h limit", interval_value),
         ("Weekly limit", weekly_value),
     ];
@@ -4252,11 +4738,7 @@ fn print_cli_session(
     let label_width = selection
         .iter()
         .map(|(label, _)| terminal_display_width(label))
-        .chain(
-            usage
-                .iter()
-                .map(|(label, _)| terminal_display_width(label)),
-        )
+        .chain(usage.iter().map(|(label, _)| terminal_display_width(label)))
         .max()
         .unwrap_or(0);
 
@@ -4378,13 +4860,22 @@ fn cli_coding_plan_limits_json(limits: Option<&CodingPlanLimits>) -> Value {
             }
         }
     };
-    rate_limits.insert("5h".to_string(), build_entry(limits.interval_percent_remaining, limits.interval_reset_seconds));
+    rate_limits.insert(
+        "5h".to_string(),
+        build_entry(
+            limits.interval_percent_remaining,
+            limits.interval_reset_seconds,
+        ),
+    );
     rate_limits.insert(
         "weekly".to_string(),
         build_entry(limits.weekly_percent_remaining, limits.weekly_reset_seconds),
     );
     if let Some(provider) = limits.source_provider.as_deref() {
-        rate_limits.insert("source_provider".to_string(), Value::String(provider.to_string()));
+        rate_limits.insert(
+            "source_provider".to_string(),
+            Value::String(provider.to_string()),
+        );
     }
     if let Some(model) = limits.source_model.as_deref() {
         rate_limits.insert("source_model".to_string(), Value::String(model.to_string()));
@@ -4400,7 +4891,8 @@ fn print_cli_session_json(
     project: Option<&ProjectSession>,
     limits: Option<&CodingPlanLimits>,
 ) -> Result<(), String> {
-    let reasoning = cli_effective_reasoning_effort(session).unwrap_or_else(|| "default".to_string());
+    let reasoning =
+        cli_effective_reasoning_effort(session).unwrap_or_else(|| "default".to_string());
     let credential = session.credential_id.as_deref().map(|credential| {
         json!({
             "id": mask_cli_status_value(credential),
@@ -4743,15 +5235,15 @@ fn select_project(state: &AppState, requested: Option<&str>) -> Result<ProjectSe
     if let Some(value) = requested.filter(|value| !value.trim().is_empty()) {
         let normalized = PathBuf::from(value).canonicalize().ok();
         if let Some(project) = projects.into_iter().find(|project| {
-                project.id == value
-                    || project.name == value
-                    || normalized
-                        .as_ref()
-                        .map(|path| {
-                            Path::new(&project.repo_root).canonicalize().ok().as_ref() == Some(path)
-                        })
-                        .unwrap_or(false)
-            }) {
+            project.id == value
+                || project.name == value
+                || normalized
+                    .as_ref()
+                    .map(|path| {
+                        Path::new(&project.repo_root).canonicalize().ok().as_ref() == Some(path)
+                    })
+                    .unwrap_or(false)
+        }) {
             return Ok(project);
         }
         if let Some(path) = normalized.as_deref() {
@@ -4824,10 +5316,13 @@ fn final_response(run: &MockAgentRun) -> Option<FinalResponseParts> {
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty());
         if content.is_empty() && reasoning.is_none() {
-            return event.output_summary.clone().map(|summary| FinalResponseParts {
-                reasoning: None,
-                content: summary,
-            });
+            return event
+                .output_summary
+                .clone()
+                .map(|summary| FinalResponseParts {
+                    reasoning: None,
+                    content: summary,
+                });
         }
         Some(FinalResponseParts { reasoning, content })
     })

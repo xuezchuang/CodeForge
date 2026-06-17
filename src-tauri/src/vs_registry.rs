@@ -132,8 +132,9 @@ impl SettingsStore {
             (read_app_settings(&path)?, false)
         } else if let Some(legacy_path) = legacy_path.filter(|path| path.exists()) {
             (read_app_settings(&legacy_path)?, true)
-        } else if let Some(imported) =
-            codebuddy_models_path.as_deref().and_then(import_codebuddy_models)
+        } else if let Some(imported) = codebuddy_models_path
+            .as_deref()
+            .and_then(import_codebuddy_models)
         {
             let mut settings = AppSettings::default();
             settings.providers = imported;

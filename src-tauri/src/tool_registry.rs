@@ -1,19 +1,28 @@
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::goal_state::GoalState;
+use crate::tool_interface::ToolOutput;
 use crate::vs_bridge_client;
 use crate::workspace_tools;
 
 pub const CALCULATOR_ADD_TOOL_NAME: &str = "calculator.add";
 pub const LIST_DIR_TOOL_NAME: &str = "list_dir";
+pub const WORKSPACE_LIST_DIR_TOOL_NAME: &str = "workspace/list_dir";
 pub const READ_FILE_TOOL_NAME: &str = "read_file";
+pub const WORKSPACE_READ_FILE_TOOL_NAME: &str = "workspace/read_file";
 pub const SEARCH_FILE_TOOL_NAME: &str = "search_file";
+pub const WORKSPACE_SEARCH_FILE_TOOL_NAME: &str = "workspace/search_file";
 pub const SEARCH_CONTENT_TOOL_NAME: &str = "search_content";
+pub const WORKSPACE_SEARCH_CONTENT_TOOL_NAME: &str = "workspace/search";
+pub const WORKSPACE_SEARCH_CONTENT_ALIAS_TOOL_NAME: &str = "workspace/search_content";
 pub const EDIT_FILE_TOOL_NAME: &str = "edit_file";
+pub const WORKSPACE_EDIT_FILE_TOOL_NAME: &str = "workspace/edit_file";
 pub const WRITE_FILE_TOOL_NAME: &str = "write_file";
+pub const WORKSPACE_WRITE_FILE_TOOL_NAME: &str = "workspace/write_file";
 pub const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
+pub const WORKSPACE_SHELL_COMMAND_TOOL_NAME: &str = "workspace/shell_command";
 pub const APPLY_PATCH_RAW_TOOL_NAME: &str = "apply_patch_raw";
 pub const GET_FILE_CONTEXT_TOOL_NAME: &str = "get_file_context";
 pub const VS_CURRENT_SOLUTION_TOOL_NAME: &str = "vs.current_solution";
@@ -22,6 +31,9 @@ pub const VS_CURRENT_SELECTION_TOOL_NAME: &str = "vs.current_selection";
 pub const VS_LIST_PROJECTS_TOOL_NAME: &str = "vs.list_projects";
 pub const VS_LIST_PROJECT_FILES_TOOL_NAME: &str = "vs.list_project_files";
 pub const VS_GET_ERROR_LIST_TOOL_NAME: &str = "vs.get_error_list";
+pub const GOAL_GET_TOOL_NAME: &str = "goal/get";
+pub const GOAL_SET_TOOL_NAME: &str = "goal/set";
+pub const GOAL_CLEAR_TOOL_NAME: &str = "goal/clear";
 
 pub struct ToolExecutionContext<'a> {
     pub workspace_root: &'a str,
@@ -29,38 +41,34 @@ pub struct ToolExecutionContext<'a> {
     pub allow_shell: bool,
     pub assume_yes: bool,
     pub cli_mode: bool,
+    pub goal: Option<&'a mut Option<GoalState>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolResultStatus {
-    Ok,
-    Error,
-    Timeout,
-    Rejected,
+/// Return the workspace/ namespaced tool definitions that should be exposed
+/// alongside the short names. These are the same handlers, just under the
+/// namespaced names that the plan recommends (e.g. `workspace/read_file`).
+fn workspace_namespace_aliases() -> Vec<Value> {
+    vec![
+        workspace_alias(WORKSPACE_READ_FILE_TOOL_NAME, &read_file_definition()),
+        workspace_alias(
+            WORKSPACE_SEARCH_CONTENT_TOOL_NAME,
+            &search_content_definition(),
+        ),
+        workspace_alias(WORKSPACE_EDIT_FILE_TOOL_NAME, &edit_file_definition()),
+        workspace_alias(WORKSPACE_WRITE_FILE_TOOL_NAME, &write_file_definition()),
+    ]
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolResult {
-    pub status: ToolResultStatus,
-    pub output: Option<Value>,
-    pub error: Option<String>,
-    pub elapsed_ms: u64,
-}
-
-impl ToolResult {
-    pub fn to_model_value(&self) -> Value {
-        json!({
-            "status": self.status,
-            "ok": self.status == ToolResultStatus::Ok,
-            "output": self.output,
-            "error": self.error,
-            "elapsedMs": self.elapsed_ms,
-        })
+/// Clone a tool definition and rename its function name to the given namespace
+/// alias. The parameters and description are preserved so the model sees the
+/// same schema.
+fn workspace_alias(name: &str, definition: &Value) -> Value {
+    let mut cloned = definition.clone();
+    if let Some(function) = cloned.get_mut("function").and_then(|v| v.as_object_mut()) {
+        function.insert("name".to_string(), Value::String(name.to_string()));
     }
+    cloned
 }
-
 pub fn tool_definitions() -> Vec<Value> {
     let mut tools = base_tool_definitions();
     tools.extend([
@@ -73,7 +81,11 @@ pub fn tool_definitions() -> Vec<Value> {
         vs_list_projects_definition(),
         vs_list_project_files_definition(),
         vs_get_error_list_definition(),
+        goal_get_definition(),
+        goal_set_definition(),
+        goal_clear_definition(),
     ]);
+    tools.extend(workspace_namespace_aliases());
     tools
 }
 
@@ -113,46 +125,38 @@ pub fn exposes_apply_patch_raw(provider_type: &str, model_id: &str) -> bool {
 }
 
 pub async fn execute_tool(
-    context: &ToolExecutionContext<'_>,
+    context: &mut ToolExecutionContext<'_>,
     name: &str,
     arguments: &Value,
 ) -> Result<Value, String> {
     let result = execute_tool_result(context, name, arguments).await;
-    match result.status {
-        ToolResultStatus::Ok => Ok(result.output.unwrap_or(Value::Null)),
-        ToolResultStatus::Error | ToolResultStatus::Rejected | ToolResultStatus::Timeout => {
-            Err(result
-                .error
-                .unwrap_or_else(|| format!("tool failed: {name}")))
-        }
+    if result.is_ok() {
+        Ok(result.output.unwrap_or(Value::Null))
+    } else {
+        Err(result
+            .error
+            .unwrap_or_else(|| format!("tool failed: {name}")))
     }
 }
 
 pub async fn execute_tool_result(
-    context: &ToolExecutionContext<'_>,
+    context: &mut ToolExecutionContext<'_>,
     name: &str,
     arguments: &Value,
-) -> ToolResult {
+) -> ToolOutput {
     let started = Instant::now();
     match execute_tool_inner(context, name, arguments).await {
-        Ok(output) => ToolResult {
-            status: ToolResultStatus::Ok,
-            output: Some(output),
-            error: None,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        },
-        Err(error) => ToolResult {
-            status: if error.starts_with("rejected:") {
-                ToolResultStatus::Rejected
+        Ok(output) => ToolOutput::ok(output, started.elapsed().as_millis() as u64),
+        Err(error) => {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            if error.starts_with("rejected:") {
+                ToolOutput::rejected(error)
             } else if error.starts_with("timeout:") {
-                ToolResultStatus::Timeout
+                ToolOutput::timeout(elapsed_ms)
             } else {
-                ToolResultStatus::Error
-            },
-            output: None,
-            error: Some(error),
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        },
+                ToolOutput::error(error, elapsed_ms)
+            }
+        }
     }
 }
 
@@ -168,19 +172,19 @@ fn tool_timeout(name: &str) -> Duration {
 }
 
 async fn execute_tool_inner(
-    context: &ToolExecutionContext<'_>,
+    context: &mut ToolExecutionContext<'_>,
     name: &str,
     arguments: &Value,
 ) -> Result<Value, String> {
     match name {
         CALCULATOR_ADD_TOOL_NAME => add(arguments),
-        LIST_DIR_TOOL_NAME => workspace_tools::list_dir(context.workspace_root, arguments),
-        READ_FILE_TOOL_NAME => workspace_tools::read_file(context.workspace_root, arguments),
-        SEARCH_FILE_TOOL_NAME => workspace_tools::search_file(context.workspace_root, arguments),
-        SEARCH_CONTENT_TOOL_NAME => workspace_tools::search_content(context.workspace_root, arguments),
-        EDIT_FILE_TOOL_NAME => workspace_tools::edit_file(context.workspace_root, arguments),
-        WRITE_FILE_TOOL_NAME => workspace_tools::write_file(context.workspace_root, arguments),
-        SHELL_COMMAND_TOOL_NAME => workspace_tools::shell_command(
+        LIST_DIR_TOOL_NAME | WORKSPACE_LIST_DIR_TOOL_NAME => workspace_tools::list_dir(context.workspace_root, arguments),
+        READ_FILE_TOOL_NAME | WORKSPACE_READ_FILE_TOOL_NAME => workspace_tools::read_file(context.workspace_root, arguments),
+        SEARCH_FILE_TOOL_NAME | WORKSPACE_SEARCH_FILE_TOOL_NAME => workspace_tools::search_file(context.workspace_root, arguments),
+        SEARCH_CONTENT_TOOL_NAME | WORKSPACE_SEARCH_CONTENT_TOOL_NAME | WORKSPACE_SEARCH_CONTENT_ALIAS_TOOL_NAME => workspace_tools::search_content(context.workspace_root, arguments),
+        EDIT_FILE_TOOL_NAME | WORKSPACE_EDIT_FILE_TOOL_NAME => workspace_tools::edit_file(context.workspace_root, arguments),
+        WRITE_FILE_TOOL_NAME | WORKSPACE_WRITE_FILE_TOOL_NAME => workspace_tools::write_file(context.workspace_root, arguments),
+        SHELL_COMMAND_TOOL_NAME | WORKSPACE_SHELL_COMMAND_TOOL_NAME => workspace_tools::shell_command(
             context.workspace_root,
             arguments,
             context.allow_shell,
@@ -193,10 +197,17 @@ async fn execute_tool_inner(
         VS_LIST_PROJECTS_TOOL_NAME => vs_bridge_client::call_vs_list_projects(context.vs_bridge_endpoint).await,
         VS_LIST_PROJECT_FILES_TOOL_NAME => vs_bridge_client::call_vs_list_project_files(context.vs_bridge_endpoint, arguments).await,
         VS_GET_ERROR_LIST_TOOL_NAME => vs_bridge_client::call_vs_get_error_list(context.vs_bridge_endpoint).await,
+        GOAL_GET_TOOL_NAME => goal_get(context),
+        GOAL_SET_TOOL_NAME => goal_set(context, arguments),
+        GOAL_CLEAR_TOOL_NAME => goal_clear(context),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
 
+/// calculator.add is a deliberately trivial demo tool kept to
+/// exercise the full tool-calling loop end-to-end. It is NOT a production
+/// tool; production code should use the workspace/ and goal/ tools.
+/// The handler returns a plain numeric result with no side effects.
 fn calculator_add_definition() -> Value {
     json!({
         "type": "function",
@@ -568,24 +579,141 @@ fn number_value(number: f64) -> Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Goal tools
+// ---------------------------------------------------------------------------
+
+fn goal_get_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": GOAL_GET_TOOL_NAME,
+            "description": "Get the current goal state. Returns the objective, status, token budget, tokens used, and elapsed time. Returns no_active_goal when no goal is set.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn goal_set_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": GOAL_SET_TOOL_NAME,
+            "description": "Set or replace the current goal with a new objective. Optionally set a token budget. Writes back to the active session's goal state.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "description": "The goal objective text."
+                    },
+                    "tokenBudget": {
+                        "type": "integer",
+                        "description": "Optional token budget for the goal.",
+                        "minimum": 1
+                    }
+                },
+                "required": ["objective"]
+            }
+        }
+    })
+}
+
+fn goal_clear_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": GOAL_CLEAR_TOOL_NAME,
+            "description": "Clear the current goal. Returns the previous goal if one was active.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn goal_get(context: &ToolExecutionContext<'_>) -> Result<Value, String> {
+    let current = context.goal.as_ref().and_then(|opt| opt.as_ref());
+    match current {
+        Some(goal) => Ok(json!({
+            "active": true,
+            "objective": goal.objective,
+            "status": goal.status.label(),
+            "tokenBudget": goal.token_budget,
+            "tokensUsed": goal.tokens_used,
+            "timeUsedSeconds": goal.time_used_seconds,
+        })),
+        None => Ok(json!({
+            "active": false,
+            "message": "No active goal.",
+        })),
+    }
+}
+
+fn goal_set(context: &mut ToolExecutionContext<'_>, arguments: &Value) -> Result<Value, String> {
+    let objective = arguments
+        .get("objective")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "goal/set requires an 'objective' string field".to_string())?;
+    let token_budget = arguments.get("tokenBudget").and_then(Value::as_i64);
+    let mut goal = GoalState::new(objective.to_string());
+    goal.token_budget = token_budget;
+    // Write back through the mutable reference if the caller provided one.
+    // This lets the tool call propagate to the owning session instead of
+    // leaving a stale snapshot in the session's goal field.
+    let response = json!({
+        "set": true,
+        "objective": goal.objective,
+        "status": goal.status.label(),
+        "tokenBudget": goal.token_budget,
+        "tokensUsed": goal.tokens_used,
+        "timeUsedSeconds": goal.time_used_seconds,
+    });
+    if let Some(slot) = context.goal.as_deref_mut() {
+        *slot = Some(goal);
+    }
+    Ok(response)
+}
+
+fn goal_clear(context: &ToolExecutionContext<'_>) -> Result<Value, String> {
+    let current = context.goal.as_ref().and_then(|opt| opt.as_ref());
+    match current {
+        Some(goal) => Ok(json!({
+            "cleared": true,
+            "previousObjective": goal.objective,
+            "previousStatus": goal.status.label(),
+        })),
+        None => Ok(json!({
+            "cleared": false,
+            "message": "No active goal to clear.",
+        })),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_interface::ToolOutputStatus;
 
     fn test_context() -> ToolExecutionContext<'static> {
-        ToolExecutionContext {
+        let mut ctx = ToolExecutionContext {
             workspace_root: ".",
             vs_bridge_endpoint: None,
             allow_shell: false,
             assume_yes: false,
             cli_mode: false,
-        }
+            goal: None,
+        };
+        ctx
     }
 
     #[test]
     fn calculator_add_returns_sum() {
         let result = tauri::async_runtime::block_on(execute_tool(
-            &test_context(),
+            &mut test_context(),
             CALCULATOR_ADD_TOOL_NAME,
             &json!({ "a": 1, "b": 1 }),
         ))
@@ -597,7 +725,7 @@ mod tests {
     #[test]
     fn calculator_add_requires_numbers() {
         let error = tauri::async_runtime::block_on(execute_tool(
-            &test_context(),
+            &mut test_context(),
             CALCULATOR_ADD_TOOL_NAME,
             &json!({ "a": "1", "b": 1 }),
         ))
@@ -609,7 +737,7 @@ mod tests {
     #[test]
     fn unknown_tool_returns_error() {
         let error = tauri::async_runtime::block_on(execute_tool(
-            &test_context(),
+            &mut test_context(),
             "missing.tool",
             &json!({}),
         ))
@@ -646,7 +774,7 @@ mod tests {
     #[test]
     fn vs_tool_returns_bridge_not_connected_when_endpoint_missing() {
         let result = tauri::async_runtime::block_on(execute_tool(
-            &test_context(),
+            &mut test_context(),
             VS_CURRENT_DOCUMENT_TOOL_NAME,
             &json!({}),
         ))
@@ -661,6 +789,7 @@ mod tests {
 #[cfg(test)]
 mod cli_runtime_tests {
     use super::*;
+    use crate::tool_interface::ToolOutputStatus;
     use std::fs;
 
     fn workspace() -> std::path::PathBuf {
@@ -671,24 +800,26 @@ mod cli_runtime_tests {
     }
 
     fn context(root: &str, allow_shell: bool) -> ToolExecutionContext<'_> {
-        ToolExecutionContext {
+        let mut ctx = ToolExecutionContext {
             workspace_root: root,
             vs_bridge_endpoint: None,
             allow_shell,
             assume_yes: true,
             cli_mode: true,
-        }
+            goal: None,
+        };
+        ctx
     }
 
     #[test]
     fn unknown_tool_returns_error_result() {
         let root = workspace();
         let result = tauri::async_runtime::block_on(execute_tool_result(
-            &context(root.to_str().unwrap(), false),
+            &mut context(root.to_str().unwrap(), false),
             "missing.tool",
             &json!({}),
         ));
-        assert_eq!(result.status, ToolResultStatus::Error);
+        assert_eq!(result.status, ToolOutputStatus::Error);
         assert!(result.error.unwrap().contains("Unknown tool"));
     }
 
@@ -708,11 +839,11 @@ mod cli_runtime_tests {
         let root = workspace();
         fs::write(root.join("sample.txt"), "alpha\nbeta\n").unwrap();
         let result = tauri::async_runtime::block_on(execute_tool_result(
-            &context(root.to_str().unwrap(), false),
+            &mut context(root.to_str().unwrap(), false),
             EDIT_FILE_TOOL_NAME,
             &json!({ "file": "sample.txt", "search": "beta", "replace": "gamma" }),
         ));
-        assert_eq!(result.status, ToolResultStatus::Ok);
+        assert_eq!(result.status, ToolOutputStatus::Ok);
         assert_eq!(
             fs::read_to_string(root.join("sample.txt")).unwrap(),
             "alpha\ngamma\n"
@@ -728,10 +859,10 @@ mod cli_runtime_tests {
             "sleep 2"
         };
         let result = tauri::async_runtime::block_on(execute_tool_result(
-            &context(root.to_str().unwrap(), true),
+            &mut context(root.to_str().unwrap(), true),
             SHELL_COMMAND_TOOL_NAME,
             &json!({ "command": command, "timeout_ms": 1 }),
         ));
-        assert_eq!(result.status, ToolResultStatus::Timeout);
+        assert_eq!(result.status, ToolOutputStatus::Timeout);
     }
 }

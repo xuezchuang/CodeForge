@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::codex_cli_runner::{self, CODEX_CLI_PROVIDER_TYPE, CODEX_CLI_TOOL_NAME};
+use crate::goal_state::GoalState;
 use crate::project_registry::ProjectSession;
 use crate::tool_registry::{self, ToolExecutionContext, CALCULATOR_ADD_TOOL_NAME};
 use crate::tool_trace::{self, MockAgentRun, ToolTraceEvent, TraceEventType, TraceStatus};
@@ -34,6 +35,14 @@ pub struct AgentRunInput {
     pub assume_yes: bool,
     #[serde(default)]
     pub cli_mode: bool,
+    #[serde(default)]
+    pub goal: Option<GoalState>,
+    /// Optional mutable slot for tools to write goal changes back to. When set,
+    /// the tool execution context receives a &mut Option<GoalState> and any
+    /// goal/set calls from tools mutate this slot directly. Callers that do
+    /// not need write-back can leave this as None and pass goal instead.
+    #[serde(default, skip)]
+    pub goal_slot: Option<Box<Option<GoalState>>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -200,7 +209,7 @@ struct ClaudeUsage {
 pub async fn run_agent(
     project: &ProjectSession,
     settings: &AppSettings,
-    input: AgentRunInput,
+    mut input: AgentRunInput,
     mut on_trace: impl FnMut(&ToolTraceEvent),
 ) -> Result<MockAgentRun, String> {
     let task_id = Uuid::new_v4().to_string();
@@ -306,18 +315,20 @@ pub async fn run_agent(
     }
 
     if supports_openai_tool_calls(&selected) {
-        let initial_messages = build_openai_messages(project, &conversation_messages, input.cli_mode);
-        let tool_context = ToolExecutionContext {
+        let initial_messages =
+            build_openai_messages(project, &conversation_messages, input.cli_mode);
+        let mut tool_context = ToolExecutionContext {
             workspace_root: &project.repo_root,
             vs_bridge_endpoint: project.vs_bridge_endpoint.as_deref(),
             allow_shell: input.allow_shell,
             assume_yes: input.assume_yes,
             cli_mode: input.cli_mode,
+            goal: input.goal_slot.as_deref_mut(),
         };
         run_openai_tool_agent_loop(
             &task_id,
             &selected,
-            &tool_context,
+            &mut tool_context,
             initial_messages,
             &mut traces,
             &mut step_index,
@@ -343,6 +354,16 @@ pub async fn run_agent(
     Ok(MockAgentRun { task_id, traces })
 }
 
+/// End-to-end tool-calling test harness.
+///
+/// This is a demo/test entry point that exercises the OpenAI tool-calling
+/// loop with a hard-coded prompt that asks the model to call
+/// calculator.add. It is intentionally kept as the primary way to verify
+/// the tool-calling pipeline end-to-end (the goal tools are the new
+/// production path, but they don't exercise the full tool-call → result →
+/// follow-up message loop the same way). Do not call this from production
+/// CLI code paths; it exists for the Tauri run_tool_call_test command and
+/// for integration tests.
 pub async fn run_tool_call_test(
     project: &ProjectSession,
     settings: &AppSettings,
@@ -424,17 +445,18 @@ pub async fn run_tool_call_test(
     }
 
     let initial_messages = build_tool_call_test_messages(project);
-    let tool_context = ToolExecutionContext {
+    let mut tool_context = ToolExecutionContext {
         workspace_root: &project.repo_root,
         vs_bridge_endpoint: project.vs_bridge_endpoint.as_deref(),
         allow_shell: false,
         assume_yes: false,
         cli_mode: false,
+        goal: None,
     };
     run_openai_tool_agent_loop(
         &task_id,
         &selected,
-        &tool_context,
+        &mut tool_context,
         initial_messages,
         &mut traces,
         &mut step_index,
@@ -450,7 +472,7 @@ pub async fn run_tool_call_test(
 async fn run_openai_tool_agent_loop(
     task_id: &str,
     selected: &SelectedModel,
-    tool_context: &ToolExecutionContext<'_>,
+    tool_context: &mut ToolExecutionContext<'_>,
     mut messages: Vec<Value>,
     traces: &mut Vec<ToolTraceEvent>,
     step_index: &mut u32,
@@ -741,12 +763,12 @@ async fn run_openai_tool_agent_loop(
             )
             .await;
             let tool_result = result.to_model_value();
-            let trace_status = if result.status == tool_registry::ToolResultStatus::Ok {
+            let trace_status = if result.is_ok() {
                 TraceStatus::Success
             } else {
                 TraceStatus::Failed
             };
-            let event_type = if result.status == tool_registry::ToolResultStatus::Ok {
+            let event_type = if result.is_ok() {
                 TraceEventType::ToolResult
             } else {
                 TraceEventType::Error
@@ -1413,11 +1435,8 @@ fn build_chat_completion_request(
         "stream": uses_streaming,
     });
 
-    let is_toggle_mode = selected
-        .model
-        .as_ref()
-        .map(resolved_model_reasoning_mode)
-        == Some("toggle");
+    let is_toggle_mode =
+        selected.model.as_ref().map(resolved_model_reasoning_mode) == Some("toggle");
 
     if is_toggle_mode {
         // MiniMax-M3 via /v1/chat/completions:
@@ -1546,16 +1565,20 @@ fn extract_token_usage_from_response(body: &Value) -> TokenUsage {
     };
     let prompt = usage.get("prompt_tokens").and_then(Value::as_u64);
     let completion = usage.get("completion_tokens").and_then(Value::as_u64);
-    let total = usage.get("total_tokens").and_then(Value::as_u64).or_else(|| {
-        prompt.zip(completion).map(|(p, c)| p + c)
-    });
-    let cached = usage.get("cached_tokens").and_then(Value::as_u64).or_else(|| {
-        usage
-            .get("prompt_tokens_details")
-            .and_then(Value::as_object)
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64)
-    });
+    let total = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| prompt.zip(completion).map(|(p, c)| p + c));
+    let cached = usage
+        .get("cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(Value::as_object)
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        });
     let uncached = prompt.zip(cached).map(|(p, c)| p.saturating_sub(c));
     TokenUsage {
         input_tokens: prompt,
@@ -2111,10 +2134,13 @@ fn build_codex_cli_prompt(
     conversation_messages: &[ChatMessage],
 ) -> String {
     let mut prompt = String::new();
-    prompt.push_str("You are CodeForge CLI, the command-line coding assistant for the active workspace.\n");
+    prompt.push_str(
+        "You are CodeForge CLI, the command-line coding assistant for the active workspace.\n",
+    );
     prompt.push_str("Do not identify yourself as a desktop app when running in CLI mode.\n");
     prompt.push_str("Use a plain terminal style: no emoji, no marketing copy, and no generic capability list.\n");
-    prompt.push_str("Do not advertise tools or demo capabilities unless the user asks about them.\n");
+    prompt
+        .push_str("Do not advertise tools or demo capabilities unless the user asks about them.\n");
     prompt.push_str("Never mention calculator or arithmetic demo tools unless directly relevant to the user's request.\n");
     prompt.push_str("For a simple greeting, reply with one short sentence asking what task to work on; do not include examples or bullet lists.\n");
     prompt.push_str(
@@ -2559,6 +2585,8 @@ mod tests {
             allow_shell: false,
             assume_yes: false,
             cli_mode: false,
+            goal: None,
+            goal_slot: None,
         };
 
         let run =
@@ -2614,6 +2642,8 @@ mod tests {
             allow_shell: false,
             assume_yes: false,
             cli_mode: false,
+            goal: None,
+            goal_slot: None,
         };
         let mut streamed_titles = Vec::new();
 
@@ -2686,6 +2716,8 @@ mod tests {
             allow_shell: false,
             assume_yes: false,
             cli_mode: false,
+            goal: None,
+            goal_slot: None,
         };
 
         let run =

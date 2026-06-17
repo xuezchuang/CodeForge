@@ -69,6 +69,99 @@ build-codeforge-cli.bat
 
 Keep CLI changes aligned with this repository's Rust/Tauri ownership model. The CLI may share desktop state and agent orchestration, but it must not bypass trace creation, provider selection rules, credential masking, workspace boundaries, or the agent safety policy above. If a CLI feature needs build, test, shell, or IDE automation, implement it as an explicit safe tool with fixed command templates, workspace confinement, trace output, and user confirmation instead of exposing generic shell execution.
 
+## CodeForge CLI Direction
+
+CodeForge CLI is a first-class product surface, not just a helper launcher.
+
+The first CLI milestone is to make the CodeForge command-line experience closely match the Codex CLI/TUI interaction model while still running CodeForge's own Rust/Tauri backend, provider settings, workspace state, trace system, Visual Studio bridge, and CodeForge-owned tools.
+
+Use the in-repository Codex checkout as the primary reference for CLI/TUI behavior:
+
+```text
+codex\codex-rs\cli\
+codex\codex-rs\tui\
+codex\codex-rs\app-server-protocol\
+```
+
+The goal is not to embed the whole Codex core runtime as CodeForge's architecture. CodeForge should selectively copy, adapt, or reimplement the parts it needs.
+
+Prioritize the CLI surface first:
+
+- Codex-like interactive terminal UI.
+- Composer/input behavior.
+- Slash command popup and command routing.
+- `/goal` style goal management.
+- Status/footer behavior where useful.
+- Human-readable output vs JSON output separation.
+- Clear command parsing and error behavior.
+- Traceable agent/tool activity.
+
+Then build the tool layer interface:
+
+- Tool schema definitions.
+- Tool invocation request/response types.
+- Tool result and error shape.
+- Approval request shape.
+- Trace event mapping for tool calls.
+- A small registry for CodeForge-owned tools.
+
+Only implement tools CodeForge actually needs. Do not bring over broad Codex features just because they exist.
+
+CodeForge tools should support coding workflows, especially local C++ / Visual Studio project understanding. Preferred early tools include:
+
+```text
+workspace/search
+workspace/read_file
+workspace/apply_patch
+vs/current_solution
+vs/current_document
+vs/current_selection
+vs/list_projects
+vs/find_definition
+vs/find_references
+vs/get_error_list
+goal/get
+goal/set
+goal/clear
+```
+
+Do not expose arbitrary shell execution as a generic tool. If build or test support is needed, implement explicit safe tools with fixed command templates, workspace confinement, user confirmation, and trace output.
+
+Copying or adapting Codex CLI/TUI/tool-interface code is allowed when it directly serves the CodeForge CLI goal.
+
+Rules:
+
+- Keep copied changes scoped.
+- Preserve license/header attribution when present.
+- Prefer copying small coherent modules over dragging in large dependency chains.
+- Rename/adapt types to CodeForge ownership where appropriate.
+- Do not make CodeForge a thin wrapper around `cf`, `codex`, or `cargo run --bin codex`.
+- Do not pull in Codex core/runtime dependencies unless explicitly requested for a specific reason.
+
+CodeForge owns:
+
+```text
+CLI command routing
+terminal rendering integration
+project/workspace state
+provider and credential selection
+trace creation and storage
+Visual Studio bridge/tool integration
+CodeForge tool registry
+goal state used by CodeForge
+```
+
+Codex is a reference for:
+
+```text
+CLI/TUI interaction design
+slash command behavior
+goal command behavior
+tool call interface shape
+approval flow ideas
+trace/event presentation ideas
+```
+
 ## Product Direction
 
 CodeForge is a local C++ / Visual Studio coding agent with VSIX semantic integration, workspace cache, build-error repair loop, and traceable tool execution.

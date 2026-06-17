@@ -14,3 +14,10 @@ pub mod vs_bridge_client;
 pub mod vs_bridge_service;
 pub mod vs_registry;
 pub mod workspace_tools;
+
+pub mod goal_state;
+pub mod slash_command;
+
+pub mod tool_interface;
+
+pub mod tui;

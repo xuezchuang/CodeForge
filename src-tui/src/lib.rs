@@ -102,6 +102,7 @@ mod chatwidget;
 mod cli;
 mod clipboard_copy;
 mod clipboard_paste;
+mod codeforge_direct_chat;
 mod codeforge_entry;
 mod collaboration_modes;
 mod color;

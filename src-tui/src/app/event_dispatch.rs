@@ -1324,16 +1324,30 @@ impl App {
                 }
             }
             AppEvent::PersistModelSelection { model, effort } => {
-                match crate::config_update::write_config_batch(
-                    app_server.request_handle(),
-                    crate::config_update::build_model_selection_edits(
-                        model.as_str(),
-                        effort.as_ref(),
-                    ),
-                )
-                .await
-                {
+                let result = if app_server.is_stub() {
+                    ConfigEditsBuilder::for_config(&self.config)
+                        .set_model(Some(model.as_str()), effort.clone())
+                        .apply()
+                        .await
+                        .map(|()| ())
+                        .map_err(|err| err.to_string())
+                } else {
+                    crate::config_update::write_config_batch(
+                        app_server.request_handle(),
+                        crate::config_update::build_model_selection_edits(
+                            model.as_str(),
+                            effort.as_ref(),
+                        ),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| err.to_string())
+                };
+                match result {
                     Ok(_) => {
+                        self.config.model = Some(model.clone());
+                        self.config.model_reasoning_effort = effort.clone();
+                        self.harness_overrides.model = Some(model.clone());
                         let effort_label = effort
                             .as_ref()
                             .map(std::string::ToString::to_string)

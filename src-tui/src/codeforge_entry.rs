@@ -8,7 +8,6 @@ use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_protocol::config_types::AltScreenMode;
 use codex_rollout::StateDbHandle;
-use codex_utils_home_dir::find_codex_home;
 
 use crate::AppExitInfo;
 use crate::AppServerTarget;
@@ -24,28 +23,38 @@ use crate::tui::Tui;
 
 pub async fn run_codeforge_main() -> std::io::Result<AppExitInfo> {
     let cli = Cli::parse();
-    let codex_home = find_codex_home()?.to_path_buf();
+    let codeforge_home = find_codeforge_home()?;
+    std::fs::create_dir_all(&codeforge_home)?;
+    let configured_model = read_configured_model(&codeforge_home);
     let cli_kv_overrides = Vec::new();
     let loader_overrides = LoaderOverrides::default();
     let initial_cloud_config_bundle = CloudConfigBundleLoader::default();
     let feedback = CodexFeedback::new();
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
+    let initial_model = cli
+        .model
+        .clone()
+        .or(configured_model)
+        .or_else(|| Some("MiniMax-M3".to_string()));
 
     let overrides = ConfigOverrides {
-        model: cli.model.clone().or_else(|| Some("MiniMax-M3".to_string())),
+        model: initial_model.clone(),
         cwd: cli.cwd.clone(),
         ..Default::default()
     };
 
     let mut config = ConfigBuilder::default()
-        .codex_home(codex_home.clone())
+        .codex_home(codeforge_home.clone())
         .cli_overrides(cli_kv_overrides.clone())
         .harness_overrides(overrides.clone())
         .loader_overrides(loader_overrides.clone())
         .cloud_config_bundle(initial_cloud_config_bundle)
         .build()
         .await?;
+    config.model.clone_from(&initial_model);
     config.tui_alternate_screen = AltScreenMode::Never;
+    config.check_for_update_on_startup = false;
+    config.show_tooltips = false;
 
     let cloud_config_bundle = CloudConfigBundleLoader::default();
 
@@ -65,7 +74,7 @@ pub async fn run_codeforge_main() -> std::io::Result<AppExitInfo> {
     } = cli;
     let images = shared.into_inner().images;
 
-    let app_server = AppServerSession::stub(ThreadParamsMode::Embedded);
+    let app_server = AppServerSession::stub(ThreadParamsMode::Embedded, config.clone());
     let startup_bootstrap = Some(app_server.stub_bootstrap(&config));
     let app_result = App::run(
         &mut tui,
@@ -93,4 +102,26 @@ pub async fn run_codeforge_main() -> std::io::Result<AppExitInfo> {
 
     let _ = tui::restore_after_exit();
     app_result
+}
+
+fn find_codeforge_home() -> std::io::Result<std::path::PathBuf> {
+    if let Some(value) = std::env::var_os("CODEFORGE_HOME") {
+        return Ok(std::path::PathBuf::from(value));
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".codeforge"))
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
+        })
+}
+
+fn read_configured_model(codeforge_home: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(codeforge_home.join("config.toml")).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    value
+        .get("model")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }

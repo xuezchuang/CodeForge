@@ -69,6 +69,7 @@ use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadInjectItemsResponse;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListParams;
@@ -147,6 +148,20 @@ fn is_thread_settings_update_unsupported(source: &JSONRPCErrorError) -> bool {
             && source.message.contains(THREAD_SETTINGS_UPDATE_METHOD))
 }
 
+fn user_input_text(items: &[UserInput]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::Text { text, .. } => Some(text.as_str()),
+            UserInput::Image { .. }
+            | UserInput::LocalImage { .. }
+            | UserInput::Skill { .. }
+            | UserInput::Mention { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Data collected during the TUI bootstrap phase that the main event loop
 /// needs to configure the UI, telemetry, and initial rate-limit prefetch.
 ///
@@ -177,6 +192,7 @@ pub(crate) struct AppServerSession {
     thread_settings_update_supported: bool,
     default_model: Option<String>,
     available_models: Vec<ModelPreset>,
+    stub_config: Option<Config>,
     external_agent_config_import_completion_pending: AtomicBool,
 }
 
@@ -221,11 +237,12 @@ impl AppServerSession {
             thread_settings_update_supported: true,
             default_model: None,
             available_models: Vec::new(),
+            stub_config: None,
             external_agent_config_import_completion_pending: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn stub(thread_params_mode: ThreadParamsMode) -> Self {
+    pub(crate) fn stub(thread_params_mode: ThreadParamsMode, config: Config) -> Self {
         Self {
             client: None,
             next_request_id: 1,
@@ -234,6 +251,7 @@ impl AppServerSession {
             thread_settings_update_supported: false,
             default_model: None,
             available_models: Vec::new(),
+            stub_config: Some(config),
             external_agent_config_import_completion_pending: AtomicBool::new(false),
         }
     }
@@ -292,7 +310,10 @@ impl AppServerSession {
                 .unwrap_or_else(|| "MiniMax-M3".to_string()),
             feedback_audience: FeedbackAudience::External,
             has_chatgpt_account: false,
-            available_models: Vec::new(),
+            available_models: crate::codeforge_direct_chat::model_presets(
+                config,
+                config.model.as_deref().unwrap_or("MiniMax-M3"),
+            ),
         }
     }
 
@@ -849,10 +870,25 @@ impl AppServerSession {
         let (sandbox_policy, permissions) =
             turn_permissions_overrides(permissions_override, cwd.as_path());
         if self.is_stub() {
+            let prompt = user_input_text(&items);
+            let config = self
+                .stub_config
+                .as_ref()
+                .wrap_err("stub app-server is missing CodeForge config")?;
+            let reply = match crate::codeforge_direct_chat::complete(config, &model, &prompt).await
+            {
+                Ok(reply) => reply,
+                Err(err) => format!("CodeForge direct chat failed: {err}"),
+            };
             return Ok(TurnStartResponse {
                 turn: Turn {
                     id: format!("stub-turn-{}", Uuid::new_v4()),
-                    items: Vec::new(),
+                    items: vec![ThreadItem::AgentMessage {
+                        id: format!("stub-agent-{}", Uuid::new_v4()),
+                        text: reply,
+                        phase: None,
+                        memory_citation: None,
+                    }],
                     items_view: Default::default(),
                     status: codex_app_server_protocol::TurnStatus::Completed,
                     error: None,
@@ -1214,6 +1250,10 @@ impl AppServerSession {
         &mut self,
         params: SkillsListParams,
     ) -> Result<SkillsListResponse> {
+        if self.is_stub() {
+            let _ = params;
+            return Ok(SkillsListResponse { data: Vec::new() });
+        }
         let request_id = self.next_request_id();
         self.client()?
             .request_typed(ClientRequest::SkillsList { request_id, params })

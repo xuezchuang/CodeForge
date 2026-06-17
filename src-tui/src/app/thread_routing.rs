@@ -626,7 +626,7 @@ impl App {
                             .as_ref()
                             .map(|profile| &profile.permission_profile),
                     );
-                    app_server
+                    let turn_start_response = app_server
                         .turn_start(
                             thread_id,
                             items.to_vec(),
@@ -644,6 +644,12 @@ impl App {
                             final_output_json_schema.clone(),
                         )
                         .await?;
+                    if app_server.is_stub() {
+                        self.chat_widget.replay_thread_turns(
+                            vec![turn_start_response.turn],
+                            ReplayKind::ThreadSnapshot,
+                        );
+                    }
                 }
                 Ok(true)
             }

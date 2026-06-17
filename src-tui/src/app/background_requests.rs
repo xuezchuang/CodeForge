@@ -123,8 +123,14 @@ impl App {
     /// app-server RPC finishes. User-initiated skills refreshes still use the blocking app command path so
     /// callers that explicitly asked for fresh skill state do not race ahead of their own refresh.
     pub(super) fn refresh_startup_skills(&mut self, app_server: &AppServerSession) {
-        let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
+        if app_server.is_stub() {
+            app_event_tx.send(AppEvent::SkillsListLoaded {
+                result: Ok(SkillsListResponse { data: Vec::new() }),
+            });
+            return;
+        }
+        let request_handle = app_server.request_handle();
         let cwd = self.config.cwd.to_path_buf();
         tokio::spawn(async move {
             let result = fetch_skills_list(request_handle, cwd)
@@ -428,13 +434,13 @@ impl App {
     }
 
     pub(super) fn refresh_plugin_mentions(&mut self, app_server: &AppServerSession) {
-        let cwd = self.config.cwd.to_path_buf();
-        let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
-        if !self.config.features.enabled(Feature::Plugins) {
+        if app_server.is_stub() || !self.config.features.enabled(Feature::Plugins) {
             app_event_tx.send(AppEvent::PluginMentionsLoaded { plugins: None });
             return;
         }
+        let cwd = self.config.cwd.to_path_buf();
+        let request_handle = app_server.request_handle();
 
         tokio::spawn(async move {
             match fetch_plugin_mentions(request_handle, cwd).await {

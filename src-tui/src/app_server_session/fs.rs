@@ -105,6 +105,9 @@ impl AppServerSession {
         local_request: impl FnOnce(RequestId, AbsolutePathBuf) -> ClientRequest,
         remote_params: serde_json::Value,
     ) -> Result<T> {
+        if self.is_stub() {
+            color_eyre::eyre::bail!("CodeForge TUI stub backend does not implement {method} yet");
+        }
         let request_id = self.next_request_id();
         match self.request_handle() {
             AppServerRequestHandle::Remote(handle) => {
@@ -125,7 +128,7 @@ impl AppServerSession {
             AppServerRequestHandle::InProcess(_) => {
                 let path = AbsolutePathBuf::from_absolute_path_checked(path.as_str())
                     .wrap_err_with(|| format!("invalid local app-server fs path {path}"))?;
-                self.client
+                self.client()?
                     .request_typed(local_request(request_id, path))
                     .await
                     .wrap_err_with(|| format!("{method} failed in TUI"))

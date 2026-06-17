@@ -3,16 +3,145 @@ name = "codeforge-tui"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-autolib = false
 autobins = false
 
 [[bin]]
 name = "codeforge"
 path = "src/main.rs"
 
+[lib]
+name = "codeforge_tui"
+path = "src/lib.rs"
+doctest = false
+
 [dependencies]
 anyhow = "1"
+base64 = "0.22.1"
+chrono = { version = "0.4.43", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
-ratatui = "0.29"
-unicode-width = "0.2"
+codex-ansi-escape = { path = "../codex/codex-rs/ansi-escape" }
+codex-app-server-client = { path = "../codex/codex-rs/app-server-client" }
+codex-app-server-protocol = { path = "../codex/codex-rs/app-server-protocol" }
+codex-arg0 = { path = "../codex/codex-rs/arg0" }
+codex-install-context = { path = "../codex/codex-rs/install-context" }
+codex-cloud-config = { path = "../codex/codex-rs/cloud-config" }
+codex-config = { path = "../codex/codex-rs/config" }
+codex-connectors = { path = "../codex/codex-rs/connectors" }
+codex-core-plugins = { path = "../codex/codex-rs/core-plugins" }
+codex-core-skills = { path = "../codex/codex-rs/core-skills" }
+codex-exec-server = { path = "../codex/codex-rs/exec-server" }
+codex-features = { path = "../codex/codex-rs/features" }
+codex-feedback = { path = "../codex/codex-rs/feedback" }
+codex-file-search = { path = "../codex/codex-rs/file-search" }
+codex-git-utils = { path = "../codex/codex-rs/git-utils" }
+codex-login = { path = "../codex/codex-rs/login" }
+codex-message-history = { path = "../codex/codex-rs/message-history" }
+codex-model-provider = { path = "../codex/codex-rs/model-provider" }
+codex-model-provider-info = { path = "../codex/codex-rs/model-provider-info" }
+codex-models-manager = { path = "../codex/codex-rs/models-manager" }
+codex-otel = { path = "../codex/codex-rs/otel" }
+codex-plugin = { path = "../codex/codex-rs/plugin" }
+codex-protocol = { path = "../codex/codex-rs/protocol" }
+codex-rollout = { path = "../codex/codex-rs/rollout" }
+codex-sandboxing = { path = "../codex/codex-rs/sandboxing" }
+codex-shell-command = { path = "../codex/codex-rs/shell-command" }
+codex-state = { path = "../codex/codex-rs/state" }
+codex-terminal-detection = { path = "../codex/codex-rs/terminal-detection" }
+codex-utils-approval-presets = { path = "../codex/codex-rs/utils/approval-presets" }
+codex-utils-absolute-path = { path = "../codex/codex-rs/utils/absolute-path" }
+codex-utils-cli = { path = "../codex/codex-rs/utils/cli" }
+codex-utils-elapsed = { path = "../codex/codex-rs/utils/elapsed" }
+codex-utils-fuzzy-match = { path = "../codex/codex-rs/utils/fuzzy-match" }
+codex-utils-home-dir = { path = "../codex/codex-rs/utils/home-dir" }
+codex-utils-oss = { path = "../codex/codex-rs/utils/oss" }
+codex-utils-path = { path = "../codex/codex-rs/utils/path-utils" }
+codex-utils-plugins = { path = "../codex/codex-rs/utils/plugins" }
+codex-utils-sandbox-summary = { path = "../codex/codex-rs/utils/sandbox-summary" }
+codex-utils-sleep-inhibitor = { path = "../codex/codex-rs/utils/sleep-inhibitor" }
+codex-utils-string = { path = "../codex/codex-rs/utils/string" }
+color-eyre = "0.6.3"
+crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
+derive_more = { version = "2", features = ["is_variant"] }
+diffy = "0.4.2"
+dirs = "6"
+dunce = "1.0.4"
+image = { version = "^0.25.9", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+itertools = "0.14.0"
+lazy_static = "1"
+pathdiff = "0.2"
+pulldown-cmark = "0.10"
+rand = "0.9"
+ratatui = { version = "0.29.0", features = [
+    "scrolling-regions",
+    "unstable-backend-writer",
+    "unstable-rendered-line-info",
+    "unstable-widget-ref",
+] }
+ratatui-macros = "0.6.0"
+regex-lite = "0.1.8"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+rmcp = { version = "1.7.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+shlex = "1.3.0"
+strum = "0.27.2"
+strum_macros = "0.28.0"
+supports-color = "3.0.2"
+tempfile = "3.23.0"
+textwrap = "0.16.2"
+thiserror = "2.0.17"
+tokio = { version = "1", features = [
+    "io-std",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "test-util",
+    "time",
+] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+toml = "0.9.5"
+tracing = { version = "0.1.44", features = ["log"] }
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+syntect = "5"
+two-face = { version = "0.5", default-features = false, features = ["syntect-default-onig"] }
+unicode-segmentation = "1.12.0"
+unicode-width = "0.2.1"
+url = "2"
+urlencoding = "2.1"
+webbrowser = "1.0"
+uuid = "1"
+codex-windows-sandbox = { path = "../codex/codex-rs/windows-sandbox-rs" }
+tokio-util = { version = "0.7.18", features = ["time"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.182"
+
+[target.'cfg(windows)'.dependencies]
+which = "8"
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+winsplit = "0.1"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { version = "3", features = ["wayland-data-control"] }
+
+[patch.crates-io]
+crossterm = { git = "https://github.com/nornagon/crossterm", rev = "87db8bfa6dc99427fd3b071681b07fc31c6ce995" }
+nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9faabb4e5c6d81d946a5e35a90f87347ee" }
+ratatui = { git = "https://github.com/nornagon/ratatui", rev = "9b2ad1298408c45918ee9f8241a6f95498cdbed2" }
+runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
+
+[patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }

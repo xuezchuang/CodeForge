@@ -170,7 +170,7 @@ pub(crate) struct AppServerBootstrap {
 }
 
 pub(crate) struct AppServerSession {
-    client: AppServerClient,
+    client: Option<AppServerClient>,
     next_request_id: i64,
     remote_cwd_override: Option<PathBuf>,
     thread_params_mode: ThreadParamsMode,
@@ -214,7 +214,7 @@ pub(crate) enum TurnPermissionsOverride {
 impl AppServerSession {
     pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
         Self {
-            client,
+            client: Some(client),
             next_request_id: 1,
             remote_cwd_override: None,
             thread_params_mode,
@@ -223,6 +223,23 @@ impl AppServerSession {
             available_models: Vec::new(),
             external_agent_config_import_completion_pending: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn stub(thread_params_mode: ThreadParamsMode) -> Self {
+        Self {
+            client: None,
+            next_request_id: 1,
+            remote_cwd_override: None,
+            thread_params_mode,
+            thread_settings_update_supported: false,
+            default_model: None,
+            available_models: Vec::new(),
+            external_agent_config_import_completion_pending: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn is_stub(&self) -> bool {
+        self.client.is_none()
     }
 
     pub(crate) fn with_remote_cwd_override(mut self, remote_cwd_override: Option<PathBuf>) -> Self {
@@ -239,29 +256,89 @@ impl AppServerSession {
     }
 
     pub(crate) fn uses_embedded_app_server(&self) -> bool {
-        matches!(&self.client, AppServerClient::InProcess(_))
+        match &self.client {
+            Some(client) => matches!(client, AppServerClient::InProcess(_)),
+            None => false,
+        }
     }
 
     pub(crate) fn codex_home_path(
         &self,
         local_codex_home: &AbsolutePathBuf,
     ) -> Option<AppServerPath> {
-        self.client.codex_home(local_codex_home)
+        self.client
+            .as_ref()
+            .and_then(|client| client.codex_home(local_codex_home))
     }
 
     pub(crate) fn server_version(&self) -> Option<&str> {
-        let AppServerClient::Remote(client) = &self.client else {
+        let Some(AppServerClient::Remote(client)) = &self.client else {
             return None;
         };
         client.server_version()
     }
 
+    pub(crate) fn stub_bootstrap(&self, config: &Config) -> AppServerBootstrap {
+        AppServerBootstrap {
+            duration: Duration::ZERO,
+            account_email: None,
+            auth_mode: None,
+            status_account_display: None,
+            plan_type: None,
+            requires_openai_auth: false,
+            default_model: config
+                .model
+                .clone()
+                .unwrap_or_else(|| "MiniMax-M3".to_string()),
+            feedback_audience: FeedbackAudience::External,
+            has_chatgpt_account: false,
+            available_models: Vec::new(),
+        }
+    }
+
+    pub(crate) fn stub_started_thread(&self, config: &Config) -> AppServerStartedThread {
+        let model = config
+            .model
+            .clone()
+            .unwrap_or_else(|| "MiniMax-M3".to_string());
+        AppServerStartedThread {
+            session: ThreadSessionState {
+                thread_id: ThreadId::new(),
+                forked_from_id: None,
+                fork_parent_title: None,
+                thread_name: None,
+                model,
+                model_provider_id: config.model_provider_id.clone(),
+                service_tier: config.service_tier.clone(),
+                approval_policy: AskForApproval::Never,
+                approvals_reviewer: config.approvals_reviewer,
+                permission_profile: config.permissions.effective_permission_profile(),
+                active_permission_profile: None,
+                cwd: config.cwd.clone(),
+                runtime_workspace_roots: config.workspace_roots.clone(),
+                instruction_source_paths: Vec::new(),
+                reasoning_effort: config.model_reasoning_effort.clone(),
+                collaboration_mode: None,
+                personality: config.personality.clone(),
+                message_history: None,
+                network_proxy: None,
+                rollout_path: None,
+            },
+            turns: Vec::new(),
+        }
+    }
+
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
+        if self.is_stub() {
+            return Ok(self.stub_bootstrap(config));
+        }
         let started_at = Instant::now();
         let account = self.read_account().await?;
         let model_request_id = self.next_request_id();
         let models: ModelListResponse = self
             .client
+            .as_ref()
+            .expect("real app-server client")
             .request_typed(ClientRequest::ModelList {
                 request_id: model_request_id,
                 params: ModelListParams {
@@ -352,7 +429,7 @@ impl AppServerSession {
     /// (to check auth mode without the overhead of a full bootstrap).
     pub(crate) async fn read_account(&mut self) -> Result<GetAccountResponse> {
         let account_request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::GetAccount {
                 request_id: account_request_id,
                 params: GetAccountParams {
@@ -368,7 +445,7 @@ impl AppServerSession {
         params: ExternalAgentConfigDetectParams,
     ) -> Result<ExternalAgentConfigDetectResponse> {
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::ExternalAgentConfigDetect { request_id, params })
             .await
             .wrap_err("externalAgentConfig/detect failed during Claude Code import")
@@ -388,7 +465,7 @@ impl AppServerSession {
         }
         let request_id = self.next_request_id();
         let response: Result<ExternalAgentConfigImportResponse> = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ExternalAgentConfigImport {
                 request_id,
                 params: ExternalAgentConfigImportParams { migration_items },
@@ -416,7 +493,10 @@ impl AppServerSession {
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
-        self.client.next_event().await
+        match self.client.as_mut() {
+            Some(client) => client.next_event().await,
+            None => None,
+        }
     }
 
     #[cfg(test)]
@@ -430,10 +510,13 @@ impl AppServerSession {
         config: &Config,
         session_start_source: Option<ThreadStartSource>,
     ) -> Result<AppServerStartedThread> {
+        if self.is_stub() {
+            return Ok(self.stub_started_thread(config));
+        }
         let request_id = self.next_request_id();
         let session_config = self.session_config_with_effective_service_tier(config);
         let response: ThreadStartResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadStart {
                 request_id,
                 params: thread_start_params_from_config(
@@ -455,10 +538,13 @@ impl AppServerSession {
         config: Config,
         thread_id: ThreadId,
     ) -> Result<AppServerStartedThread> {
+        if self.is_stub() {
+            return Ok(self.stub_started_thread(&config));
+        }
         let request_id = self.next_request_id();
         let session_config = self.session_config_with_effective_service_tier(&config);
         let response: ThreadResumeResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadResume {
                 request_id,
                 params: thread_resume_params_from_config(
@@ -487,10 +573,13 @@ impl AppServerSession {
         config: Config,
         thread_id: ThreadId,
     ) -> Result<AppServerStartedThread> {
+        if self.is_stub() {
+            return Ok(self.stub_started_thread(&config));
+        }
         let request_id = self.next_request_id();
         let session_config = self.session_config_with_effective_service_tier(&config);
         let response: ThreadForkResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadFork {
                 request_id,
                 params: thread_fork_params_from_config(
@@ -573,7 +662,7 @@ impl AppServerSession {
         params: ThreadListParams,
     ) -> Result<ThreadListResponse> {
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::ThreadList { request_id, params })
             .await
             .wrap_err("thread/list failed during TUI session lookup")
@@ -589,7 +678,7 @@ impl AppServerSession {
         params: ThreadLoadedListParams,
     ) -> Result<ThreadLoadedListResponse> {
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::ThreadLoadedList { request_id, params })
             .await
             .wrap_err("failed to list loaded threads from app server")
@@ -602,7 +691,7 @@ impl AppServerSession {
     ) -> Result<Thread> {
         let request_id = self.next_request_id();
         let response: ThreadReadResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadRead {
                 request_id,
                 params: ThreadReadParams {
@@ -618,7 +707,7 @@ impl AppServerSession {
     pub(crate) async fn thread_archive(&mut self, thread_id: ThreadId) -> Result<()> {
         let request_id = self.next_request_id();
         let _: ThreadArchiveResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadArchive {
                 request_id,
                 params: ThreadArchiveParams {
@@ -633,7 +722,7 @@ impl AppServerSession {
     pub(crate) async fn thread_delete(&mut self, thread_id: ThreadId) -> Result<()> {
         let request_id = self.next_request_id();
         let _: ThreadDeleteResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadDelete {
                 request_id,
                 params: ThreadDeleteParams {
@@ -648,7 +737,7 @@ impl AppServerSession {
     pub(crate) async fn thread_unarchive(&mut self, thread_id: ThreadId) -> Result<Thread> {
         let request_id = self.next_request_id();
         let response: ThreadUnarchiveResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadUnarchive {
                 request_id,
                 params: ThreadUnarchiveParams {
@@ -666,7 +755,7 @@ impl AppServerSession {
         branch: String,
     ) -> Result<ThreadMetadataUpdateResponse> {
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::ThreadMetadataUpdate {
                 request_id,
                 params: ThreadMetadataUpdateParams {
@@ -691,7 +780,7 @@ impl AppServerSession {
         }
         let request_id = self.next_request_id();
         match self
-            .client
+            .client()?
             .request_typed::<ThreadSettingsUpdateResponse>(ClientRequest::ThreadSettingsUpdate {
                 request_id,
                 params,
@@ -726,7 +815,7 @@ impl AppServerSession {
             .collect::<std::result::Result<Vec<_>, _>>()
             .wrap_err("failed to encode thread/inject_items payload")?;
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::ThreadInjectItems {
                 request_id,
                 params: ThreadInjectItemsParams {
@@ -759,7 +848,21 @@ impl AppServerSession {
         let request_id = self.next_request_id();
         let (sandbox_policy, permissions) =
             turn_permissions_overrides(permissions_override, cwd.as_path());
-        self.client
+        if self.is_stub() {
+            return Ok(TurnStartResponse {
+                turn: Turn {
+                    id: format!("stub-turn-{}", Uuid::new_v4()),
+                    items: Vec::new(),
+                    items_view: Default::default(),
+                    status: codex_app_server_protocol::TurnStatus::Completed,
+                    error: None,
+                    started_at: None,
+                    completed_at: None,
+                    duration_ms: Some(0),
+                },
+            });
+        }
+        self.client()?
             .request_typed(ClientRequest::TurnStart {
                 request_id,
                 params: TurnStartParams {
@@ -793,9 +896,14 @@ impl AppServerSession {
         thread_id: ThreadId,
         turn_id: String,
     ) -> std::result::Result<(), TypedRequestError> {
+        if self.is_stub() {
+            return Ok(());
+        }
         let request_id = self.next_request_id();
         let _: TurnInterruptResponse = self
             .client
+            .as_ref()
+            .expect("real app-server client")
             .request_typed(ClientRequest::TurnInterrupt {
                 request_id,
                 params: TurnInterruptParams {
@@ -820,8 +928,13 @@ impl AppServerSession {
         turn_id: String,
         items: Vec<UserInput>,
     ) -> std::result::Result<TurnSteerResponse, TypedRequestError> {
+        if self.is_stub() {
+            return Ok(TurnSteerResponse { turn_id });
+        }
         let request_id = self.next_request_id();
         self.client
+            .as_ref()
+            .expect("real app-server client")
             .request_typed(ClientRequest::TurnSteer {
                 request_id,
                 params: TurnSteerParams {
@@ -843,7 +956,7 @@ impl AppServerSession {
     ) -> Result<()> {
         let request_id = self.next_request_id();
         let _: ThreadSetNameResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadSetName {
                 request_id,
                 params: ThreadSetNameParams {
@@ -863,7 +976,7 @@ impl AppServerSession {
     ) -> Result<()> {
         let request_id = self.next_request_id();
         let _: ThreadMemoryModeSetResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadMemoryModeSet {
                 request_id,
                 params: ThreadMemoryModeSetParams {
@@ -879,7 +992,7 @@ impl AppServerSession {
     pub(crate) async fn memory_reset(&mut self) -> Result<()> {
         let request_id = self.next_request_id();
         let _: MemoryResetResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::MemoryReset {
                 request_id,
                 params: None,
@@ -894,7 +1007,7 @@ impl AppServerSession {
         thread_id: ThreadId,
     ) -> Result<ThreadGoalGetResponse> {
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::ThreadGoalGet {
                 request_id,
                 params: ThreadGoalGetParams {
@@ -913,7 +1026,7 @@ impl AppServerSession {
         token_budget: Option<Option<i64>>,
     ) -> Result<ThreadGoalSetResponse> {
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::ThreadGoalSet {
                 request_id,
                 params: ThreadGoalSetParams {
@@ -932,7 +1045,7 @@ impl AppServerSession {
         thread_id: ThreadId,
     ) -> Result<ThreadGoalClearResponse> {
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::ThreadGoalClear {
                 request_id,
                 params: ThreadGoalClearParams {
@@ -946,7 +1059,7 @@ impl AppServerSession {
     pub(crate) async fn logout_account(&mut self) -> Result<()> {
         let request_id = self.next_request_id();
         let _: LogoutAccountResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::LogoutAccount {
                 request_id,
                 params: None,
@@ -957,9 +1070,12 @@ impl AppServerSession {
     }
 
     pub(crate) async fn thread_unsubscribe(&mut self, thread_id: ThreadId) -> Result<()> {
+        if self.is_stub() {
+            return Ok(());
+        }
         let request_id = self.next_request_id();
         let _: ThreadUnsubscribeResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadUnsubscribe {
                 request_id,
                 params: ThreadUnsubscribeParams {
@@ -972,9 +1088,12 @@ impl AppServerSession {
     }
 
     pub(crate) async fn thread_compact_start(&mut self, thread_id: ThreadId) -> Result<()> {
+        if self.is_stub() {
+            return Ok(());
+        }
         let request_id = self.next_request_id();
         let _: ThreadCompactStartResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadCompactStart {
                 request_id,
                 params: ThreadCompactStartParams {
@@ -991,9 +1110,12 @@ impl AppServerSession {
         thread_id: ThreadId,
         command: String,
     ) -> Result<()> {
+        if self.is_stub() {
+            return Ok(());
+        }
         let request_id = self.next_request_id();
         let _: ThreadShellCommandResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadShellCommand {
                 request_id,
                 params: ThreadShellCommandParams {
@@ -1011,9 +1133,12 @@ impl AppServerSession {
         thread_id: ThreadId,
         event: &GuardianAssessmentEvent,
     ) -> Result<()> {
+        if self.is_stub() {
+            return Ok(());
+        }
         let request_id = self.next_request_id();
         let _: ThreadApproveGuardianDeniedActionResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadApproveGuardianDeniedAction {
                 request_id,
                 params: ThreadApproveGuardianDeniedActionParams {
@@ -1031,9 +1156,12 @@ impl AppServerSession {
         &mut self,
         thread_id: ThreadId,
     ) -> Result<()> {
+        if self.is_stub() {
+            return Ok(());
+        }
         let request_id = self.next_request_id();
         let _: ThreadBackgroundTerminalsCleanResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ThreadBackgroundTerminalsClean {
                 request_id,
                 params: ThreadBackgroundTerminalsCleanParams {
@@ -1051,7 +1179,7 @@ impl AppServerSession {
         num_turns: u32,
     ) -> Result<ThreadRollbackResponse> {
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::ThreadRollback {
                 request_id,
                 params: ThreadRollbackParams {
@@ -1069,7 +1197,7 @@ impl AppServerSession {
         target: ReviewTarget,
     ) -> Result<ReviewStartResponse> {
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::ReviewStart {
                 request_id,
                 params: ReviewStartParams {
@@ -1087,16 +1215,19 @@ impl AppServerSession {
         params: SkillsListParams,
     ) -> Result<SkillsListResponse> {
         let request_id = self.next_request_id();
-        self.client
+        self.client()?
             .request_typed(ClientRequest::SkillsList { request_id, params })
             .await
             .wrap_err("skills/list failed in TUI")
     }
 
     pub(crate) async fn reload_user_config(&mut self) -> Result<()> {
+        if self.is_stub() {
+            return Ok(());
+        }
         let request_id = self.next_request_id();
         let _: ConfigWriteResponse = self
-            .client
+            .client()?
             .request_typed(ClientRequest::ConfigBatchWrite {
                 request_id,
                 params: ConfigBatchWriteParams {
@@ -1116,7 +1247,10 @@ impl AppServerSession {
         request_id: RequestId,
         error: JSONRPCErrorError,
     ) -> std::io::Result<()> {
-        self.client.reject_server_request(request_id, error).await
+        match self.client.as_ref() {
+            Some(client) => client.reject_server_request(request_id, error).await,
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn resolve_server_request(
@@ -1124,21 +1258,36 @@ impl AppServerSession {
         request_id: RequestId,
         result: serde_json::Value,
     ) -> std::io::Result<()> {
-        self.client.resolve_server_request(request_id, result).await
+        match self.client.as_ref() {
+            Some(client) => client.resolve_server_request(request_id, result).await,
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn shutdown(self) -> std::io::Result<()> {
-        self.client.shutdown().await
+        match self.client {
+            Some(client) => client.shutdown().await,
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn request_handle(&self) -> AppServerRequestHandle {
-        self.client.request_handle()
+        self.client
+            .as_ref()
+            .expect("stub app-server has no request handle")
+            .request_handle()
     }
 
     fn next_request_id(&mut self) -> RequestId {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         RequestId::Integer(request_id)
+    }
+
+    fn client(&self) -> Result<&AppServerClient> {
+        self.client
+            .as_ref()
+            .context("CodeForge TUI stub backend does not implement this app-server call yet")
     }
 }
 

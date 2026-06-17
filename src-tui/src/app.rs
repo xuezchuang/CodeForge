@@ -629,6 +629,11 @@ fn spawn_startup_thread_start(
     config: Config,
     app_event_tx: AppEventSender,
 ) {
+    if app_server.is_stub() {
+        let result = Ok(app_server.stub_started_thread(&config));
+        app_event_tx.send(AppEvent::StartupThreadStarted { result });
+        return;
+    }
     let request_handle = app_server.request_handle();
     let thread_params_mode = app_server.thread_params_mode();
     let remote_cwd_override = app_server.remote_cwd_override().map(Path::to_path_buf);
@@ -851,9 +856,13 @@ impl App {
 
         let status_line_invalid_items_warned = Arc::new(AtomicBool::new(false));
         let terminal_title_invalid_items_warned = Arc::new(AtomicBool::new(false));
-        let workspace_command_runner: WorkspaceCommandRunner = Arc::new(
-            AppServerWorkspaceCommandRunner::new(app_server.request_handle()),
-        );
+        let workspace_command_runner: Option<WorkspaceCommandRunner> = if app_server.is_stub() {
+            None
+        } else {
+            Some(Arc::new(AppServerWorkspaceCommandRunner::new(
+                app_server.request_handle(),
+            )))
+        };
         let runtime_model_provider_started_at = Instant::now();
         let runtime_model_provider_base_url =
             resolve_runtime_model_provider_base_url(&config.model_provider).await;
@@ -884,7 +893,7 @@ impl App {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
                     app_event_tx: app_event_tx.clone(),
-                    workspace_command_runner: Some(workspace_command_runner.clone()),
+                    workspace_command_runner: workspace_command_runner.clone(),
                     initial_user_message: crate::chatwidget::create_initial_user_message(
                         initial_prompt.clone(),
                         initial_images.clone(),
@@ -920,7 +929,7 @@ impl App {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
                     app_event_tx: app_event_tx.clone(),
-                    workspace_command_runner: Some(workspace_command_runner.clone()),
+                    workspace_command_runner: workspace_command_runner.clone(),
                     initial_user_message: crate::chatwidget::create_initial_user_message(
                         initial_prompt.clone(),
                         initial_images.clone(),
@@ -959,7 +968,7 @@ impl App {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
                     app_event_tx: app_event_tx.clone(),
-                    workspace_command_runner: Some(workspace_command_runner.clone()),
+                    workspace_command_runner: workspace_command_runner.clone(),
                     initial_user_message: crate::chatwidget::create_initial_user_message(
                         initial_prompt.clone(),
                         initial_images.clone(),
@@ -1006,7 +1015,7 @@ See the Codex keymap documentation for supported actions and examples."
             session_telemetry: session_telemetry.clone(),
             app_event_tx,
             chat_widget,
-            workspace_command_runner: Some(workspace_command_runner),
+            workspace_command_runner,
             config,
             state_db,
             cli_kv_overrides,

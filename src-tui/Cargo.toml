@@ -1,0 +1,18 @@
+[package]
+name = "codeforge-tui"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+autolib = false
+autobins = false
+
+[[bin]]
+name = "codeforge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.29"
+unicode-width = "0.2"

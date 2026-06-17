@@ -41,3 +41,25 @@ src/components/ChatMessage.tsx.bak
 *.sln
 !vsix/SnowAgent.VSBridge/SnowAgent.VSBridge.sln
 *.sw?
+
+# Miscellaneous local files
+*.tmp
+*.temp
+*.swp
+*.swo
+*.log.*
+*.orig
+*.rej
+*.bak
+*.old
+*.cache
+*.pid
+*.pid.lock
+Thumbs.db
+Desktop.ini
+out
+tmp
+temp
+
+# TUI project generated build artifacts
+src-tui/target

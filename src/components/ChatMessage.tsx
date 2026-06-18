@@ -44,6 +44,7 @@ function ChatMessage({
   const displayContent = isUser ? message.content : sanitizeModelMessage(message.content)
   const isRunningAssistant =
     !isUser && message.status === 'running' && !hasTerminalTraceEvent(message.traceEvents ?? [])
+  const hideAssistantActions = !isUser && message.status === 'running'
   const thinkingNowMs = useThinkingClock(isRunningAssistant)
   const animateThinkingPrefix =
     isRunningAssistant && displayContent.startsWith(THINKING_PREFIX)
@@ -93,10 +94,10 @@ function ChatMessage({
             <time>{formatTime(message.createdAt)}</time>
           </div>
         ) : null}
-        {!isUser && thinkingSummary ? (
+        {!isUser && thinkingSummary && !isRunningAssistant ? (
           <ThinkingPanel
             summary={thinkingSummary}
-            defaultOpen={isRunningAssistant}
+            defaultOpen={false}
           />
         ) : null}
         {message.attachments && message.attachments.length > 0 ? (
@@ -111,27 +112,16 @@ function ChatMessage({
             ))}
           </div>
         ) : null}
-        {displayContent.trim().length > 0 || !message.attachments?.length ? (
+        {!animateThinkingPrefix && (displayContent.trim().length > 0 || !message.attachments?.length) ? (
           <div className="message-content">
-            {animateThinkingPrefix ? (
-              <RunningAssistantContent
-                text={displayContent}
-                projectId={projectId}
-                taskId={message.taskId}
-                onCodeLinkResult={onCodeLinkResult}
-                onCodeLinkError={onCodeLinkError}
-                onTraceChanged={() => onTraceChanged(message.taskId)}
-              />
-            ) : (
-              <MarkdownMessage
-                text={displayContent}
-                projectId={projectId}
-                taskId={message.taskId}
-                onCodeLinkResult={onCodeLinkResult}
-                onCodeLinkError={onCodeLinkError}
-                onTraceChanged={() => onTraceChanged(message.taskId)}
-              />
-            )}
+            <MarkdownMessage
+              text={displayContent}
+              projectId={projectId}
+              taskId={message.taskId}
+              onCodeLinkResult={onCodeLinkResult}
+              onCodeLinkError={onCodeLinkError}
+              onTraceChanged={() => onTraceChanged(message.taskId)}
+            />
           </div>
         ) : null}
         {isUser ? (
@@ -162,7 +152,41 @@ function ChatMessage({
             </button>
           </div>
         ) : null}
-        {!isUser ? (
+        {message.codeLinks && message.codeLinks.length > 0 ? (
+          <div className="suggested-edit-card">
+            <div>
+              <strong>Suggested edit</strong>
+              <span>Review the referenced file in Visual Studio.</span>
+            </div>
+            <div className="code-link-row">
+              {message.codeLinks.map((link) => (
+                <CodeLink
+                  key={link.rawLink}
+                  projectId={projectId}
+                  taskId={message.taskId}
+                  rawLink={link.rawLink}
+                  onResult={onCodeLinkResult}
+                  onError={onCodeLinkError}
+                  onTraceChanged={() => onTraceChanged(message.taskId)}
+                />
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {animateThinkingPrefix ? (
+          <div className="message-content running-message-content">
+            <RunningAssistantContent
+              text={displayContent}
+              thinkingSummary={thinkingSummary}
+              projectId={projectId}
+              taskId={message.taskId}
+              onCodeLinkResult={onCodeLinkResult}
+              onCodeLinkError={onCodeLinkError}
+              onTraceChanged={() => onTraceChanged(message.taskId)}
+            />
+          </div>
+        ) : null}
+        {!isUser && !hideAssistantActions ? (
           <div className="message-actions" aria-label="Message actions">
             <button
               type="button"
@@ -208,27 +232,6 @@ function ChatMessage({
             </button>
           </div>
         ) : null}
-        {message.codeLinks && message.codeLinks.length > 0 ? (
-          <div className="suggested-edit-card">
-            <div>
-              <strong>Suggested edit</strong>
-              <span>Review the referenced file in Visual Studio.</span>
-            </div>
-            <div className="code-link-row">
-              {message.codeLinks.map((link) => (
-                <CodeLink
-                  key={link.rawLink}
-                  projectId={projectId}
-                  taskId={message.taskId}
-                  rawLink={link.rawLink}
-                  onResult={onCodeLinkResult}
-                  onError={onCodeLinkError}
-                  onTraceChanged={() => onTraceChanged(message.taskId)}
-                />
-              ))}
-            </div>
-          </div>
-        ) : null}
       </div>
     </article>
   )
@@ -241,6 +244,10 @@ interface MarkdownMessageProps {
   onCodeLinkResult: (message: string) => void
   onCodeLinkError: (message: string) => void
   onTraceChanged: () => void
+}
+
+interface RunningAssistantContentProps extends MarkdownMessageProps {
+  thinkingSummary: ThinkingSummary | null
 }
 
 interface MarkdownCodeBlockProps {
@@ -273,13 +280,15 @@ function useThinkingClock(enabled: boolean): number {
 
 function RunningAssistantContent({
   text,
+  thinkingSummary,
   projectId,
   taskId,
   onCodeLinkResult,
   onCodeLinkError,
   onTraceChanged,
-}: MarkdownMessageProps) {
+}: RunningAssistantContentProps) {
   const detail = text.startsWith(THINKING_PREFIX) ? text.slice(THINKING_PREFIX.length) : text
+  const latestItemId = thinkingSummary?.items.at(-1)?.id ?? null
 
   return (
     <>
@@ -291,7 +300,22 @@ function RunningAssistantContent({
           <span>.</span>
         </span>
       </p>
-      {detail.trim().length > 0 ? (
+      {thinkingSummary && thinkingSummary.items.length > 0 ? (
+        <div className="running-thinking-steps">
+          {thinkingSummary.items.map((item) => (
+            <ThinkingItemRow
+              key={item.id}
+              item={item}
+              autoOpen={item.id === latestItemId}
+            />
+          ))}
+          {thinkingSummary.omitted > 0 ? (
+            <div className="thinking-more">
+              {thinkingSummary.omitted} more trace steps are available in Trace.
+            </div>
+          ) : null}
+        </div>
+      ) : detail.trim().length > 0 ? (
         <MarkdownMessage
           text={detail}
           projectId={projectId}
@@ -656,21 +680,21 @@ function ThinkingPanel({
   }, [defaultOpen, summary.items.length, visibleItemCount])
 
   return (
-    <section className={open ? 'message-thinking open' : 'message-thinking'}>
+    <section className={open ? 'message-thinking open' : 'message-thinking collapsed'}>
       <button
         type="button"
         className="thinking-toggle"
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
       >
+        <span>
+          {summary.workedFor ? `Worked for ${summary.workedFor}` : 'Thinking'}
+        </span>
         {open ? (
           <ChevronDown size={14} aria-hidden="true" />
         ) : (
           <ChevronRight size={14} aria-hidden="true" />
         )}
-        <span>
-          {summary.workedFor ? `Worked for ${summary.workedFor}` : 'Thinking'}
-        </span>
       </button>
       {open ? (
         <div className="thinking-details">

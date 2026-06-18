@@ -6009,12 +6009,242 @@ pre {
   box-shadow: 0 0 0 1px rgba(47, 140, 255, 0.28);
 }
 
+.config-model-settings {
+  display: grid;
+  gap: 18px;
+}
+
+.config-default-bar {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.7fr) minmax(280px, 1fr);
+  gap: 14px;
+  padding: 0;
+}
+
+.config-default-bar label,
+.config-provider-fields label {
+  min-width: 0;
+}
+
+.config-default-bar span {
+  display: block;
+  margin-bottom: 7px;
+  color: #aeb9c6;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.config-default-bar input,
+.config-default-bar select,
+.config-add-model input {
+  min-height: 44px;
+  border: 1px solid #293544;
+  border-radius: 7px;
+  background: #131a23;
+  color: #edf2f7;
+  padding: 0 14px;
+}
+
+.config-models-layout {
+  display: grid;
+  grid-template-columns: 290px minmax(0, 1fr);
+  gap: 18px;
+  min-height: 520px;
+}
+
+.config-provider-list {
+  border: 1px solid #26313e;
+  border-radius: 8px;
+  background: #101720;
+  overflow: hidden;
+}
+
+.config-provider-list-heading {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  border-bottom: 1px solid #26313e;
+  color: #aeb9c6;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.config-provider-row {
+  width: 100%;
+  min-height: 68px;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  border-bottom: 1px solid #222c38;
+  background: transparent;
+  color: #e7eef7;
+  padding: 10px 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.config-provider-row:hover,
+.config-provider-row.active {
+  background: #151f2b;
+}
+
+.config-provider-row-icon {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #2a3645;
+  border-radius: 6px;
+  color: #7eb0ff;
+}
+
+.config-provider-row-main {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.config-provider-row-main strong,
+.config-provider-editor-heading h4,
+.config-model-main strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.config-provider-row-main small,
+.config-provider-editor-heading p,
+.config-model-main small {
+  overflow: hidden;
+  color: #8290a1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.config-provider-row-status,
+.config-model-reasoning {
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #26384f;
+  border-radius: 999px;
+  background: #12233a;
+  color: #75adff;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.config-provider-editor {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 18px;
+}
+
+.config-provider-editor-heading {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.config-provider-editor-heading h4,
+.config-provider-editor-heading p {
+  margin: 0;
+}
+
+.config-provider-editor-actions,
+.config-model-toolbar,
+.config-add-model {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.config-provider-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 16px;
+}
+
+.config-auth-toggle {
+  min-height: 46px;
+  align-self: end;
+}
+
+.config-models-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.config-model-toolbar {
+  justify-content: space-between;
+}
+
+.config-add-model input {
+  width: min(260px, 100%);
+}
+
+.config-model-table {
+  border: 1px solid #26313e;
+  border-radius: 8px;
+  background: #101720;
+  overflow: hidden;
+}
+
+.config-model-row {
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+  border-bottom: 1px solid #222c38;
+}
+
+.config-model-row:last-child {
+  border-bottom: 0;
+}
+
+.config-default-model {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #2a3645;
+  border-radius: 6px;
+  background: #121923;
+  color: #8d9aad;
+}
+
+.config-default-model.active {
+  border-color: #285793;
+  background: #142c4d;
+  color: #77b3ff;
+}
+
+.config-model-main {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
 @media (max-width: 1060px) {
   .settings-grid,
   .providers-layout,
   .provider-editor,
   .model-config-main,
   .model-subrow,
+  .config-default-bar,
+  .config-models-layout,
+  .config-provider-fields,
   .provider-key-fields,
   .selected-models-row {
     grid-template-columns: 1fr;
@@ -6044,14 +6274,17 @@ pre {
 
   .models-admin-header,
   .provider-key-card-header,
+  .config-provider-editor-heading,
   .model-picker-toolbar,
-  .model-picker-footer {
+  .model-picker-footer,
+  .config-model-toolbar {
     align-items: stretch;
     flex-direction: column;
   }
 
   .provider-key-actions,
   .model-picker-bulk,
+  .config-provider-editor-actions,
   .selected-model-actions {
     justify-content: flex-start;
   }

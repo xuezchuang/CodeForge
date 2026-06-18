@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::history_store::HistoryStore;
 use crate::project_registry::ProjectRegistry;
 use crate::tool_trace::ToolTraceStore;
 use crate::vs_registry::{AppSettings, SettingsStore, VsRegistry};
@@ -12,6 +13,7 @@ pub struct AppState {
     pub settings: Arc<Mutex<SettingsStore>>,
     pub vs_registry: Arc<Mutex<VsRegistry>>,
     pub traces: Arc<Mutex<ToolTraceStore>>,
+    pub history: Arc<Mutex<HistoryStore>>,
 }
 
 impl AppState {
@@ -29,13 +31,16 @@ impl AppState {
                 data_dir.join("projects.json"),
             )?)),
             settings: Arc::new(Mutex::new(SettingsStore::load(
-                default_config_dir().join("settings.json"),
+                default_config_dir().join("config.toml"),
                 data_dir.to_string_lossy().to_string(),
-                Some(data_dir.join("settings.json")),
+                Some(default_config_dir().join("settings.json")),
                 codebuddy_models_path(),
             )?)),
             vs_registry: Arc::new(Mutex::new(VsRegistry::default())),
             traces: Arc::new(Mutex::new(ToolTraceStore::default())),
+            history: Arc::new(Mutex::new(HistoryStore::load(
+                data_dir.join("codeforge.sqlite3"),
+            )?)),
         })
     }
 }

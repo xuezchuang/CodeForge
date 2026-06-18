@@ -22,6 +22,8 @@ const MODEL_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 #[serde(rename_all = "camelCase")]
 pub struct AgentRunInput {
     pub project_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub user_prompt: String,
     pub messages: Option<Vec<AgentConversationMessage>>,
     pub provider_id: Option<String>,
@@ -73,11 +75,25 @@ struct SelectedModel {
 }
 
 impl SelectedModel {
-    fn credential_api_key(&self) -> &str {
-        self.credential
+    fn credential_api_key(&self) -> String {
+        let credential_key = self
+            .credential
             .as_ref()
             .map(|credential| credential.api_key.as_str())
             .unwrap_or("")
+            .trim();
+        if !credential_key.is_empty() {
+            return credential_key.to_string();
+        }
+        let env_key = self.provider.env_key.trim();
+        if env_key.is_empty() {
+            return String::new();
+        }
+        std::env::var(env_key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
     }
 }
 
@@ -325,11 +341,13 @@ pub async fn run_agent(
             cli_mode: input.cli_mode,
             goal: input.goal_slot.as_deref_mut(),
         };
+        let tools = openai_tool_definitions(&selected, &tool_context);
         run_openai_tool_agent_loop(
             &task_id,
             &selected,
             &mut tool_context,
             initial_messages,
+            tools,
             &mut traces,
             &mut step_index,
             DEFAULT_MAX_TOOL_ROUNDS,
@@ -458,6 +476,7 @@ pub async fn run_tool_call_test(
         &selected,
         &mut tool_context,
         initial_messages,
+        tool_registry::tool_call_test_definitions(),
         &mut traces,
         &mut step_index,
         DEFAULT_MAX_TOOL_ROUNDS,
@@ -474,22 +493,13 @@ async fn run_openai_tool_agent_loop(
     selected: &SelectedModel,
     tool_context: &mut ToolExecutionContext<'_>,
     mut messages: Vec<Value>,
+    tools: Vec<Value>,
     traces: &mut Vec<ToolTraceEvent>,
     step_index: &mut u32,
     max_tool_rounds: usize,
     require_tool_call: bool,
     on_trace: &mut impl FnMut(&ToolTraceEvent),
 ) -> Result<(), String> {
-    let tools = if tool_context.cli_mode {
-        tool_registry::cli_tool_definitions(
-            &selected.provider.provider_type,
-            &selected.model_id,
-            tool_context.allow_shell,
-        )
-    } else {
-        tool_registry::tool_definitions()
-    };
-
     for round_index in 0..=max_tool_rounds {
         let request =
             build_chat_completion_request(selected, messages.clone(), Some(tools.clone()));
@@ -802,6 +812,21 @@ async fn run_openai_tool_agent_loop(
     Ok(())
 }
 
+fn openai_tool_definitions(
+    selected: &SelectedModel,
+    tool_context: &ToolExecutionContext<'_>,
+) -> Vec<Value> {
+    if tool_context.cli_mode {
+        tool_registry::cli_tool_definitions(
+            &selected.provider.provider_type,
+            &selected.model_id,
+            tool_context.allow_shell,
+        )
+    } else {
+        tool_registry::tool_definitions()
+    }
+}
+
 fn push_assistant_model_message_trace(
     task_id: &str,
     traces: &mut Vec<ToolTraceEvent>,
@@ -981,7 +1006,7 @@ async fn record_plain_provider_completion(
                         "baseUrl": selected.provider.base_url,
                         "model": selected.model_id,
                         "messages": conversation_messages,
-                        "apiKey": mask_secret(selected.credential_api_key()),
+                        "apiKey": mask_secret(&selected.credential_api_key()),
                     })),
                     &error,
                 ),
@@ -2456,6 +2481,7 @@ fn mask_secret(secret: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::thread;
     use std::time::Duration;
 
@@ -2471,11 +2497,13 @@ mod tests {
         );
 
         assert_eq!(request["tool_choice"], json!("auto"));
-        assert_eq!(array_len(&request, "tools"), 12);
-        assert_eq!(
-            request["tools"][0]["function"]["name"],
-            json!(CALCULATOR_ADD_TOOL_NAME)
-        );
+        let names = request_tool_names(&request);
+        assert!(names.contains(&tool_registry::WORKSPACE_LIST_DIR_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::WORKSPACE_SEARCH_CONTENT_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&CALCULATOR_ADD_TOOL_NAME.to_string()));
     }
 
     #[test]
@@ -2567,16 +2595,22 @@ mod tests {
     }
 
     #[test]
-    fn run_agent_openai_loop_executes_calculator_tool() {
+    fn run_agent_openai_loop_executes_workspace_read_file_tool() {
+        let root = test_workspace();
+        fs::write(root.join("sample.txt"), "alpha\nbeta\n").unwrap();
         let (base_url, server_thread) = start_mock_openai_server(vec![
-            tool_call_response_with_name(CALCULATOR_ADD_TOOL_NAME),
-            final_message_response("The result is 2."),
+            tool_call_response_with_args(
+                tool_registry::WORKSPACE_READ_FILE_TOOL_NAME,
+                json!({ "path": "sample.txt" }),
+            ),
+            final_message_response("Read sample.txt."),
         ]);
-        let project = test_project();
+        let project = test_project_with_root(root.to_str().unwrap());
         let settings = test_settings(&base_url);
         let input = AgentRunInput {
             project_id: project.id.clone(),
-            user_prompt: "请调用 calculator.add 计算 1+1".to_string(),
+            session_id: None,
+            user_prompt: "请读取 sample.txt".to_string(),
             messages: None,
             provider_id: Some("provider".to_string()),
             credential_id: Some("default".to_string()),
@@ -2596,10 +2630,9 @@ mod tests {
 
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["tool_choice"], json!("auto"));
-        assert_eq!(
-            requests[0]["tools"][0]["function"]["name"],
-            json!(CALCULATOR_ADD_TOOL_NAME)
-        );
+        let names = request_tool_names(&requests[0]);
+        assert!(names.contains(&tool_registry::WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&CALCULATOR_ADD_TOOL_NAME.to_string()));
         assert!(requests[1]["messages"]
             .as_array()
             .unwrap()
@@ -2607,21 +2640,28 @@ mod tests {
             .any(|message| {
                 message["role"].as_str() == Some("tool")
                     && message["tool_call_id"].as_str() == Some("call_1")
-                    && message["name"].as_str() == Some(CALCULATOR_ADD_TOOL_NAME)
-                    && message["content"].as_str() == Some("{\"result\":2}")
+                    && message["name"].as_str()
+                        == Some(tool_registry::WORKSPACE_READ_FILE_TOOL_NAME)
+                    && message["content"].as_str().is_some_and(|content| {
+                        content.contains("\"file\":\"sample.txt\"")
+                            && content.contains("\"text\":\"alpha\"")
+                    })
             }));
         assert!(run.traces.iter().any(|event| {
             matches!(&event.event_type, TraceEventType::ToolCall)
-                && event.tool_name.as_deref() == Some(CALCULATOR_ADD_TOOL_NAME)
+                && event.tool_name.as_deref() == Some(tool_registry::WORKSPACE_READ_FILE_TOOL_NAME)
         }));
         assert!(run.traces.iter().any(|event| {
             matches!(&event.event_type, TraceEventType::ToolResult)
-                && event.tool_name.as_deref() == Some(CALCULATOR_ADD_TOOL_NAME)
-                && event.output_summary.as_deref() == Some("result=2")
+                && event.tool_name.as_deref() == Some(tool_registry::WORKSPACE_READ_FILE_TOOL_NAME)
+                && event
+                    .output_summary
+                    .as_deref()
+                    .is_some_and(|summary| summary.contains("sample.txt"))
         }));
         assert!(run.traces.iter().any(|event| {
             event.title == "final_response"
-                && event.output_summary.as_deref() == Some("The result is 2.")
+                && event.output_summary.as_deref() == Some("Read sample.txt.")
         }));
     }
 
@@ -2633,6 +2673,7 @@ mod tests {
         let settings = test_settings(&base_url);
         let input = AgentRunInput {
             project_id: project.id.clone(),
+            session_id: None,
             user_prompt: "hello".to_string(),
             messages: None,
             provider_id: Some("provider".to_string()),
@@ -2707,6 +2748,7 @@ mod tests {
         let settings = test_settings(&base_url);
         let input = AgentRunInput {
             project_id: project.id.clone(),
+            session_id: None,
             user_prompt: "请调用 missing.tool".to_string(),
             messages: None,
             provider_id: Some("provider".to_string()),
@@ -2739,7 +2781,8 @@ mod tests {
                         .is_some_and(|content| content.contains("Unknown tool: missing.tool"))
             }));
         assert!(run.traces.iter().any(|event| {
-            event.title == "tool execution failed"
+            event.title == "tool_result"
+                && matches!(&event.event_type, TraceEventType::Error)
                 && matches!(&event.status, TraceStatus::Failed)
                 && event
                     .output_summary
@@ -2757,6 +2800,11 @@ mod tests {
     }
 
     fn tool_call_response_with_name(tool_name: &str) -> Value {
+        tool_call_response_with_args(tool_name, json!({ "a": 1, "b": 1 }))
+    }
+
+    fn tool_call_response_with_args(tool_name: &str, arguments: Value) -> Value {
+        let arguments = serde_json::to_string(&arguments).unwrap();
         json!({
             "choices": [{
                 "message": {
@@ -2767,13 +2815,24 @@ mod tests {
                         "type": "function",
                         "function": {
                             "name": tool_name,
-                            "arguments": "{\"a\":1,\"b\":1}"
+                            "arguments": arguments
                         }
                     }]
                 },
                 "finish_reason": "tool_calls"
             }]
         })
+    }
+
+    fn request_tool_names(request: &Value) -> Vec<String> {
+        request
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool.get("function")?.get("name")?.as_str())
+            .map(str::to_string)
+            .collect()
     }
 
     fn final_message_response(message: &str) -> Value {
@@ -2797,18 +2856,31 @@ mod tests {
                 base_url: "https://example.test/v1".to_string(),
                 base_url_locked: false,
                 api_key: String::new(),
+                is_default: true,
                 default_credential_id: "default".to_string(),
                 default_model: "test-model".to_string(),
                 enabled: true,
-                supports_tool_call: Some(false),
+                supports_tool_call: Some(true),
                 credentials: vec![ProviderCredential {
                     id: "default".to_string(),
                     name: "Default Key".to_string(),
                     enabled: true,
                     api_key: "test-key".to_string(),
                 }],
-                models: Vec::new(),
+                models: vec![ProviderModel {
+                    id: "test-model".to_string(),
+                    name: "test-model".to_string(),
+                    enabled: true,
+                    credential_id: String::new(),
+                    reasoning_mode: String::new(),
+                    default_reasoning: String::new(),
+                    owned_by: None,
+                    created: None,
+                }],
                 temperature: 0.0,
+                env_key: String::new(),
+                wire_api: "responses".to_string(),
+                requires_openai_auth: false,
             },
             credential: Some(ProviderCredential {
                 id: "default".to_string(),
@@ -2823,11 +2895,15 @@ mod tests {
     }
 
     fn test_project() -> ProjectSession {
+        test_project_with_root("D:\\code\\snowAgents")
+    }
+
+    fn test_project_with_root(repo_root: &str) -> ProjectSession {
         ProjectSession {
             id: "project".to_string(),
             name: "Project".to_string(),
-            repo_root: "D:\\code\\snowAgents".to_string(),
-            solution_path: Some("D:\\code\\snowAgents\\Project.sln".to_string()),
+            repo_root: repo_root.to_string(),
+            solution_path: Some(format!("{repo_root}\\Project.sln")),
             uproject_path: None,
             build_command: None,
             vs_process_id: None,
@@ -2835,6 +2911,13 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    fn test_workspace() -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("codeforge-agent-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 
     fn test_settings(base_url: &str) -> AppSettings {

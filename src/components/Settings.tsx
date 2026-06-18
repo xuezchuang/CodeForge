@@ -144,7 +144,11 @@ function SettingsForm({
             onChange={setUiPreferences}
           />
         </div>
-        <ProviderSettings providers={providers} onProvidersChanged={onProvidersChanged} />
+        <ProviderSettings
+          configPath={settings.configPath}
+          providers={providers}
+          onProvidersChanged={onProvidersChanged}
+        />
       </div>
     </section>
   )

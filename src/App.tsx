@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
 import './App.css'
-import { getSettings, listProjects } from './api/tauriApi'
+import {
+  getSettings,
+  importWorkspaceHistory,
+  listProjects,
+  loadWorkspaceHistory,
+  saveWorkspaceHistory,
+} from './api/tauriApi'
 import Profile from './components/Profile'
 import ProjectList from './components/ProjectList'
 import Settings from './components/Settings'
@@ -10,21 +16,22 @@ import type { ToastState } from './components/Toast'
 import Workspace from './components/Workspace'
 import {
   ensureWorkspaceProject,
+  clearLegacyWorkspaceHistoryState,
+  createWorkspaceHistorySnapshot,
+  hasWorkspaceHistory,
   initialAppState,
   latestTaskIdForProject,
-  loadPersistedWorkspaceState,
+  loadLegacyWorkspaceHistoryState,
+  normalizeWorkspaceHistoryState,
   normalizeSettings,
-  persistWorkspaceState,
 } from './state/appState'
 import type { AppState, View } from './state/appState'
 import type { AgentTask } from './types/task'
 
 function App() {
   const [view, setView] = useState<View>('projects')
-  const [appState, setAppState] = useState<AppState>(() => ({
-    ...initialAppState,
-    ...loadPersistedWorkspaceState(),
-  }))
+  const [appState, setAppState] = useState<AppState>(initialAppState)
+  const [historyLoaded, setHistoryLoaded] = useState(false)
   const [toast, setToast] = useState<ToastState | null>(null)
   const visualStyle = appState.settings?.uiPreferences.visualStyle ?? 'codex'
   const historyDays = appState.settings?.uiPreferences.workspaceHistoryDays ?? 7
@@ -76,20 +83,29 @@ function App() {
 
     const load = async () => {
       try {
-        const [nextProjects, rawSettings] = await Promise.all([
+        const legacyHistory = loadLegacyWorkspaceHistoryState()
+        if (hasWorkspaceHistory(legacyHistory)) {
+          await importWorkspaceHistory(legacyHistory)
+          clearLegacyWorkspaceHistoryState()
+        }
+        const [nextProjects, rawSettings, rawHistory] = await Promise.all([
           listProjects(),
           getSettings(),
+          loadWorkspaceHistory(),
         ])
         if (cancelled) {
           return
         }
         const settings = normalizeSettings(rawSettings)
+        const history = normalizeWorkspaceHistoryState(rawHistory)
         setAppState((current) => ({
           ...current,
+          ...history,
           projects: nextProjects,
           settings,
           providers: settings.providers,
         }))
+        setHistoryLoaded(true)
       } catch (caught) {
         if (!cancelled) {
           showToast('error', toMessage(caught))
@@ -105,8 +121,26 @@ function App() {
   }, [showToast])
 
   useEffect(() => {
-    persistWorkspaceState(appState)
-  }, [appState])
+    if (!historyLoaded) {
+      return undefined
+    }
+    const timeoutId = window.setTimeout(() => {
+      const snapshot = createWorkspaceHistorySnapshot(appState)
+      void saveWorkspaceHistory(snapshot).catch((caught) => {
+        showToast('error', toMessage(caught))
+      })
+    }, 250)
+    return () => {
+      window.clearTimeout(timeoutId)
+    }
+  }, [
+    appState.activeProjectId,
+    appState.currentWorkspaceTaskId,
+    appState.taskIdsByProjectId,
+    appState.tasksById,
+    historyLoaded,
+    showToast,
+  ])
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {

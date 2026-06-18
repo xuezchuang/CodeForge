@@ -16,6 +16,7 @@ export interface ProviderConfig {
   type: ProviderType
   name: string
   enabled: boolean
+  isDefault?: boolean
   baseUrl: string
   baseUrlLocked: boolean
   supportsToolCall?: boolean | null
@@ -23,6 +24,9 @@ export interface ProviderConfig {
   defaultCredentialId: string
   defaultModel: string
   temperature: number
+  envKey?: string
+  wireApi?: 'responses' | string
+  requiresOpenAiAuth?: boolean
   credentials: ProviderCredential[]
   models: ProviderModel[]
 }

@@ -3,6 +3,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::agent_runner::{self, AgentRunInput};
 use crate::app_state::{current_settings, lock_error, AppState};
 use crate::code_link::{self, OpenCodeLinkResult, OpenFilePayload};
+use crate::history_store::WorkspaceHistoryState;
 use crate::process_manager;
 use crate::project_registry::{ProjectInput, ProjectSession};
 use crate::tool_registry;
@@ -140,6 +141,30 @@ pub fn list_tools() -> Result<Vec<ToolDefinitionSummary>, String> {
 }
 
 #[tauri::command]
+pub fn load_workspace_history(state: State<'_, AppState>) -> Result<WorkspaceHistoryState, String> {
+    let history = state.history.lock().map_err(|_| lock_error())?;
+    history.load_workspace_history()
+}
+
+#[tauri::command]
+pub fn save_workspace_history(
+    state: State<'_, AppState>,
+    history_state: WorkspaceHistoryState,
+) -> Result<(), String> {
+    let mut history = state.history.lock().map_err(|_| lock_error())?;
+    history.save_workspace_history(&history_state, false)
+}
+
+#[tauri::command]
+pub fn import_workspace_history(
+    state: State<'_, AppState>,
+    history_state: WorkspaceHistoryState,
+) -> Result<(), String> {
+    let mut history = state.history.lock().map_err(|_| lock_error())?;
+    history.save_workspace_history(&history_state, true)
+}
+
+#[tauri::command]
 pub fn run_mock_agent(
     state: State<'_, AppState>,
     project_id: String,
@@ -153,6 +178,10 @@ pub fn run_mock_agent(
     let run = tool_trace::create_mock_agent_run(&project, &user_prompt);
     let mut traces = state.traces.lock().map_err(|_| lock_error())?;
     traces.insert_task(run.task_id.clone(), run.traces.clone());
+    let mut history = state.history.lock().map_err(|_| lock_error())?;
+    for event in &run.traces {
+        history.insert_trace_event(&run.task_id, event)?;
+    }
     Ok(run)
 }
 
@@ -180,16 +209,25 @@ pub async fn run_agent(
         current_settings(&settings_store)
     };
     let trace_state = state.inner().clone();
+    let session_id = input.session_id.clone();
+    let provider_id = input.provider_id.clone();
+    let model_id = input.model_id.clone();
 
     let run = agent_runner::run_agent(&project, &settings, input, move |event| {
         if let Ok(mut traces) = trace_state.traces.lock() {
             traces.append_event(&event.task_id, event.clone());
+        }
+        if let Ok(mut history) = trace_state.history.lock() {
+            let session_id = session_id.as_deref().unwrap_or(event.task_id.as_str());
+            let _ = history.insert_trace_event(session_id, event);
         }
         let _ = app_handle.emit("agent_trace_event", event.clone());
     })
     .await?;
     let mut traces = state.traces.lock().map_err(|_| lock_error())?;
     traces.insert_task(run.task_id.clone(), run.traces.clone());
+    let mut history = state.history.lock().map_err(|_| lock_error())?;
+    history.update_agent_run_metadata(&run.task_id, provider_id.as_deref(), model_id.as_deref())?;
     Ok(run)
 }
 
@@ -208,6 +246,8 @@ pub async fn run_tool_call_test(
         current_settings(&settings_store)
     };
     let trace_state = state.inner().clone();
+    let provider_id = input.provider_id.clone();
+    let model_id = input.model_id.clone();
 
     let run = agent_runner::run_tool_call_test(
         &project,
@@ -219,6 +259,9 @@ pub async fn run_tool_call_test(
             if let Ok(mut traces) = trace_state.traces.lock() {
                 traces.append_event(&event.task_id, event.clone());
             }
+            if let Ok(mut history) = trace_state.history.lock() {
+                let _ = history.insert_trace_event(&event.task_id, event);
+            }
             let _ = app_handle.emit("agent_trace_event", event.clone());
         },
     )
@@ -226,6 +269,8 @@ pub async fn run_tool_call_test(
 
     let mut traces = state.traces.lock().map_err(|_| lock_error())?;
     traces.insert_task(run.task_id.clone(), run.traces.clone());
+    let mut history = state.history.lock().map_err(|_| lock_error())?;
+    history.update_agent_run_metadata(&run.task_id, provider_id.as_deref(), model_id.as_deref())?;
     Ok(run)
 }
 
@@ -234,8 +279,15 @@ pub fn list_traces(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<Vec<ToolTraceEvent>, String> {
-    let traces = state.traces.lock().map_err(|_| lock_error())?;
-    Ok(traces.list(&task_id))
+    let in_memory = {
+        let traces = state.traces.lock().map_err(|_| lock_error())?;
+        traces.list(&task_id)
+    };
+    if !in_memory.is_empty() {
+        return Ok(in_memory);
+    }
+    let history = state.history.lock().map_err(|_| lock_error())?;
+    history.list_trace_events(&task_id)
 }
 
 #[tauri::command]

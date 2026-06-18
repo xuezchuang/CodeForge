@@ -1,20 +1,14 @@
 import {
-  AudioWaveform,
-  Bot,
   Check,
-  ChevronDown,
   Eye,
   EyeOff,
-  ListChecks,
-  Pencil,
   Plus,
-  RefreshCw,
   Search,
+  Server,
+  Star,
   Trash2,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
-import { fetchMiniMaxModels, fetchOpenAiCompatibleModels } from '../api/tauriApi'
-import { defaultProviders } from '../state/appState'
+import { useEffect, useMemo, useState } from 'react'
 import type {
   ModelDefaultReasoning,
   ModelReasoningMode,
@@ -22,976 +16,551 @@ import type {
   ProviderCredential,
   ProviderModel,
 } from '../types/provider'
-import { minimaxOpenAiBaseUrl, providerTypeLabels } from '../types/provider'
 
 interface ProviderSettingsProps {
+  configPath: string
   providers: ProviderConfig[]
   onProvidersChanged: (providers: ProviderConfig[]) => void
 }
 
-type FetchStatus = 'not-fetched' | 'fetched' | 'error'
-
-interface FetchState {
-  status: FetchStatus
-  message?: string
-}
-
-interface PickerState {
-  providerId: string
-  credentialId: string
-  draftModelIds: string[]
-  search: string
-}
-
-interface ProviderKeyCard {
-  id: string
-  provider: ProviderConfig
-  credential: ProviderCredential
-  selectedCount: number
-  fetchState: FetchState
-}
-
-interface SelectedModelRow {
-  key: string
-  provider: ProviderConfig
-  credential: ProviderCredential | null
-  credentialId: string
-  model: ProviderModel
-}
-
-function ProviderSettings({ providers, onProvidersChanged }: ProviderSettingsProps) {
-  const [fetchStateByCardId, setFetchStateByCardId] = useState<Record<string, FetchState>>({})
-  const [modelCatalogs, setModelCatalogs] = useState<Record<string, ProviderModel[]>>({})
-  const [keyVisibleByCardId, setKeyVisibleByCardId] = useState<Record<string, boolean>>({})
-  const [keyEditingByCardId, setKeyEditingByCardId] = useState<Record<string, boolean>>({})
-  const [picker, setPicker] = useState<PickerState | null>(null)
-  const [selectedModelSearch, setSelectedModelSearch] = useState('')
-  const [editingModelKey, setEditingModelKey] = useState<string | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
-
-  const providerKeyCards = useMemo(
-    () => buildProviderKeyCards(providers, fetchStateByCardId),
-    [providers, fetchStateByCardId],
+function ProviderSettings({
+  configPath,
+  providers,
+  onProvidersChanged,
+}: ProviderSettingsProps) {
+  const [selectedProviderId, setSelectedProviderId] = useState(
+    () => defaultProvider(providers)?.id ?? providers[0]?.id ?? '',
   )
-  const selectedRows = useMemo(() => buildSelectedModelRows(providers), [providers])
-  const filteredSelectedRows = useMemo(
-    () => filterSelectedRows(selectedRows, selectedModelSearch),
-    [selectedRows, selectedModelSearch],
+  const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({})
+  const [modelSearch, setModelSearch] = useState('')
+  const [newModelId, setNewModelId] = useState('')
+
+  const selectedProvider =
+    providers.find((provider) => provider.id === selectedProviderId) ??
+    defaultProvider(providers) ??
+    providers[0] ??
+    null
+  const activeDefaultProvider = defaultProvider(providers)
+  const filteredModels = useMemo(
+    () => filterModels(selectedProvider?.models ?? [], modelSearch),
+    [selectedProvider?.models, modelSearch],
   )
 
-  const addProviderKey = () => {
-    const provider = providers.find((item) => item.id === 'minimax') ?? providers[0]
-    if (!provider) {
+  useEffect(() => {
+    if (selectedProviderId && providers.some((provider) => provider.id === selectedProviderId)) {
       return
     }
-    const credential = createCredential(provider)
-    setNotice(null)
-    setKeyEditingByCardId((current) => ({
-      ...current,
-      [cardId(provider.id, credential.id)]: true,
-    }))
-    updateProvider(provider.id, (current) =>
-      finalizeProvider({
-        ...current,
-        credentials: [...(current.credentials ?? []), credential],
-        defaultCredentialId: current.defaultCredentialId || credential.id,
-      }),
-    )
+    setSelectedProviderId(defaultProvider(providers)?.id ?? providers[0]?.id ?? '')
+  }, [providers, selectedProviderId])
+
+  const emit = (nextProviders: ProviderConfig[]) => {
+    onProvidersChanged(ensureOneDefault(nextProviders.map(finalizeProvider)))
+  }
+
+  const addProvider = () => {
+    const provider = createProvider(providers)
+    setSelectedProviderId(provider.id)
+    emit([...providers, provider])
+  }
+
+  const removeProvider = (providerId: string) => {
+    const nextProviders = providers.filter((provider) => provider.id !== providerId)
+    setSelectedProviderId(nextProviders[0]?.id ?? '')
+    emit(nextProviders)
   }
 
   const updateProvider = (
     providerId: string,
     updater: (provider: ProviderConfig) => ProviderConfig,
   ) => {
-    onProvidersChanged(
-      providers.map((provider) =>
-        provider.id === providerId ? finalizeProvider(updater(provider)) : provider,
-      ),
+    emit(providers.map((provider) => (provider.id === providerId ? updater(provider) : provider)))
+  }
+
+  const setDefaultProvider = (providerId: string) => {
+    emit(
+      providers.map((provider) => ({
+        ...provider,
+        enabled: true,
+        isDefault: provider.id === providerId,
+      })),
     )
   }
 
-  const updateCredential = (
-    providerId: string,
-    credentialId: string,
-    patch: Partial<ProviderCredential>,
-  ) => {
-    setNotice(null)
+  const setBearerToken = (providerId: string, apiKey: string) => {
     updateProvider(providerId, (provider) => ({
       ...provider,
-      credentials: (provider.credentials ?? []).map((credential) =>
-        credential.id === credentialId ? { ...credential, ...patch } : credential,
-      ),
+      credentials: apiKey.trim().length > 0 ? [bearerCredential(apiKey)] : [],
+      defaultCredentialId: apiKey.trim().length > 0 ? 'default' : '',
     }))
   }
 
-  const changeCredentialProvider = (
-    provider: ProviderConfig,
-    credential: ProviderCredential,
-    nextProviderId: string,
-  ) => {
-    if (provider.id === nextProviderId) {
+  const addModel = () => {
+    const modelId = newModelId.trim()
+    if (!selectedProvider || !modelId) {
       return
     }
-    const nextProvider = providers.find((item) => item.id === nextProviderId)
-    if (!nextProvider) {
-      return
-    }
-
-    const movedCredential = {
-      ...credential,
-      id: uniqueCredentialId(nextProvider.credentials ?? []),
-    }
-    const movedModels = (provider.models ?? [])
-      .filter((model) => modelBelongsToCredential(provider, model, credential.id))
-      .map((model) => ({ ...model, credentialId: movedCredential.id }))
-
-    setPicker(null)
-    setNotice(null)
-    onProvidersChanged(
-      providers.map((item) => {
-        if (item.id === provider.id) {
-          return finalizeProvider({
-            ...item,
-            credentials: (item.credentials ?? []).filter(
-              (current) => current.id !== credential.id,
-            ),
-            models: (item.models ?? []).filter(
-              (model) => !modelBelongsToCredential(item, model, credential.id),
-            ),
-          })
-        }
-        if (item.id === nextProvider.id) {
-          return finalizeProvider({
-            ...item,
-            credentials: [...(item.credentials ?? []), movedCredential],
-            defaultCredentialId: item.defaultCredentialId || movedCredential.id,
-            models: [...(item.models ?? []), ...movedModels],
-          })
-        }
-        return item
-      }),
-    )
-  }
-
-  const removeProviderKey = (provider: ProviderConfig, credential: ProviderCredential) => {
-    setPicker(null)
-    setNotice(null)
-    updateProvider(provider.id, (current) => ({
-      ...current,
-      credentials: (current.credentials ?? []).filter((item) => item.id !== credential.id),
-      models: (current.models ?? []).filter(
-        (model) => !modelBelongsToCredential(current, model, credential.id),
-      ),
-      defaultCredentialId:
-        current.defaultCredentialId === credential.id ? '' : current.defaultCredentialId,
-    }))
-  }
-
-  const fetchModels = async (card: ProviderKeyCard) => {
-    if (!card.credential.apiKey.trim()) {
-      setFetchStateByCardId((current) => ({
-        ...current,
-        [card.id]: { status: 'error', message: 'API key is required.' },
-      }))
-      return
-    }
-    if (!isMiniMax(card.provider) && !card.provider.baseUrl.trim()) {
-      setFetchStateByCardId((current) => ({
-        ...current,
-        [card.id]: { status: 'error', message: 'Base URL is required.' },
-      }))
-      return
-    }
-
-    try {
-      setFetchStateByCardId((current) => ({
-        ...current,
-        [card.id]: { status: 'not-fetched', message: 'Fetching...' },
-      }))
-      const fetchedModels = isMiniMax(card.provider)
-        ? await fetchMiniMaxModels(card.credential.apiKey)
-        : await fetchOpenAiCompatibleModels(card.provider.baseUrl, card.credential.apiKey)
-      setModelCatalogs((current) => ({ ...current, [card.id]: fetchedModels }))
-      setFetchStateByCardId((current) => ({
-        ...current,
-        [card.id]: { status: 'fetched' },
-      }))
-    } catch (caught) {
-      setFetchStateByCardId((current) => ({
-        ...current,
-        [card.id]: {
-          status: 'error',
-          message: caught instanceof Error ? caught.message : String(caught),
-        },
-      }))
-    }
-  }
-
-  const openPicker = (card: ProviderKeyCard) => {
-    setNotice(null)
-    setPicker({
-      providerId: card.provider.id,
-      credentialId: card.credential.id,
-      draftModelIds: selectedModelIdsForCredential(card.provider, card.credential.id),
-      search: '',
-    })
-  }
-
-  const togglePickerModel = (modelId: string) => {
-    setPicker((current) => {
-      if (!current) {
-        return current
-      }
-      const selected = current.draftModelIds.includes(modelId)
-      return {
-        ...current,
-        draftModelIds: selected
-          ? current.draftModelIds.filter((id) => id !== modelId)
-          : [...current.draftModelIds, modelId],
-      }
-    })
-  }
-
-  const applyPicker = (card: ProviderKeyCard) => {
-    if (!picker) {
-      return
-    }
-    const options = modelOptionsForCard(card.provider, card.credential, modelCatalogs[card.id])
-    updateProvider(card.provider.id, (provider) =>
-      applySelectedModels(provider, card.credential.id, options, picker.draftModelIds),
-    )
-    setPicker(null)
-  }
-
-  const removeSelectedModel = (row: SelectedModelRow) => {
-    updateProvider(row.provider.id, (provider) => ({
+    updateProvider(selectedProvider.id, (provider) => ({
       ...provider,
-      models: (provider.models ?? []).filter(
-        (model) =>
-          !(
-            model.id === row.model.id &&
-            modelCredentialId(provider, model) === row.credentialId
-          ),
-      ),
+      defaultModel: modelId,
+      models: upsertModel(provider.models ?? [], modelId),
     }))
-  }
-
-  const updateSelectedModel = (
-    row: SelectedModelRow,
-    patch: Partial<ProviderModel>,
-  ) => {
-    updateProvider(row.provider.id, (provider) => ({
-      ...provider,
-      models: (provider.models ?? []).map((model) =>
-        model.id === row.model.id && modelCredentialId(provider, model) === row.credentialId
-          ? { ...model, ...patch, credentialId: row.credentialId }
-          : model,
-      ),
-    }))
+    setNewModelId('')
   }
 
   return (
-    <section className="settings-card model-settings-card">
+    <section className="settings-card model-settings-card config-model-settings">
       <div className="models-admin-header">
         <div>
           <h3>Models</h3>
-          <p>Manage providers, API keys and selectable models for agents.</p>
+          <p>{configPath}</p>
         </div>
-        <button type="button" className="primary-button" onClick={addProviderKey}>
+        <button type="button" className="primary-button" onClick={addProvider}>
           <Plus size={16} aria-hidden="true" />
-          Add Provider Key
+          Add Provider
         </button>
       </div>
 
-      <div className="models-section">
-        <div className="models-section-heading">
-          <h4>Provider Keys</h4>
-        </div>
-        {providerKeyCards.length === 0 ? (
-          <div className="empty-state model-empty-state">No provider keys configured.</div>
-        ) : (
-          <div className="provider-key-grid">
-            {providerKeyCards.map((card) => {
-              const keyVisible = keyVisibleByCardId[card.id] === true
-              const keyEditing = keyEditingByCardId[card.id] === true
-              const cardPicker =
-                picker?.providerId === card.provider.id &&
-                picker.credentialId === card.credential.id
-                  ? picker
-                  : null
-              const modelOptions = modelOptionsForCard(
-                card.provider,
-                card.credential,
-                modelCatalogs[card.id],
-              )
-              const pickerOptions = filterModelOptions(modelOptions, cardPicker?.search ?? '')
-
-              return (
-                <div className="provider-key-card" key={card.id}>
-                  <div className="provider-key-card-header">
-                    <div className="provider-key-identity">
-                      <span className={providerBrandClass(card.provider)} aria-hidden="true">
-                        {isMiniMax(card.provider) ? (
-                          <AudioWaveform size={22} />
-                        ) : (
-                          <Bot size={22} />
-                        )}
-                      </span>
-                      <div className="provider-key-title">
-                        <strong>{card.provider.name}</strong>
-                        <div className="provider-key-badges">
-                          <span className={statusBadgeClass(card.fetchState.status)}>
-                            {statusLabel(card.fetchState.status)}
-                          </span>
-                          <span className="model-count-badge">
-                            {card.selectedCount} models selected
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="provider-key-actions">
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={() => void fetchModels(card)}
-                      >
-                        <RefreshCw size={15} aria-hidden="true" />
-                        Fetch Models
-                      </button>
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={() =>
-                          setKeyEditingByCardId((current) => ({
-                            ...current,
-                            [card.id]: !current[card.id],
-                          }))
-                        }
-                      >
-                        {keyEditing ? (
-                          <Check size={15} aria-hidden="true" />
-                        ) : (
-                          <Pencil size={15} aria-hidden="true" />
-                        )}
-                        {keyEditing ? 'Done' : 'Edit Key'}
-                      </button>
-                      <button
-                        type="button"
-                        className="icon-button provider-key-delete"
-                        onClick={() => removeProviderKey(card.provider, card.credential)}
-                        aria-label={`Delete ${credentialAlias(card.credential)}`}
-                        title={`Delete ${credentialAlias(card.credential)}`}
-                      >
-                        <Trash2 size={16} aria-hidden="true" />
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="provider-key-fields">
-                    <label className="provider-key-field">
-                      <span>Key Alias</span>
-                      <input
-                        value={card.credential.name}
-                        onChange={(event) =>
-                          updateCredential(card.provider.id, card.credential.id, {
-                            name: event.target.value,
-                          })
-                        }
-                        placeholder="minimax-main"
-                      />
-                    </label>
-                    <label className="provider-key-field">
-                      <span>API Key</span>
-                      <div className="provider-key-secret">
-                        <input
-                          type={keyVisible || keyEditing ? 'text' : 'password'}
-                          value={
-                            keyVisible || keyEditing
-                              ? card.credential.apiKey
-                              : maskApiKey(card.credential.apiKey)
-                          }
-                          readOnly={!keyEditing}
-                          onChange={(event) =>
-                            updateCredential(card.provider.id, card.credential.id, {
-                              apiKey: event.target.value,
-                            })
-                          }
-                          placeholder="empty"
-                        />
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          onClick={() =>
-                            setKeyVisibleByCardId((current) => ({
-                              ...current,
-                              [card.id]: !current[card.id],
-                            }))
-                          }
-                        >
-                          {keyVisible ? (
-                            <EyeOff size={15} aria-hidden="true" />
-                          ) : (
-                            <Eye size={15} aria-hidden="true" />
-                          )}
-                          {keyVisible ? 'Hide' : 'Show'}
-                        </button>
-                      </div>
-                    </label>
-                    <label className="provider-key-field">
-                      <span>Base URL</span>
-                      <input
-                        value={card.provider.baseUrl}
-                        readOnly={card.provider.baseUrlLocked}
-                        onChange={(event) =>
-                          updateProvider(card.provider.id, (provider) => ({
-                            ...provider,
-                            baseUrl: event.target.value,
-                          }))
-                        }
-                        placeholder="http://127.0.0.1:8080/v1"
-                      />
-                    </label>
-                    <label className="provider-key-field">
-                      <span>Provider</span>
-                      <select
-                        value={card.provider.id}
-                        onChange={(event) =>
-                          changeCredentialProvider(
-                            card.provider,
-                            card.credential,
-                            event.target.value,
-                          )
-                        }
-                      >
-                        {providers.filter(providerUsesCredentials).map((provider) => (
-                          <option key={provider.id} value={provider.id}>
-                            {providerTypeLabels[provider.type] ?? provider.name}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  </div>
-
-                  {card.fetchState.message ? (
-                    <div className="provider-key-message">{card.fetchState.message}</div>
-                  ) : null}
-
-                  <div className="provider-key-footer">
-                    <button
-                      type="button"
-                      className="secondary-button model-selector-button"
-                      onClick={() => openPicker(card)}
-                      aria-expanded={cardPicker ? 'true' : 'false'}
-                    >
-                      <ListChecks size={16} aria-hidden="true" />
-                      Select Models
-                      <ChevronDown size={14} aria-hidden="true" />
-                    </button>
-                  </div>
-
-                  {cardPicker ? (
-                    <div className="model-picker-popover">
-                      <div className="model-picker-panel">
-                        <div className="model-picker-toolbar">
-                          <div className="model-picker-search">
-                            <Search size={15} aria-hidden="true" />
-                            <input
-                              value={cardPicker.search}
-                              onChange={(event) =>
-                                setPicker({ ...cardPicker, search: event.target.value })
-                              }
-                              placeholder="Search models..."
-                            />
-                          </div>
-                          <div className="model-picker-bulk">
-                            <button
-                              type="button"
-                              className="ghost-button"
-                              onClick={() =>
-                                setPicker({
-                                  ...cardPicker,
-                                  draftModelIds: modelOptions.map((model) => model.id),
-                                })
-                              }
-                            >
-                              Select all
-                            </button>
-                            <button
-                              type="button"
-                              className="ghost-button"
-                              onClick={() => setPicker({ ...cardPicker, draftModelIds: [] })}
-                            >
-                              Clear
-                            </button>
-                          </div>
-                        </div>
-
-                        <div className="model-picker-list">
-                          {pickerOptions.length === 0 ? (
-                            <div className="empty-state model-choice-empty">No models found.</div>
-                          ) : (
-                            pickerOptions.map((model) => {
-                              const selected = cardPicker.draftModelIds.includes(model.id)
-                              return (
-                                <label className="model-picker-option" key={model.id}>
-                                  <input
-                                    type="checkbox"
-                                    checked={selected}
-                                    onChange={() => togglePickerModel(model.id)}
-                                  />
-                                  <span className="model-picker-option-main">
-                                    <strong>{model.id}</strong>
-                                  </span>
-                                  <span className="model-picker-tags">
-                                    {selected ? <span className="selected">selected</span> : null}
-                                    {modelTags(model.id).map((tag) => (
-                                      <span className={tag} key={tag}>
-                                        {tag}
-                                      </span>
-                                    ))}
-                                  </span>
-                                </label>
-                              )
-                            })
-                          )}
-                        </div>
-
-                        <div className="model-picker-footer">
-                          <button
-                            type="button"
-                            className="secondary-button"
-                            onClick={() => setPicker(null)}
-                          >
-                            Cancel
-                          </button>
-                          <button
-                            type="button"
-                            className="primary-button"
-                            onClick={() => applyPicker(card)}
-                          >
-                            Apply selected models
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              )
-            })}
-          </div>
-        )}
+      <div className="config-default-bar">
+        <label>
+          <span>Default Provider</span>
+          <select
+            value={activeDefaultProvider?.id ?? ''}
+            onChange={(event) => setDefaultProvider(event.target.value)}
+          >
+            {providers.map((provider) => (
+              <option key={provider.id} value={provider.id}>
+                {provider.name || provider.id}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Default Model</span>
+          <input
+            value={activeDefaultProvider?.defaultModel ?? ''}
+            onChange={(event) => {
+              if (activeDefaultProvider) {
+                updateProvider(activeDefaultProvider.id, (provider) => ({
+                  ...provider,
+                  defaultModel: event.target.value,
+                  models: upsertModel(provider.models ?? [], event.target.value),
+                }))
+              }
+            }}
+            placeholder="model id"
+          />
+        </label>
       </div>
 
-      <div className="models-section selected-models-section">
-        <div className="models-section-heading">
-          <h4>Selected Models</h4>
-          <span>{selectedRows.length}</span>
-        </div>
-        <div className="selected-models-toolbar">
-          <div className="model-picker-search">
-            <Search size={15} aria-hidden="true" />
-            <input
-              value={selectedModelSearch}
-              onChange={(event) => setSelectedModelSearch(event.target.value)}
-              placeholder="Search selected models..."
-            />
-          </div>
-        </div>
-
-        {filteredSelectedRows.length === 0 ? (
-          <div className="empty-state model-empty-state">No selected models.</div>
-        ) : (
-          <div className="selected-models-table">
-            <div className="selected-models-row selected-models-head">
-              <span>Model</span>
-              <span>Reasoning</span>
-              <span>Status</span>
-              <span>Actions</span>
+      {providers.length === 0 ? (
+        <div className="empty-state model-empty-state">No model providers in config.toml.</div>
+      ) : (
+        <div className="config-models-layout">
+          <aside className="config-provider-list">
+            <div className="config-provider-list-heading">
+              <span>Providers</span>
+              <span>{providers.length}</span>
             </div>
-            {filteredSelectedRows.map((row) => {
-              const editing = editingModelKey === row.key
-              const reasoningMode = modelReasoningMode(row.model)
-              return (
-                <div className="selected-models-row" key={row.key}>
-                  <span className="selected-model-display">
-                    {editing ? (
-                      <input
-                        value={row.model.name || row.model.id}
-                        onChange={(event) =>
-                          updateSelectedModel(row, { name: event.target.value })
-                        }
-                      />
-                    ) : (
-                      row.model.name || row.model.id
-                    )}
-                  </span>
-                  <span className="selected-model-reasoning">
-                    <select
-                      value={reasoningMode}
-                      onChange={(event) => {
-                        const nextMode = event.target.value as ModelReasoningMode
-                        updateSelectedModel(row, {
-                          reasoningMode: nextMode,
-                          defaultReasoning: defaultReasoningForMode(
-                            nextMode,
-                            row.model.defaultReasoning,
-                          ),
-                        })
-                      }}
-                    >
-                      <option value="none">None</option>
-                      <option value="toggle">Off / On</option>
-                      <option value="effort">Effort</option>
-                    </select>
-                    {reasoningMode === 'toggle' ? (
-                      <select
-                        value={modelDefaultReasoning(row.model, reasoningMode)}
-                        onChange={(event) =>
-                          updateSelectedModel(row, {
-                            defaultReasoning: event.target.value as ModelDefaultReasoning,
-                          })
-                        }
-                      >
-                        <option value="off">Off</option>
-                        <option value="on">On</option>
-                      </select>
-                    ) : null}
-                    {reasoningMode === 'effort' ? (
-                      <select
-                        value={modelDefaultReasoning(row.model, reasoningMode)}
-                        onChange={(event) =>
-                          updateSelectedModel(row, {
-                            defaultReasoning: event.target.value as ModelDefaultReasoning,
-                          })
-                        }
-                      >
-                        <option value="minimal">Minimal</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                      </select>
-                    ) : null}
-                  </span>
-                  <label className="selected-model-switch">
-                    <input
-                      type="checkbox"
-                      checked={row.model.enabled}
-                      onChange={(event) =>
-                        updateSelectedModel(row, { enabled: event.target.checked })
-                      }
-                      aria-label={
-                        row.model.enabled ?
-                          `${row.model.name || row.model.id} enabled`
-                        : `${row.model.name || row.model.id} disabled`
-                      }
-                    />
-                  </label>
-                  <span className="selected-model-actions">
-                    <button
-                      type="button"
-                      className="ghost-button"
-                      onClick={() => setEditingModelKey(editing ? null : row.key)}
-                    >
-                      {editing ? (
-                        <Check size={15} aria-hidden="true" />
-                      ) : (
-                        <Pencil size={15} aria-hidden="true" />
-                      )}
-                      {editing ? 'Done' : 'Edit'}
-                    </button>
-                    <button
-                      type="button"
-                      className="ghost-button danger-text-button"
-                      onClick={() => removeSelectedModel(row)}
-                    >
-                      <Trash2 size={15} aria-hidden="true" />
-                      Remove
-                    </button>
-                  </span>
-                </div>
-              )
-            })}
-          </div>
-        )}
-      </div>
+            {providers.map((provider) => (
+              <button
+                type="button"
+                className={
+                  provider.id === selectedProvider?.id ?
+                    'config-provider-row active'
+                  : 'config-provider-row'
+                }
+                key={provider.id}
+                onClick={() => setSelectedProviderId(provider.id)}
+              >
+                <span className="config-provider-row-icon" aria-hidden="true">
+                  {provider.isDefault ? <Star size={15} /> : <Server size={15} />}
+                </span>
+                <span className="config-provider-row-main">
+                  <strong>{provider.name || provider.id}</strong>
+                  <small>{provider.id}</small>
+                </span>
+                <span className="config-provider-row-status">
+                  {providerHasToken(provider) ? 'token' : provider.envKey ? 'env' : 'no key'}
+                </span>
+              </button>
+            ))}
+          </aside>
 
-      {notice ? <div className="provider-test-result">{notice}</div> : null}
+          {selectedProvider ? (
+            <div className="config-provider-editor">
+              <div className="config-provider-editor-heading">
+                <div>
+                  <h4>{selectedProvider.name || selectedProvider.id}</h4>
+                  <p>[model_providers.{selectedProvider.id}]</p>
+                </div>
+                <div className="config-provider-editor-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => setDefaultProvider(selectedProvider.id)}
+                  >
+                    <Star size={15} aria-hidden="true" />
+                    {selectedProvider.isDefault ? 'Default' : 'Set Default'}
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button provider-key-delete"
+                    onClick={() => removeProvider(selectedProvider.id)}
+                    aria-label={`Delete ${selectedProvider.name || selectedProvider.id}`}
+                    title={`Delete ${selectedProvider.name || selectedProvider.id}`}
+                  >
+                    <Trash2 size={16} aria-hidden="true" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="config-provider-fields">
+                <label className="provider-key-field">
+                  <span>Provider ID</span>
+                  <input value={selectedProvider.id} readOnly />
+                </label>
+                <label className="provider-key-field">
+                  <span>Name</span>
+                  <input
+                    value={selectedProvider.name}
+                    onChange={(event) =>
+                      updateProvider(selectedProvider.id, (provider) => ({
+                        ...provider,
+                        name: event.target.value,
+                      }))
+                    }
+                    placeholder="Provider name"
+                  />
+                </label>
+                <label className="provider-key-field">
+                  <span>Base URL</span>
+                  <input
+                    value={selectedProvider.baseUrl}
+                    onChange={(event) =>
+                      updateProvider(selectedProvider.id, (provider) => ({
+                        ...provider,
+                        baseUrl: event.target.value,
+                      }))
+                    }
+                    placeholder="https://api.example.com/v1"
+                  />
+                </label>
+                <label className="provider-key-field">
+                  <span>Bearer Token</span>
+                  <div className="provider-key-secret">
+                    <input
+                      type={visibleKeys[selectedProvider.id] ? 'text' : 'password'}
+                      value={providerBearerToken(selectedProvider)}
+                      onChange={(event) => setBearerToken(selectedProvider.id, event.target.value)}
+                      placeholder="empty"
+                    />
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() =>
+                        setVisibleKeys((current) => ({
+                          ...current,
+                          [selectedProvider.id]: !current[selectedProvider.id],
+                        }))
+                      }
+                    >
+                      {visibleKeys[selectedProvider.id] ?
+                        <EyeOff size={15} aria-hidden="true" />
+                      : <Eye size={15} aria-hidden="true" />}
+                      {visibleKeys[selectedProvider.id] ? 'Hide' : 'Show'}
+                    </button>
+                  </div>
+                </label>
+                <label className="provider-key-field">
+                  <span>Env Key</span>
+                  <input
+                    value={selectedProvider.envKey ?? ''}
+                    onChange={(event) =>
+                      updateProvider(selectedProvider.id, (provider) => ({
+                        ...provider,
+                        envKey: event.target.value,
+                      }))
+                    }
+                    placeholder="OPENAI_API_KEY"
+                  />
+                </label>
+                <label className="provider-key-field">
+                  <span>Wire API</span>
+                  <select
+                    value={selectedProvider.wireApi ?? 'responses'}
+                    onChange={(event) =>
+                      updateProvider(selectedProvider.id, (provider) => ({
+                        ...provider,
+                        wireApi: event.target.value,
+                      }))
+                    }
+                  >
+                    <option value="responses">responses</option>
+                  </select>
+                </label>
+                <label className="toggle-row config-auth-toggle">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(selectedProvider.requiresOpenAiAuth)}
+                    onChange={(event) =>
+                      updateProvider(selectedProvider.id, (provider) => ({
+                        ...provider,
+                        requiresOpenAiAuth: event.target.checked,
+                      }))
+                    }
+                  />
+                  <span>Requires OpenAI Auth</span>
+                </label>
+              </div>
+
+              <div className="config-models-panel">
+                <div className="models-section-heading">
+                  <h4>Models</h4>
+                  <span>{selectedProvider.models.length}</span>
+                </div>
+                <div className="config-model-toolbar">
+                  <div className="model-picker-search">
+                    <Search size={15} aria-hidden="true" />
+                    <input
+                      value={modelSearch}
+                      onChange={(event) => setModelSearch(event.target.value)}
+                      placeholder="Search models..."
+                    />
+                  </div>
+                  <div className="config-add-model">
+                    <input
+                      value={newModelId}
+                      onChange={(event) => setNewModelId(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          event.preventDefault()
+                          addModel()
+                        }
+                      }}
+                      placeholder="model id"
+                    />
+                    <button type="button" className="secondary-button" onClick={addModel}>
+                      <Plus size={15} aria-hidden="true" />
+                      Add
+                    </button>
+                  </div>
+                </div>
+
+                {filteredModels.length === 0 ? (
+                  <div className="empty-state model-empty-state">No models found.</div>
+                ) : (
+                  <div className="config-model-table">
+                    {filteredModels.map((model) => {
+                      const isDefaultModel = selectedProvider.defaultModel === model.id
+                      return (
+                        <div className="config-model-row" key={model.id}>
+                          <button
+                            type="button"
+                            className={
+                              isDefaultModel ?
+                                'config-default-model active'
+                              : 'config-default-model'
+                            }
+                            onClick={() =>
+                              updateProvider(selectedProvider.id, (provider) => ({
+                                ...provider,
+                                defaultModel: model.id,
+                                models: upsertModel(provider.models ?? [], model.id),
+                              }))
+                            }
+                            title="Set default model"
+                            aria-label={`Set ${model.id} as default model`}
+                          >
+                            {isDefaultModel ?
+                              <Check size={15} aria-hidden="true" />
+                            : <Star size={15} aria-hidden="true" />}
+                          </button>
+                          <span className="config-model-main">
+                            <strong>{model.name || model.id}</strong>
+                            <small>{model.id}</small>
+                          </span>
+                          <span className="config-model-reasoning">
+                            {model.reasoningMode ?? 'none'}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      )}
     </section>
   )
 }
 
-function buildProviderKeyCards(
-  providers: ProviderConfig[],
-  fetchStateByCardId: Record<string, FetchState>,
-): ProviderKeyCard[] {
-  return providers.flatMap((provider) =>
-    providerUsesCredentials(provider) ?
-    (provider.credentials ?? []).map((credential) => {
-      const id = cardId(provider.id, credential.id)
-      return {
-        id,
-        provider,
-        credential,
-        selectedCount: selectedModelIdsForCredential(provider, credential.id).length,
-        fetchState: fetchStateByCardId[id] ?? { status: 'not-fetched' },
-      }
-    })
-    : [],
-  )
+function defaultProvider(providers: ProviderConfig[]): ProviderConfig | null {
+  return providers.find((provider) => provider.isDefault) ?? null
 }
 
-function buildSelectedModelRows(providers: ProviderConfig[]): SelectedModelRow[] {
-  return providers.flatMap((provider) =>
-    (provider.models ?? []).map((model) => {
-      const credentialId = modelCredentialId(provider, model)
-      const credential =
-        (provider.credentials ?? []).find((item) => item.id === credentialId) ??
-        (provider.credentials ?? [])[0] ??
-        null
-      return {
-        key: selectedModelKey(provider.id, credentialId, model.id),
-        provider,
-        credential,
-        credentialId,
-        model,
-      }
-    }),
-  )
-}
-
-function filterSelectedRows(
-  rows: SelectedModelRow[],
-  search: string,
-): SelectedModelRow[] {
-  const query = search.trim().toLowerCase()
-  if (!query) {
-    return rows
+function ensureOneDefault(providers: ProviderConfig[]): ProviderConfig[] {
+  if (providers.length === 0) {
+    return providers
   }
-  return rows.filter((row) =>
-    [
-      row.model.name,
-      row.model.id,
-      row.provider.name,
-      row.credential ? credentialAlias(row.credential) : '',
-    ]
-      .join(' ')
-      .toLowerCase()
-      .includes(query),
-  )
-}
-
-function filterModelOptions(models: ProviderModel[], search: string): ProviderModel[] {
-  const query = search.trim().toLowerCase()
-  if (!query) {
-    return models
-  }
-  return models.filter((model) =>
-    `${model.name} ${model.id}`.toLowerCase().includes(query),
-  )
-}
-
-function modelOptionsForCard(
-  provider: ProviderConfig,
-  credential: ProviderCredential,
-  fetchedModels: ProviderModel[] | undefined,
-): ProviderModel[] {
-  const options = new Map<string, ProviderModel>()
-  const defaultProvider = defaultProviders.find((item) => item.id === provider.id)
-  addModelOptions(options, defaultProvider?.models ?? [])
-  addModelOptions(options, fetchedModels ?? [])
-  addModelOptions(
-    options,
-    (provider.models ?? []).filter((model) =>
-      modelBelongsToCredential(provider, model, credential.id),
-    ),
-  )
-
-  return [...options.values()]
-}
-
-function addModelOptions(target: Map<string, ProviderModel>, models: ProviderModel[]): void {
-  for (const model of models) {
-    const id = model.id.trim()
-    if (!id || target.has(id)) {
-      continue
+  let defaultSeen = false
+  const hasDefault = providers.some((provider) => provider.isDefault)
+  return providers.map((provider, index) => {
+    const isDefault = hasDefault ? Boolean(provider.isDefault && !defaultSeen) : index === 0
+    if (isDefault) {
+      defaultSeen = true
     }
-    target.set(id, {
-      ...model,
-      id,
-      name: (model.name ?? '').trim() || id,
-    })
-  }
-}
-
-function selectedModelIdsForCredential(
-  provider: ProviderConfig,
-  credentialId: string,
-): string[] {
-  return (provider.models ?? [])
-    .filter((model) => modelBelongsToCredential(provider, model, credentialId))
-    .map((model) => model.id)
-}
-
-function applySelectedModels(
-  provider: ProviderConfig,
-  credentialId: string,
-  options: ProviderModel[],
-  selectedModelIds: string[],
-): ProviderConfig {
-  const selectedIds = new Set(selectedModelIds)
-  const optionById = new Map(options.map((model) => [model.id, model]))
-  const otherModels = (provider.models ?? []).filter(
-    (model) => !modelBelongsToCredential(provider, model, credentialId),
-  )
-  const existingById = new Map(
-    (provider.models ?? [])
-      .filter((model) => modelBelongsToCredential(provider, model, credentialId))
-      .map((model) => [model.id, model]),
-  )
-  const selectedModels: ProviderModel[] = []
-  for (const modelId of selectedIds) {
-    const existing = existingById.get(modelId)
-    const option = optionById.get(modelId)
-    const source = existing ?? option
-    if (!source) {
-      continue
+    return {
+      ...provider,
+      enabled: true,
+      isDefault,
     }
-    selectedModels.push({
-      ...source,
-      ...(existing ?? {}),
-      id: modelId,
-      name: (existing?.name ?? option?.name ?? modelId).trim() || modelId,
-      enabled: existing?.enabled ?? true,
-      credentialId,
-      reasoningMode: modelReasoningMode(existing ?? option ?? source),
-      defaultReasoning: modelDefaultReasoning(existing ?? option ?? source),
-    })
-  }
-
-  return {
-    ...provider,
-    models: [...otherModels, ...selectedModels],
-  }
+  })
 }
 
-function modelBelongsToCredential(
-  provider: ProviderConfig,
-  model: ProviderModel,
-  credentialId: string,
-): boolean {
-  return modelCredentialId(provider, model) === credentialId
-}
-
-function modelCredentialId(provider: ProviderConfig, model: ProviderModel): string {
-  return (
-    model.credentialId?.trim() ||
-    provider.defaultCredentialId ||
-    (provider.credentials ?? [])[0]?.id ||
-    ''
-  )
+function createProvider(providers: ProviderConfig[]): ProviderConfig {
+  const id = uniqueProviderId(providers)
+  return finalizeProvider({
+    id,
+    type: 'openai-compatible',
+    name: 'New Provider',
+    enabled: true,
+    isDefault: providers.length === 0,
+    baseUrl: '',
+    baseUrlLocked: false,
+    defaultCredentialId: '',
+    defaultModel: '',
+    temperature: 0.2,
+    envKey: '',
+    wireApi: 'responses',
+    requiresOpenAiAuth: false,
+    credentials: [],
+    models: [],
+  })
 }
 
 function finalizeProvider(provider: ProviderConfig): ProviderConfig {
-  const credentials = normalizeCredentials(provider.credentials ?? [])
-  const models = normalizeModels(provider, provider.models ?? [], credentials)
-  const enabledCredential = credentials.find((credential) => credential.enabled)
-  const enabledModel = models.find((model) => model.enabled)
-  const usesCredentials = providerUsesCredentials(provider)
-  const enabledWithoutCredentials =
-    provider.type === 'codex-cli'
-      ? provider.enabled && provider.defaultModel.trim().length > 0
-      : Boolean(enabledModel)
-
+  const token = providerBearerToken(provider)
+  const credentials = token.trim().length > 0 ? [bearerCredential(token)] : []
+  const models = normalizeModels(provider.models ?? [])
   return {
     ...provider,
+    type: provider.type || 'openai-compatible',
+    name: provider.name.trim() || provider.id,
+    enabled: true,
+    baseUrl: provider.baseUrl.trim(),
+    baseUrlLocked: false,
     apiKey: undefined,
-    enabled:
-      usesCredentials ? Boolean(enabledCredential && enabledModel) : enabledWithoutCredentials,
-    baseUrl: isMiniMax(provider) ? minimaxOpenAiBaseUrl : provider.baseUrl,
-    baseUrlLocked: isMiniMax(provider) ? true : provider.baseUrlLocked,
+    defaultCredentialId: credentials[0]?.id ?? '',
+    defaultModel:
+      provider.defaultModel.trim() ||
+      models.find((model) => model.enabled)?.id ||
+      models[0]?.id ||
+      '',
+    temperature: Number.isFinite(provider.temperature) ? provider.temperature : 0.2,
+    envKey: provider.envKey?.trim() ?? '',
+    wireApi: provider.wireApi || 'responses',
+    requiresOpenAiAuth: Boolean(provider.requiresOpenAiAuth),
     credentials,
-    defaultCredentialId: usesCredentials ? enabledCredential?.id ?? credentials[0]?.id ?? '' : '',
-    defaultModel: enabledModel?.id ?? models[0]?.id ?? provider.defaultModel,
     models,
   }
 }
 
-function normalizeCredentials(credentials: ProviderCredential[]): ProviderCredential[] {
-  return credentials
-    .map((credential, index) => {
-      const apiKey = (credential.apiKey ?? '').trim()
-      return {
-        ...credential,
-        id: credential.id?.trim() || `key-${index + 1}`,
-        name: credential.name?.trim() || `key-${index + 1}`,
-        enabled: apiKey.length > 0,
-        apiKey,
-      }
-    })
-    .filter((credential) => credential.id.length > 0)
-}
-
-function normalizeModels(
-  provider: ProviderConfig,
-  models: ProviderModel[],
-  credentials: ProviderCredential[],
-): ProviderModel[] {
+function normalizeModels(models: ProviderModel[]): ProviderModel[] {
   return models
     .map((model) => {
       const id = model.id.trim()
-      const credentialId =
-        providerUsesCredentials(provider) ?
-          model.credentialId?.trim() ||
-          provider.defaultCredentialId ||
-          credentials[0]?.id ||
-          ''
-        : ''
+      const name = (model.name ?? '').trim() || id
+      const reasoningMode = normalizeReasoningMode(model.reasoningMode, id, name)
       return {
         ...model,
         id,
-        name: (model.name ?? '').trim() || id,
-        enabled: Boolean(model.enabled),
-        credentialId,
-        reasoningMode: modelReasoningMode(model),
-        defaultReasoning: modelDefaultReasoning(model),
+        name,
+        enabled: true,
+        reasoningMode,
+        defaultReasoning: normalizeDefaultReasoning(reasoningMode, model.defaultReasoning),
       }
     })
     .filter((model) => model.id.length > 0)
 }
 
-function createCredential(provider: ProviderConfig): ProviderCredential {
-  const id = uniqueCredentialId(provider.credentials ?? [])
+function upsertModel(models: ProviderModel[], rawModelId: string): ProviderModel[] {
+  const modelId = rawModelId.trim()
+  if (!modelId) {
+    return models
+  }
+  if (models.some((model) => model.id === modelId)) {
+    return models
+  }
+  return [
+    ...models,
+    {
+      id: modelId,
+      name: modelId,
+      enabled: true,
+      reasoningMode: inferReasoningMode(modelId, modelId),
+      defaultReasoning: 'off',
+    },
+  ]
+}
+
+function filterModels(models: ProviderModel[], search: string): ProviderModel[] {
+  const query = search.trim().toLowerCase()
+  if (!query) {
+    return models
+  }
+  return models.filter((model) => `${model.name} ${model.id}`.toLowerCase().includes(query))
+}
+
+function bearerCredential(apiKey: string): ProviderCredential {
   return {
-    id,
-    name: '',
-    enabled: false,
-    apiKey: '',
+    id: 'default',
+    name: 'Bearer Token',
+    enabled: apiKey.trim().length > 0,
+    apiKey,
   }
 }
 
-function modelReasoningMode(model: ProviderModel): ModelReasoningMode {
-  const inferred = inferReasoningMode(model.id, model.name)
-  if (inferred !== 'none' && (!model.reasoningMode || model.reasoningMode === 'none')) {
+function providerBearerToken(provider: ProviderConfig): string {
+  return (
+    provider.credentials?.find((credential) => credential.apiKey.trim().length > 0)?.apiKey ??
+    provider.apiKey ??
+    ''
+  )
+}
+
+function providerHasToken(provider: ProviderConfig): boolean {
+  return providerBearerToken(provider).trim().length > 0
+}
+
+function uniqueProviderId(providers: ProviderConfig[]): string {
+  const used = new Set(providers.map((provider) => provider.id))
+  let index = providers.length + 1
+  let id = `provider-${index}`
+  while (used.has(id)) {
+    index += 1
+    id = `provider-${index}`
+  }
+  return id
+}
+
+function normalizeReasoningMode(
+  value: string | undefined,
+  modelId: string,
+  modelName: string,
+): ModelReasoningMode {
+  const inferred = inferReasoningMode(modelId, modelName)
+  if (inferred !== 'none' && (!value || value === 'none')) {
     return inferred
   }
-  if (
-    model.reasoningMode === 'toggle' ||
-    model.reasoningMode === 'effort' ||
-    model.reasoningMode === 'none'
-  ) {
-    return model.reasoningMode
+  if (value === 'toggle' || value === 'effort' || value === 'none') {
+    return value
   }
   return inferred
 }
 
-function modelDefaultReasoning(
-  model: ProviderModel,
-  mode = modelReasoningMode(model),
-): ModelDefaultReasoning {
-  return defaultReasoningForMode(mode, model.defaultReasoning)
-}
-
-function defaultReasoningForMode(
+function normalizeDefaultReasoning(
   mode: ModelReasoningMode,
   value: string | undefined,
 ): ModelDefaultReasoning {
@@ -1012,84 +581,6 @@ function defaultReasoningForMode(
 function inferReasoningMode(modelId: string, modelName: string): ModelReasoningMode {
   const normalized = `${modelId} ${modelName}`.toLowerCase()
   return normalized.includes('minimax-m3') ? 'toggle' : 'none'
-}
-
-function uniqueCredentialId(credentials: ProviderCredential[]): string {
-  let index = credentials.length + 1
-  let id = `key-${index}`
-  const used = new Set(credentials.map((credential) => credential.id))
-  while (used.has(id)) {
-    index += 1
-    id = `key-${index}`
-  }
-  return id
-}
-
-function cardId(providerId: string, credentialId: string): string {
-  return `${providerId}:${credentialId}`
-}
-
-function selectedModelKey(
-  providerId: string,
-  credentialId: string,
-  modelId: string,
-): string {
-  return `${providerId}:${credentialId || 'default'}:${modelId}`
-}
-
-function credentialAlias(credential: ProviderCredential): string {
-  return credential.name.trim() || credential.id || 'key'
-}
-
-function statusBadgeClass(status: FetchStatus): string {
-  return `status-badge ${status}`
-}
-
-function statusLabel(status: FetchStatus): string {
-  if (status === 'fetched') {
-    return 'Fetched'
-  }
-  if (status === 'error') {
-    return 'Error'
-  }
-  return 'Not fetched'
-}
-
-function providerBrandClass(provider: ProviderConfig): string {
-  if (provider.id === 'codex-cli' || provider.type === 'codex-cli') {
-    return 'provider-key-brand codex-cli'
-  }
-  if (isMiniMax(provider)) {
-    return 'provider-key-brand minimax'
-  }
-  if (provider.id === 'codebuddy' || provider.type === 'codebuddy') {
-    return 'provider-key-brand codebuddy'
-  }
-  return 'provider-key-brand'
-}
-
-function maskApiKey(apiKey: string | undefined): string {
-  if (!apiKey) {
-    return ''
-  }
-  return '************'
-}
-
-function isMiniMax(provider: ProviderConfig): boolean {
-  return provider.id === 'minimax' || provider.type === 'minimax'
-}
-
-function providerUsesCredentials(provider: ProviderConfig): boolean {
-  return provider.type !== 'ollama' && provider.type !== 'codex-cli'
-}
-
-function modelTags(modelId: string): string[] {
-  const normalized = modelId.toLowerCase()
-  return [
-    normalized.includes('highspeed') ? 'highspeed' : null,
-    normalized.includes('reason') ? 'reasoning' : null,
-    normalized.includes('vision') || normalized.includes('vl') ? 'vision' : null,
-  ].filter((tag): tag is string => tag !== null)
 }
 
 export default ProviderSettings

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use toml_edit::{value, DocumentMut, Item, Table};
 
 use crate::codex_cli_runner::{CODEX_CLI_DEFAULT_MODEL, CODEX_CLI_PROVIDER_TYPE};
 use crate::path_utils::normalize_display_path;
@@ -68,6 +69,8 @@ pub struct ProviderConfig {
     pub provider_type: String,
     pub name: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub is_default: bool,
     pub base_url: String,
     #[serde(default)]
     pub base_url_locked: bool,
@@ -79,6 +82,12 @@ pub struct ProviderConfig {
     pub default_credential_id: String,
     pub default_model: String,
     pub temperature: f64,
+    #[serde(default)]
+    pub env_key: String,
+    #[serde(default = "default_wire_api")]
+    pub wire_api: String,
+    #[serde(default)]
+    pub requires_openai_auth: bool,
     #[serde(default)]
     pub credentials: Vec<ProviderCredential>,
     #[serde(default)]
@@ -119,6 +128,13 @@ pub struct ProviderModel {
 pub struct SettingsStore {
     path: PathBuf,
     settings: AppSettings,
+    format: SettingsFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsFormat {
+    Toml,
+    Json,
 }
 
 impl SettingsStore {
@@ -128,10 +144,14 @@ impl SettingsStore {
         legacy_path: Option<PathBuf>,
         codebuddy_models_path: Option<PathBuf>,
     ) -> Result<Self, String> {
+        let format = settings_format(&path);
         let (mut settings, should_save_initial) = if path.exists() {
-            (read_app_settings(&path)?, false)
+            (read_app_settings(&path, format)?, false)
         } else if let Some(legacy_path) = legacy_path.filter(|path| path.exists()) {
-            (read_app_settings(&legacy_path)?, true)
+            (
+                read_app_settings(&legacy_path, settings_format(&legacy_path))?,
+                true,
+            )
         } else if let Some(imported) = codebuddy_models_path
             .as_deref()
             .and_then(import_codebuddy_models)
@@ -144,11 +164,15 @@ impl SettingsStore {
         };
         settings.data_dir = normalize_display_path(&data_dir);
         settings.config_path = normalize_display_path(&path.to_string_lossy());
-        let normalized_providers = normalize_providers(settings.providers.clone());
+        let normalized_providers = normalize_settings_providers(settings.providers.clone(), format);
         let should_save_providers = normalized_providers != settings.providers;
         settings.providers = normalized_providers;
 
-        let mut store = Self { path, settings };
+        let mut store = Self {
+            path,
+            settings,
+            format,
+        };
         let mut should_save_settings = should_save_initial || should_save_providers;
         if let Some(devenv_path) = store.settings.devenv_path.as_mut() {
             let normalized = normalize_display_path(devenv_path);
@@ -187,7 +211,7 @@ impl SettingsStore {
             self.settings.ui_preferences = normalize_ui_preferences(preferences);
         }
         if let Some(providers) = input.providers {
-            self.settings.providers = normalize_providers(providers);
+            self.settings.providers = normalize_settings_providers(providers, self.format);
         }
         self.save()?;
         Ok(self.current())
@@ -196,20 +220,441 @@ impl SettingsStore {
     fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|error| format!("JSON 设置目录创建失败 {}: {error}", parent.display()))?;
+                .map_err(|error| format!("设置目录创建失败 {}: {error}", parent.display()))?;
         }
-        let text = serde_json::to_string_pretty(&self.settings)
-            .map_err(|error| format!("JSON 设置序列化失败: {error}"))?;
-        fs::write(&self.path, text)
-            .map_err(|error| format!("JSON 设置写入失败 {}: {error}", self.path.display()))
+        match self.format {
+            SettingsFormat::Toml => write_toml_app_settings(&self.path, &self.settings),
+            SettingsFormat::Json => {
+                let text = serde_json::to_string_pretty(&self.settings)
+                    .map_err(|error| format!("JSON 设置序列化失败: {error}"))?;
+                fs::write(&self.path, text)
+                    .map_err(|error| format!("JSON 设置写入失败 {}: {error}", self.path.display()))
+            }
+        }
     }
 }
 
-fn read_app_settings(path: &Path) -> Result<AppSettings, String> {
+fn settings_format(path: &Path) -> SettingsFormat {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"))
+    {
+        SettingsFormat::Toml
+    } else {
+        SettingsFormat::Json
+    }
+}
+
+fn read_app_settings(path: &Path, format: SettingsFormat) -> Result<AppSettings, String> {
+    match format {
+        SettingsFormat::Toml => read_toml_app_settings(path),
+        SettingsFormat::Json => read_json_app_settings(path),
+    }
+}
+
+fn read_json_app_settings(path: &Path) -> Result<AppSettings, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("JSON 设置读取失败 {}: {error}", path.display()))?;
     serde_json::from_str::<AppSettings>(&text)
         .map_err(|error| format!("JSON 设置解析失败 {}: {error}", path.display()))
+}
+
+fn read_toml_app_settings(path: &Path) -> Result<AppSettings, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("TOML 配置读取失败 {}: {error}", path.display()))?;
+    let doc = text
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("TOML 配置解析失败 {}: {error}", path.display()))?;
+
+    let mut settings = AppSettings::default();
+    settings.provider_notes = format!(
+        "Editing {}",
+        normalize_display_path(&path.to_string_lossy())
+    );
+    settings.devenv_path = read_desktop_string(&doc, "devenv_path");
+    settings.ui_preferences = read_toml_ui_preferences(&doc);
+    settings.providers = read_toml_providers(path, &doc);
+    Ok(settings)
+}
+
+fn write_toml_app_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let mut doc = if existing.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        existing
+            .parse::<DocumentMut>()
+            .map_err(|error| format!("TOML 配置解析失败 {}: {error}", path.display()))?
+    };
+
+    let default_provider = default_config_provider(&settings.providers);
+    if let Some(provider) = default_provider {
+        set_doc_string(&mut doc, "model_provider", &provider.id);
+        set_doc_string(&mut doc, "model", &default_config_model(provider));
+    }
+
+    write_toml_desktop_settings(&mut doc, settings)?;
+    write_toml_providers(&mut doc, &settings.providers)?;
+
+    fs::write(path, doc.to_string())
+        .map_err(|error| format!("TOML 配置写入失败 {}: {error}", path.display()))
+}
+
+fn read_toml_providers(config_path: &Path, doc: &DocumentMut) -> Vec<ProviderConfig> {
+    let default_provider_id = doc_string(doc, "model_provider").unwrap_or_default();
+    let default_model = doc_string(doc, "model").unwrap_or_default();
+    let catalog_models = read_model_catalog(config_path, doc_string(doc, "model_catalog_json"));
+    let Some(providers_table) = doc.get("model_providers").and_then(Item::as_table) else {
+        return Vec::new();
+    };
+
+    providers_table
+        .iter()
+        .filter_map(|(id, item)| {
+            let table = item.as_table()?;
+            let provider_id = id.trim().to_string();
+            if provider_id.is_empty() {
+                return None;
+            }
+            let is_default = provider_id == default_provider_id;
+            let token = table_string(table, "experimental_bearer_token").unwrap_or_default();
+            let env_key = table_string(table, "env_key").unwrap_or_default();
+            let credentials = if token.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![ProviderCredential {
+                    id: "default".to_string(),
+                    name: "Bearer Token".to_string(),
+                    enabled: true,
+                    api_key: token,
+                }]
+            };
+            let default_credential_id = credentials
+                .first()
+                .map(|credential| credential.id.clone())
+                .unwrap_or_default();
+            let mut models = catalog_models.clone();
+            if !default_model.trim().is_empty()
+                && !models.iter().any(|model| model.id == default_model)
+            {
+                models.insert(0, provider_model(&default_model, &default_model));
+            }
+            for model in &mut models {
+                model.enabled = true;
+                model.credential_id = default_credential_id.clone();
+            }
+            let default_model_for_provider = if is_default {
+                default_model.clone()
+            } else {
+                models
+                    .first()
+                    .map(|model| model.id.clone())
+                    .unwrap_or_default()
+            };
+
+            Some(ProviderConfig {
+                id: provider_id.clone(),
+                provider_type: "openai-compatible".to_string(),
+                name: table_string(table, "name").unwrap_or(provider_id),
+                enabled: true,
+                is_default,
+                base_url: table_string(table, "base_url").unwrap_or_default(),
+                base_url_locked: false,
+                supports_tool_call: None,
+                api_key: String::new(),
+                default_credential_id,
+                default_model: default_model_for_provider,
+                temperature: 0.2,
+                env_key,
+                wire_api: normalize_wire_api(
+                    &table_string(table, "wire_api").unwrap_or_else(default_wire_api),
+                ),
+                requires_openai_auth: table_bool(table, "requires_openai_auth").unwrap_or(false),
+                credentials,
+                models,
+            })
+        })
+        .collect()
+}
+
+fn write_toml_providers(doc: &mut DocumentMut, providers: &[ProviderConfig]) -> Result<(), String> {
+    ensure_table(doc, "model_providers")?;
+    let providers_item = doc
+        .get_mut("model_providers")
+        .ok_or_else(|| "TOML model_providers table missing".to_string())?;
+    let providers_table = providers_item
+        .as_table_mut()
+        .ok_or_else(|| "TOML model_providers must be a table".to_string())?;
+    let provider_ids = providers
+        .iter()
+        .map(|provider| provider.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    let existing_ids = providers_table
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .collect::<Vec<_>>();
+    for id in existing_ids {
+        if !provider_ids.contains(&id) {
+            providers_table.remove(&id);
+        }
+    }
+
+    for provider in providers {
+        let id = provider.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if !providers_table.get(id).and_then(Item::as_table).is_some() {
+            providers_table.insert(id, Item::Table(Table::new()));
+        }
+        let table = providers_table
+            .get_mut(id)
+            .and_then(Item::as_table_mut)
+            .ok_or_else(|| format!("TOML model_providers.{id} must be a table"))?;
+        set_table_string(table, "name", provider.name.trim());
+        set_table_string(table, "base_url", provider.base_url.trim());
+        set_table_string(table, "env_key", provider.env_key.trim());
+        set_table_string(
+            table,
+            "experimental_bearer_token",
+            provider_bearer_token(provider).trim(),
+        );
+        set_table_string(table, "wire_api", &normalize_wire_api(&provider.wire_api));
+        table["requires_openai_auth"] = value(provider.requires_openai_auth);
+    }
+    Ok(())
+}
+
+fn read_toml_ui_preferences(doc: &DocumentMut) -> UiPreferences {
+    let mut preferences = default_ui_preferences();
+    let Some(desktop) = doc.get("desktop").and_then(Item::as_table) else {
+        return preferences;
+    };
+    let Some(ui) = desktop.get("ui_preferences").and_then(Item::as_table) else {
+        return preferences;
+    };
+    if let Some(value) = table_bool(ui, "show_trace_button") {
+        preferences.show_trace_button = value;
+    }
+    if let Some(value) = table_bool(ui, "auto_open_trace_on_errors") {
+        preferences.auto_open_trace_on_errors = value;
+    }
+    if let Some(value) = table_string(ui, "default_workspace_layout") {
+        preferences.default_workspace_layout = value;
+    }
+    if let Some(value) = table_string(ui, "visual_style") {
+        preferences.visual_style = value;
+    }
+    if let Some(value) = ui
+        .get("workspace_history_days")
+        .and_then(Item::as_integer)
+        .and_then(|value| u32::try_from(value).ok())
+    {
+        preferences.workspace_history_days = value;
+    }
+    normalize_ui_preferences(preferences)
+}
+
+fn write_toml_desktop_settings(
+    doc: &mut DocumentMut,
+    settings: &AppSettings,
+) -> Result<(), String> {
+    ensure_table(doc, "desktop")?;
+    let desktop = doc
+        .get_mut("desktop")
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| "TOML desktop must be a table".to_string())?;
+    match settings
+        .devenv_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(path) => desktop["devenv_path"] = value(path.trim()),
+        None => {
+            desktop.remove("devenv_path");
+        }
+    }
+    if !desktop
+        .get("ui_preferences")
+        .and_then(Item::as_table)
+        .is_some()
+    {
+        desktop.insert("ui_preferences", Item::Table(Table::new()));
+    }
+    let ui = desktop
+        .get_mut("ui_preferences")
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| "TOML desktop.ui_preferences must be a table".to_string())?;
+    ui["show_trace_button"] = value(settings.ui_preferences.show_trace_button);
+    ui["auto_open_trace_on_errors"] = value(settings.ui_preferences.auto_open_trace_on_errors);
+    ui["default_workspace_layout"] =
+        value(settings.ui_preferences.default_workspace_layout.as_str());
+    ui["visual_style"] = value(settings.ui_preferences.visual_style.as_str());
+    ui["workspace_history_days"] = value(i64::from(settings.ui_preferences.workspace_history_days));
+    Ok(())
+}
+
+fn read_desktop_string(doc: &DocumentMut, key: &str) -> Option<String> {
+    doc.get("desktop")
+        .and_then(Item::as_table)
+        .and_then(|table| table_string(table, key))
+}
+
+fn default_config_provider(providers: &[ProviderConfig]) -> Option<&ProviderConfig> {
+    providers
+        .iter()
+        .find(|provider| provider.is_default)
+        .or_else(|| providers.iter().find(|provider| provider.enabled))
+        .or_else(|| providers.first())
+}
+
+fn default_config_model(provider: &ProviderConfig) -> String {
+    if !provider.default_model.trim().is_empty() {
+        return provider.default_model.trim().to_string();
+    }
+    provider
+        .models
+        .iter()
+        .find(|model| model.enabled)
+        .or_else(|| provider.models.first())
+        .map(|model| model.id.clone())
+        .unwrap_or_default()
+}
+
+fn provider_bearer_token(provider: &ProviderConfig) -> String {
+    provider
+        .credentials
+        .iter()
+        .find(|credential| credential.enabled && !credential.api_key.trim().is_empty())
+        .or_else(|| {
+            provider
+                .credentials
+                .iter()
+                .find(|credential| !credential.api_key.trim().is_empty())
+        })
+        .map(|credential| credential.api_key.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn doc_string(doc: &DocumentMut, key: &str) -> Option<String> {
+    doc.get(key)
+        .and_then(Item::as_str)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn table_string(table: &Table, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(Item::as_str)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn table_bool(table: &Table, key: &str) -> Option<bool> {
+    table.get(key).and_then(Item::as_bool)
+}
+
+fn set_doc_string(doc: &mut DocumentMut, key: &str, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        doc.as_table_mut().remove(key);
+    } else {
+        doc[key] = value(text);
+    }
+}
+
+fn set_table_string(table: &mut Table, key: &str, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        table.remove(key);
+    } else {
+        table[key] = value(text);
+    }
+}
+
+fn ensure_table(doc: &mut DocumentMut, key: &str) -> Result<(), String> {
+    if doc.get(key).and_then(Item::as_table).is_none() {
+        doc[key] = Item::Table(Table::new());
+    }
+    if doc.get(key).and_then(Item::as_table).is_some() {
+        Ok(())
+    } else {
+        Err(format!("TOML {key} must be a table"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelCatalogFile {
+    #[serde(default)]
+    models: Vec<ModelCatalogEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelCatalogEntry {
+    #[serde(default)]
+    slug: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<serde_json::Value>,
+}
+
+fn read_model_catalog(config_path: &Path, catalog_path: Option<String>) -> Vec<ProviderModel> {
+    let Some(catalog_path) = catalog_path.filter(|value| !value.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let mut path = PathBuf::from(catalog_path.trim());
+    if path.is_relative() {
+        if let Some(parent) = config_path.parent() {
+            path = parent.join(path);
+        }
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(catalog) = serde_json::from_str::<ModelCatalogFile>(&text) else {
+        return Vec::new();
+    };
+
+    catalog
+        .models
+        .into_iter()
+        .filter_map(|model| {
+            let id = model.slug.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let name = if model.display_name.trim().is_empty() {
+                id.to_string()
+            } else {
+                model.display_name.trim().to_string()
+            };
+            let reasoning_mode = if model.supported_reasoning_levels.is_empty() {
+                normalize_model_reasoning_mode("", id, &name)
+            } else {
+                "effort".to_string()
+            };
+            let default_reasoning = normalize_model_default_reasoning(
+                &reasoning_mode,
+                model.default_reasoning_level.as_deref().unwrap_or(""),
+            );
+            Some(ProviderModel {
+                id: id.to_string(),
+                name,
+                enabled: true,
+                credential_id: String::new(),
+                reasoning_mode,
+                default_reasoning,
+                owned_by: None,
+                created: None,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +746,7 @@ fn import_codebuddy_models(path: &Path) -> Option<Vec<ProviderConfig>> {
             provider_type: "openai-compatible".to_string(),
             name: group.name,
             enabled: true,
+            is_default: index == 0,
             base_url: group.base_url,
             base_url_locked: false,
             supports_tool_call: group.supports_tool_call,
@@ -316,6 +762,9 @@ fn import_codebuddy_models(path: &Path) -> Option<Vec<ProviderConfig>> {
                 .map(|model| model.id.clone())
                 .unwrap_or_default(),
             temperature: group.temperature,
+            env_key: String::new(),
+            wire_api: default_wire_api(),
+            requires_openai_auth: false,
             credentials: group.credentials,
             models: group.models,
         })
@@ -423,6 +872,17 @@ fn default_model_default_reasoning() -> String {
     "off".to_string()
 }
 
+fn default_wire_api() -> String {
+    "responses".to_string()
+}
+
+fn normalize_wire_api(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "responses" => "responses".to_string(),
+        _ => default_wire_api(),
+    }
+}
+
 fn normalize_model_reasoning_mode(value: &str, model_id: &str, model_name: &str) -> String {
     let inferred = infer_model_reasoning_mode(model_id, model_name);
     if inferred != "none" && value.trim().is_empty() {
@@ -479,6 +939,7 @@ fn default_providers() -> Vec<ProviderConfig> {
             provider_type: "codebuddy".to_string(),
             name: "CodeBuddy VSCode".to_string(),
             enabled: false,
+            is_default: false,
             base_url: CODEBUDDY_OPENAI_BASE_URL.to_string(),
             base_url_locked: true,
             supports_tool_call: None,
@@ -486,6 +947,9 @@ fn default_providers() -> Vec<ProviderConfig> {
             default_credential_id: String::new(),
             default_model: "glm-5.1".to_string(),
             temperature: 1.0,
+            env_key: String::new(),
+            wire_api: default_wire_api(),
+            requires_openai_auth: false,
             credentials: Vec::new(),
             models: codebuddy_models(),
         },
@@ -497,6 +961,7 @@ fn default_providers() -> Vec<ProviderConfig> {
             provider_type: "ollama".to_string(),
             name: "Ollama".to_string(),
             enabled: false,
+            is_default: false,
             base_url: "http://127.0.0.1:11434".to_string(),
             base_url_locked: false,
             supports_tool_call: None,
@@ -504,6 +969,9 @@ fn default_providers() -> Vec<ProviderConfig> {
             default_credential_id: String::new(),
             default_model: "llama3.1".to_string(),
             temperature: 0.2,
+            env_key: String::new(),
+            wire_api: default_wire_api(),
+            requires_openai_auth: false,
             credentials: Vec::new(),
             models: Vec::new(),
         },
@@ -522,6 +990,7 @@ fn codex_cli_provider() -> ProviderConfig {
         provider_type: CODEX_CLI_PROVIDER_TYPE.to_string(),
         name: "Codex CLI".to_string(),
         enabled: true,
+        is_default: true,
         base_url: String::new(),
         base_url_locked: true,
         supports_tool_call: None,
@@ -529,6 +998,9 @@ fn codex_cli_provider() -> ProviderConfig {
         default_credential_id: String::new(),
         default_model: CODEX_CLI_DEFAULT_MODEL.to_string(),
         temperature: 0.2,
+        env_key: String::new(),
+        wire_api: default_wire_api(),
+        requires_openai_auth: false,
         credentials: Vec::new(),
         models: Vec::new(),
     }
@@ -540,6 +1012,7 @@ fn provider(id: &str, provider_type: &str, name: &str, default_model: &str) -> P
         provider_type: provider_type.to_string(),
         name: name.to_string(),
         enabled: false,
+        is_default: false,
         base_url: if id == "minimax" {
             MINIMAX_OPENAI_BASE_URL.to_string()
         } else if id == "codebuddy" {
@@ -553,6 +1026,9 @@ fn provider(id: &str, provider_type: &str, name: &str, default_model: &str) -> P
         default_credential_id: String::new(),
         default_model: default_model.to_string(),
         temperature: 0.2,
+        env_key: String::new(),
+        wire_api: default_wire_api(),
+        requires_openai_auth: false,
         credentials: Vec::new(),
         models: Vec::new(),
     }
@@ -607,6 +1083,106 @@ fn normalize_ui_preferences(preferences: UiPreferences) -> UiPreferences {
     }
 }
 
+fn normalize_settings_providers(
+    providers: Vec<ProviderConfig>,
+    format: SettingsFormat,
+) -> Vec<ProviderConfig> {
+    match format {
+        SettingsFormat::Toml => normalize_config_providers(providers),
+        SettingsFormat::Json => normalize_providers(providers),
+    }
+}
+
+fn normalize_config_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
+    let mut normalized = providers
+        .into_iter()
+        .map(|provider| {
+            let id = provider.id.trim().to_string();
+            let provider_type = if provider.provider_type.trim().is_empty() {
+                "openai-compatible".to_string()
+            } else {
+                provider.provider_type.trim().to_string()
+            };
+            let legacy_api_key = provider.api_key.trim().to_string();
+            let credentials = normalize_credentials(provider.credentials, &legacy_api_key);
+            let default_credential_id =
+                normalize_default_credential_id(&provider.default_credential_id, &credentials);
+            let models = provider
+                .models
+                .into_iter()
+                .map(|model| ProviderModel {
+                    id: model.id.trim().to_string(),
+                    name: if model.name.trim().is_empty() {
+                        model.id.trim().to_string()
+                    } else {
+                        model.name.trim().to_string()
+                    },
+                    enabled: model.enabled,
+                    credential_id: normalize_model_credential_id(
+                        &model.credential_id,
+                        &default_credential_id,
+                        &credentials,
+                    ),
+                    reasoning_mode: normalize_model_reasoning_mode(
+                        &model.reasoning_mode,
+                        &model.id,
+                        &model.name,
+                    ),
+                    default_reasoning: normalize_model_default_reasoning(
+                        &normalize_model_reasoning_mode(
+                            &model.reasoning_mode,
+                            &model.id,
+                            &model.name,
+                        ),
+                        &model.default_reasoning,
+                    ),
+                    owned_by: model.owned_by,
+                    created: model.created,
+                })
+                .filter(|model| !model.id.is_empty())
+                .collect::<Vec<_>>();
+            ProviderConfig {
+                id: id.clone(),
+                provider_type,
+                name: if provider.name.trim().is_empty() {
+                    id.clone()
+                } else {
+                    provider.name.trim().to_string()
+                },
+                enabled: provider.enabled || provider.is_default,
+                is_default: provider.is_default,
+                base_url: provider.base_url.trim().to_string(),
+                base_url_locked: false,
+                supports_tool_call: provider.supports_tool_call,
+                api_key: String::new(),
+                default_credential_id,
+                default_model: if provider.default_model.trim().is_empty() {
+                    models
+                        .first()
+                        .map(|model| model.id.clone())
+                        .unwrap_or_default()
+                } else {
+                    provider.default_model.trim().to_string()
+                },
+                temperature: provider.temperature.clamp(0.0, 2.0),
+                env_key: provider.env_key.trim().to_string(),
+                wire_api: normalize_wire_api(&provider.wire_api),
+                requires_openai_auth: provider.requires_openai_auth,
+                credentials,
+                models,
+            }
+        })
+        .filter(|provider| !provider.id.is_empty() && !provider.name.is_empty())
+        .collect::<Vec<_>>();
+
+    if !normalized.iter().any(|provider| provider.is_default) {
+        if let Some(first) = normalized.first_mut() {
+            first.is_default = true;
+        }
+    }
+    normalized
+}
+
 fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
     let normalized = providers
         .into_iter()
@@ -619,6 +1195,7 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                     provider_type: CODEX_CLI_PROVIDER_TYPE.to_string(),
                     name: "Codex CLI".to_string(),
                     enabled: provider.enabled,
+                    is_default: provider.is_default,
                     base_url: String::new(),
                     base_url_locked: true,
                     supports_tool_call: provider.supports_tool_call,
@@ -630,6 +1207,9 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                         provider.default_model.trim().to_string()
                     },
                     temperature: provider.temperature.clamp(0.0, 2.0),
+                    env_key: String::new(),
+                    wire_api: default_wire_api(),
+                    requires_openai_auth: false,
                     credentials: Vec::new(),
                     models: provider
                         .models
@@ -706,6 +1286,7 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                 provider_type: provider_type.clone(),
                 name: provider.name.trim().to_string(),
                 enabled: provider.enabled,
+                is_default: provider.is_default,
                 base_url: if id == "minimax" || provider_type == "minimax" {
                     MINIMAX_OPENAI_BASE_URL.to_string()
                 } else if id == "codebuddy" || provider_type == "codebuddy" {
@@ -722,6 +1303,9 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                 default_credential_id,
                 default_model: provider.default_model.trim().to_string(),
                 temperature: provider.temperature.clamp(0.0, 2.0),
+                env_key: provider.env_key.trim().to_string(),
+                wire_api: normalize_wire_api(&provider.wire_api),
+                requires_openai_auth: provider.requires_openai_auth,
                 credentials,
                 models,
             }
@@ -918,6 +1502,7 @@ impl VsRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn normalize_providers_backfills_default_models_when_saved_list_is_empty() {
@@ -932,5 +1517,116 @@ mod tests {
 
         assert!(!provider.models.is_empty());
         assert!(provider.models.iter().any(|model| model.id == "glm-5.1"));
+    }
+
+    #[test]
+    fn toml_settings_reads_configured_model_provider() {
+        let root = create_temp_settings_dir();
+        let config_path = root.join("config.toml");
+        let catalog_path = root.join("models.json");
+        fs::write(
+            &catalog_path,
+            r#"{"models":[{"slug":"model-a","display_name":"Model A","supported_reasoning_levels":[]}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                r#"model = "model-a"
+model_provider = "gateway"
+model_catalog_json = '{}'
+
+[projects.'d:\code\snowagents']
+trust_level = "trusted"
+
+[model_providers.gateway]
+name = "Gateway"
+base_url = "http://127.0.0.1:8080/v1"
+experimental_bearer_token = "test-token"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+                catalog_path.to_string_lossy().replace('\\', "\\")
+            ),
+        )
+        .unwrap();
+
+        let settings = read_toml_app_settings(&config_path).unwrap();
+        let provider = settings.providers.first().unwrap();
+
+        assert_eq!(provider.id, "gateway");
+        assert_eq!(provider.name, "Gateway");
+        assert!(provider.is_default);
+        assert_eq!(provider.default_model, "model-a");
+        assert_eq!(provider.credentials[0].api_key, "test-token");
+        assert!(provider.models.iter().any(|model| model.id == "model-a"));
+    }
+
+    #[test]
+    fn toml_settings_write_preserves_unrelated_sections() {
+        let root = create_temp_settings_dir();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "old-model"
+model_provider = "gateway"
+
+[projects.'d:\code\snowagents']
+trust_level = "trusted"
+
+[model_providers.gateway]
+name = "Old Gateway"
+base_url = "http://old.example/v1"
+experimental_bearer_token = "old-token"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+
+        let mut settings = AppSettings::default();
+        settings.providers = vec![ProviderConfig {
+            id: "gateway".to_string(),
+            provider_type: "openai-compatible".to_string(),
+            name: "New Gateway".to_string(),
+            enabled: true,
+            is_default: true,
+            base_url: "http://new.example/v1".to_string(),
+            base_url_locked: false,
+            supports_tool_call: None,
+            api_key: String::new(),
+            default_credential_id: "default".to_string(),
+            default_model: "new-model".to_string(),
+            temperature: 0.2,
+            env_key: String::new(),
+            wire_api: "responses".to_string(),
+            requires_openai_auth: false,
+            credentials: vec![ProviderCredential {
+                id: "default".to_string(),
+                name: "Bearer Token".to_string(),
+                enabled: true,
+                api_key: "new-token".to_string(),
+            }],
+            models: vec![provider_model("new-model", "New Model")],
+        }];
+
+        write_toml_app_settings(&config_path, &settings).unwrap();
+        let written = fs::read_to_string(config_path).unwrap();
+
+        assert!(written.contains("[projects.'d:\\code\\snowagents']"));
+        assert!(written.contains("model = \"new-model\""));
+        assert!(written.contains("model_provider = \"gateway\""));
+        assert!(written.contains("name = \"New Gateway\""));
+        assert!(written.contains("base_url = \"http://new.example/v1\""));
+        assert!(written.contains("experimental_bearer_token = \"new-token\""));
+    }
+
+    fn create_temp_settings_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codeforge-settings-test-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 }

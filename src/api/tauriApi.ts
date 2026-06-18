@@ -6,6 +6,7 @@ import type {
   ProjectSession,
 } from '../types/project'
 import type { AppSettings, SettingsInput } from '../types/settings'
+import type { WorkspaceHistoryState } from '../state/appState'
 import type {
   AgentRunInput,
   MockAgentRun,
@@ -88,6 +89,22 @@ export function listVsInstances(): Promise<VSInstance[]> {
 
 export function listTools(): Promise<ToolDefinitionSummary[]> {
   return call<ToolDefinitionSummary[]>('list_tools')
+}
+
+export function loadWorkspaceHistory(): Promise<WorkspaceHistoryState> {
+  return call<WorkspaceHistoryState>('load_workspace_history')
+}
+
+export function saveWorkspaceHistory(
+  historyState: WorkspaceHistoryState,
+): Promise<void> {
+  return call<void>('save_workspace_history', { historyState })
+}
+
+export function importWorkspaceHistory(
+  historyState: WorkspaceHistoryState,
+): Promise<void> {
+  return call<void>('import_workspace_history', { historyState })
 }
 
 export function runMockAgent(

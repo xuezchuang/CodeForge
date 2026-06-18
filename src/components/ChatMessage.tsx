@@ -53,8 +53,13 @@ function ChatMessage({
       createThinkingSummary(message.traceEvents ?? [], {
         nowMs: thinkingNowMs,
         running: isRunningAssistant,
+        startedAt: message.createdAt,
+        initialText:
+          displayContent.startsWith(THINKING_PREFIX) ?
+            displayContent.slice(THINKING_PREFIX.length).trim()
+          : 'Preparing model request.',
       }),
-    [isRunningAssistant, message.traceEvents, thinkingNowMs],
+    [displayContent, isRunningAssistant, message.createdAt, message.traceEvents, thinkingNowMs],
   )
   const copyText = (value: string, target: 'user' | 'assistant') => {
     if (!navigator.clipboard) {
@@ -758,10 +763,38 @@ function ThinkingIcon({ kind }: { kind: ThinkingItem['kind'] }) {
 
 function createThinkingSummary(
   events: ToolTraceEvent[],
-  options: { nowMs: number; running: boolean },
+  options: { nowMs: number; running: boolean; startedAt: string; initialText: string },
 ): ThinkingSummary | null {
   if (events.length === 0) {
-    return null
+    if (!options.running) {
+      return null
+    }
+    const startedMs = Date.parse(options.startedAt)
+    return {
+      toolCalls: 0,
+      llmCalls: 0,
+      steps: 1,
+      workedFor:
+        Number.isFinite(startedMs) ?
+          formatElapsedMs(Math.max(1000, options.nowMs - startedMs))
+        : '',
+      items: [
+        {
+          id: 'waiting-for-first-trace',
+          kind: 'model',
+          text: options.initialText || 'Preparing model request.',
+          detail: 'waiting for backend trace',
+          details: [],
+          status: 'running',
+          duration:
+            Number.isFinite(startedMs) ?
+              formatElapsedMs(Math.max(1000, options.nowMs - startedMs))
+            : 'running',
+          progressive: false,
+        },
+      ],
+      omitted: 0,
+    }
   }
 
   const visibleEvents = events.filter(
@@ -808,7 +841,7 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
     }
   }
 
-  if (event.type === 'llm_request' || event.type === 'final_response') {
+  if (event.type === 'final_response') {
     return null
   }
 
@@ -818,6 +851,9 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
 function isVisibleThinkingEvent(event: ToolTraceEvent): boolean {
   if (event.type === 'llm_response' || event.type === 'model_message') {
     return Boolean(modelThinkingContent(asRecord(event.input), asRecord(event.output), event))
+  }
+  if (event.type === 'llm_request' || event.type === 'system_event') {
+    return true
   }
   if (event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'error') {
     return true
@@ -894,6 +930,12 @@ function thinkingKind(
 }
 
 function defaultThinkingText(event: ToolTraceEvent, toolName: string): string {
+  if (event.type === 'llm_request') {
+    return 'Sending model request'
+  }
+  if (event.title === 'select_model') {
+    return 'Selected model'
+  }
   if (toolName) {
     return toolName
   }
@@ -1341,8 +1383,18 @@ function formatDuration(value: number | null): string {
   if (value === null || !Number.isFinite(value)) {
     return ''
   }
+  return formatElapsedMs(value)
+}
+
+function formatElapsedMs(value: number): string {
   if (value >= 1000) {
     const seconds = value / 1000
+    if (seconds >= 60) {
+      const totalSeconds = Math.round(seconds)
+      const minutes = Math.floor(totalSeconds / 60)
+      const remainingSeconds = totalSeconds % 60
+      return `${minutes}m ${remainingSeconds}s`
+    }
     return `${seconds >= 10 ? Math.round(seconds) : seconds.toFixed(1)}s`
   }
   return `${Math.max(0, Math.round(value))} ms`

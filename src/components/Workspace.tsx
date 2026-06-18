@@ -175,7 +175,10 @@ function Workspace({
 
     const sessionTaskId = currentTask?.id ?? crypto.randomUUID()
     const userMessage = createMessage(sessionTaskId, 'user', prompt, attachments)
-    const pendingAssistantMessage = createPendingAssistantMessage(sessionTaskId)
+    const pendingAssistantMessage = createPendingAssistantMessage(
+      sessionTaskId,
+      attachments.length,
+    )
     const conversationMessages = createConversationMessages([
       ...(currentTask?.messages ?? []),
       userMessage,
@@ -227,6 +230,7 @@ function Workspace({
 
       const run = await runAgent({
         projectId: activeProject.id,
+        sessionId: sessionTaskId,
         userPrompt: prompt,
         messages: conversationMessages,
         providerId: selection.providerId,
@@ -792,18 +796,29 @@ function createMessage(
   }
 }
 
-function createPendingAssistantMessage(taskId: string): ChatMessage {
+function createPendingAssistantMessage(taskId: string, attachmentCount = 0): ChatMessage {
   return {
-    ...createMessage(taskId, 'assistant', createRunningAssistantContent([])),
+    ...createMessage(
+      taskId,
+      'assistant',
+      createRunningAssistantContent([], attachmentCount),
+    ),
     status: 'running',
     traceEvents: [],
   }
 }
 
-function createRunningAssistantContent(traces: ToolTraceEvent[]): string {
+function createRunningAssistantContent(
+  traces: ToolTraceEvent[],
+  attachmentCount = 0,
+): string {
   const latestTrace = traces.at(-1)
   if (!latestTrace) {
-    return 'Thinking...\n\nWaiting for the first trace event.'
+    const imageText =
+      attachmentCount > 0 ?
+        `Preparing ${attachmentCount} image${attachmentCount === 1 ? '' : 's'} and model request.`
+      : 'Preparing model request.'
+    return `Thinking...\n\n${imageText}`
   }
   return `Thinking...\n\n${describeRunningTrace(latestTrace)}`
 }

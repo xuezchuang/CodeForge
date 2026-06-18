@@ -47,6 +47,7 @@ export interface AgentMessageAttachment {
 
 export interface AgentRunInput {
   projectId: string
+  sessionId?: string | null
   userPrompt: string
   messages?: AgentConversationMessage[]
   providerId: string | null

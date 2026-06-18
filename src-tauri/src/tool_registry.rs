@@ -25,6 +25,7 @@ pub const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
 pub const WORKSPACE_SHELL_COMMAND_TOOL_NAME: &str = "workspace/shell_command";
 pub const APPLY_PATCH_RAW_TOOL_NAME: &str = "apply_patch_raw";
 pub const GET_FILE_CONTEXT_TOOL_NAME: &str = "get_file_context";
+pub const WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME: &str = "workspace/get_file_context";
 pub const VS_CURRENT_SOLUTION_TOOL_NAME: &str = "vs.current_solution";
 pub const VS_CURRENT_DOCUMENT_TOOL_NAME: &str = "vs.current_document";
 pub const VS_CURRENT_SELECTION_TOOL_NAME: &str = "vs.current_selection";
@@ -44,18 +45,21 @@ pub struct ToolExecutionContext<'a> {
     pub goal: Option<&'a mut Option<GoalState>>,
 }
 
-/// Return the workspace/ namespaced tool definitions that should be exposed
-/// alongside the short names. These are the same handlers, just under the
-/// namespaced names that the plan recommends (e.g. `workspace/read_file`).
 fn workspace_namespace_aliases() -> Vec<Value> {
     vec![
+        workspace_alias(WORKSPACE_LIST_DIR_TOOL_NAME, &list_dir_definition()),
         workspace_alias(WORKSPACE_READ_FILE_TOOL_NAME, &read_file_definition()),
+        workspace_alias(WORKSPACE_SEARCH_FILE_TOOL_NAME, &search_file_definition()),
         workspace_alias(
             WORKSPACE_SEARCH_CONTENT_TOOL_NAME,
             &search_content_definition(),
         ),
         workspace_alias(WORKSPACE_EDIT_FILE_TOOL_NAME, &edit_file_definition()),
         workspace_alias(WORKSPACE_WRITE_FILE_TOOL_NAME, &write_file_definition()),
+        workspace_alias(
+            WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME,
+            &get_file_context_definition(),
+        ),
     ]
 }
 
@@ -70,7 +74,7 @@ fn workspace_alias(name: &str, definition: &Value) -> Value {
     cloned
 }
 pub fn tool_definitions() -> Vec<Value> {
-    let mut tools = base_tool_definitions();
+    let mut tools = workspace_tool_definitions();
     tools.extend([
         list_dir_definition(),
         search_file_definition(),
@@ -89,12 +93,17 @@ pub fn tool_definitions() -> Vec<Value> {
     tools
 }
 
+pub fn tool_call_test_definitions() -> Vec<Value> {
+    vec![calculator_add_definition()]
+}
+
 pub fn cli_tool_definitions(
     provider_type: &str,
     model_id: &str,
     shell_enabled: bool,
 ) -> Vec<Value> {
-    let mut tools = base_tool_definitions();
+    let mut tools = workspace_tool_definitions();
+    tools.extend(workspace_namespace_aliases());
     if shell_enabled {
         tools.push(shell_command_definition());
     }
@@ -104,9 +113,8 @@ pub fn cli_tool_definitions(
     tools
 }
 
-fn base_tool_definitions() -> Vec<Value> {
+fn workspace_tool_definitions() -> Vec<Value> {
     vec![
-        calculator_add_definition(),
         read_file_definition(),
         search_content_definition(),
         edit_file_definition(),
@@ -191,6 +199,7 @@ async fn execute_tool_inner(
             context.assume_yes,
         ).await,
         APPLY_PATCH_RAW_TOOL_NAME => Err("rejected: apply_patch_raw is reserved for compatible Codex/OpenAI adapters and is not implemented in the CLI runtime".to_string()),
+        GET_FILE_CONTEXT_TOOL_NAME | WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME => workspace_tools::get_file_context(context.workspace_root, arguments),
         VS_CURRENT_SOLUTION_TOOL_NAME => vs_bridge_client::call_vs_current_solution(context.vs_bridge_endpoint).await,
         VS_CURRENT_DOCUMENT_TOOL_NAME => vs_bridge_client::call_vs_current_document(context.vs_bridge_endpoint).await,
         VS_CURRENT_SELECTION_TOOL_NAME => vs_bridge_client::call_vs_current_selection(context.vs_bridge_endpoint).await,
@@ -696,18 +705,16 @@ fn goal_clear(context: &ToolExecutionContext<'_>) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool_interface::ToolOutputStatus;
 
     fn test_context() -> ToolExecutionContext<'static> {
-        let mut ctx = ToolExecutionContext {
+        ToolExecutionContext {
             workspace_root: ".",
             vs_bridge_endpoint: None,
             allow_shell: false,
             assume_yes: false,
             cli_mode: false,
             goal: None,
-        };
-        ctx
+        }
     }
 
     #[test]
@@ -759,16 +766,39 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.contains(&LIST_DIR_TOOL_NAME.to_string()));
+        assert!(names.contains(&WORKSPACE_LIST_DIR_TOOL_NAME.to_string()));
         assert!(names.contains(&READ_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&SEARCH_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&WORKSPACE_SEARCH_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&SEARCH_CONTENT_TOOL_NAME.to_string()));
+        assert!(names.contains(&WORKSPACE_SEARCH_CONTENT_TOOL_NAME.to_string()));
         assert!(names.contains(&GET_FILE_CONTEXT_TOOL_NAME.to_string()));
+        assert!(names.contains(&WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME.to_string()));
+        assert!(names.contains(&WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_CURRENT_SOLUTION_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_CURRENT_DOCUMENT_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_CURRENT_SELECTION_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_LIST_PROJECTS_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_LIST_PROJECT_FILES_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_GET_ERROR_LIST_TOOL_NAME.to_string()));
+        assert!(!names.contains(&CALCULATOR_ADD_TOOL_NAME.to_string()));
+    }
+
+    #[test]
+    fn tool_call_test_definitions_expose_calculator_demo_only() {
+        let names = tool_call_test_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec![CALCULATOR_ADD_TOOL_NAME.to_string()]);
     }
 
     #[test]
@@ -800,15 +830,14 @@ mod cli_runtime_tests {
     }
 
     fn context(root: &str, allow_shell: bool) -> ToolExecutionContext<'_> {
-        let mut ctx = ToolExecutionContext {
+        ToolExecutionContext {
             workspace_root: root,
             vs_bridge_endpoint: None,
             allow_shell,
             assume_yes: true,
             cli_mode: true,
             goal: None,
-        };
-        ctx
+        }
     }
 
     #[test]
@@ -832,6 +861,24 @@ mod cli_runtime_tests {
             .collect::<Vec<_>>();
         assert!(!names.contains(&APPLY_PATCH_RAW_TOOL_NAME));
         assert!(names.contains(&EDIT_FILE_TOOL_NAME));
+        assert!(names.contains(&WORKSPACE_EDIT_FILE_TOOL_NAME));
+        assert!(!names.contains(&CALCULATOR_ADD_TOOL_NAME));
+    }
+
+    #[test]
+    fn workspace_get_file_context_alias_executes() {
+        let root = workspace();
+        fs::write(root.join("sample.txt"), "one\ntwo\nthree\n").unwrap();
+        let result = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context(root.to_str().unwrap(), false),
+            WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME,
+            &json!({ "path": "sample.txt", "line": 2, "before": 1, "after": 1 }),
+        ));
+        assert_eq!(result.status, ToolOutputStatus::Ok);
+        let output = result.output.unwrap();
+        assert_eq!(output["file"], json!("sample.txt"));
+        assert_eq!(output["line"], json!(2));
+        assert_eq!(output["lines"].as_array().unwrap().len(), 3);
     }
 
     #[test]

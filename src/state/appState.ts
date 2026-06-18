@@ -10,7 +10,7 @@ import type { AppSettings, UiPreferences } from '../types/settings'
 import type { AgentTask } from '../types/task'
 
 export type View = 'projects' | 'workspace' | 'profile' | 'settings'
-type PersistedWorkspaceState = Pick<
+export type WorkspaceHistoryState = Pick<
   AppState,
   'activeProjectId' | 'currentWorkspaceTaskId' | 'tasksById' | 'taskIdsByProjectId'
 >
@@ -166,7 +166,9 @@ const workspaceHistoryStorageKey = 'snowagent.workspaceHistory.v1'
 export function normalizeSettings(settings: AppSettings): AppSettings {
   const providers =
     settings.providers && settings.providers.length > 0
-      ? mergeProviders(settings.providers)
+      ? settings.configPath.toLowerCase().endsWith('.toml')
+        ? normalizeConfiguredProviders(settings.providers)
+        : mergeProviders(settings.providers)
       : defaultProviders
 
   return {
@@ -205,46 +207,71 @@ export function ensureWorkspaceProject(state: AppState): AppState {
   }
 }
 
-export function loadPersistedWorkspaceState(): PersistedWorkspaceState {
+export function loadLegacyWorkspaceHistoryState(): WorkspaceHistoryState {
   if (typeof window === 'undefined') {
-    return emptyPersistedWorkspaceState()
+    return emptyWorkspaceHistoryState()
   }
   try {
     const raw = window.localStorage.getItem(workspaceHistoryStorageKey)
     if (!raw) {
-      return emptyPersistedWorkspaceState()
+      return emptyWorkspaceHistoryState()
     }
     const parsed: unknown = JSON.parse(raw)
-    if (!isRecord(parsed)) {
-      return emptyPersistedWorkspaceState()
-    }
-    const tasksById = readTasksById(parsed.tasksById)
-    return {
-      activeProjectId: readNullableString(parsed.activeProjectId),
-      currentWorkspaceTaskId: readNullableString(parsed.currentWorkspaceTaskId),
-      tasksById,
-      taskIdsByProjectId: readTaskIdsByProjectId(parsed.taskIdsByProjectId, tasksById),
-    }
+    return normalizeWorkspaceHistoryState(parsed)
   } catch {
-    return emptyPersistedWorkspaceState()
+    return emptyWorkspaceHistoryState()
   }
 }
 
-export function persistWorkspaceState(state: AppState): void {
+export function clearLegacyWorkspaceHistoryState(): void {
   if (typeof window === 'undefined') {
     return
   }
-  const payload: PersistedWorkspaceState = {
+  window.localStorage.removeItem(workspaceHistoryStorageKey)
+}
+
+export function normalizeWorkspaceHistoryState(value: unknown): WorkspaceHistoryState {
+  if (!isRecord(value)) {
+    return emptyWorkspaceHistoryState()
+  }
+  const tasksById = readTasksById(value.tasksById)
+  return {
+    activeProjectId: readNullableString(value.activeProjectId),
+    currentWorkspaceTaskId: readNullableString(value.currentWorkspaceTaskId),
+    tasksById,
+    taskIdsByProjectId: readTaskIdsByProjectId(value.taskIdsByProjectId, tasksById),
+  }
+}
+
+export function createWorkspaceHistorySnapshot(state: AppState): WorkspaceHistoryState {
+  const tasksById = Object.fromEntries(
+    Object.entries(state.tasksById).map(([taskId, task]) => [
+      taskId,
+      {
+        ...task,
+        traceEvents: [],
+        messages: task.messages.map((message) => ({
+          ...message,
+          traceEvents: undefined,
+        })),
+      },
+    ]),
+  )
+  return {
     activeProjectId: state.activeProjectId,
     currentWorkspaceTaskId: state.currentWorkspaceTaskId,
-    tasksById: state.tasksById,
+    tasksById,
     taskIdsByProjectId: state.taskIdsByProjectId,
   }
-  try {
-    window.localStorage.setItem(workspaceHistoryStorageKey, JSON.stringify(payload))
-  } catch {
-    // Best-effort UI history; the app can keep running if storage is unavailable.
-  }
+}
+
+export function hasWorkspaceHistory(state: WorkspaceHistoryState): boolean {
+  return (
+    Boolean(state.activeProjectId) ||
+    Boolean(state.currentWorkspaceTaskId) ||
+    Object.keys(state.tasksById).length > 0 ||
+    Object.keys(state.taskIdsByProjectId).length > 0
+  )
 }
 
 function mergeProviders(providers: ProviderConfig[]): ProviderConfig[] {
@@ -302,6 +329,34 @@ function normalizeProviderCredentials(provider: ProviderConfig): ProviderConfig[
   return []
 }
 
+function normalizeConfiguredProviders(providers: ProviderConfig[]): ProviderConfig[] {
+  const normalized = providers
+    .map((provider) => ({
+      ...provider,
+      id: provider.id.trim(),
+      name: provider.name.trim() || provider.id.trim(),
+      type: provider.type || 'openai-compatible',
+      baseUrl: provider.baseUrl ?? '',
+      baseUrlLocked: false,
+      defaultModel:
+        provider.defaultModel?.trim() ||
+        provider.models.find((model) => model.enabled)?.id ||
+        provider.models[0]?.id ||
+        '',
+      envKey: provider.envKey?.trim() ?? '',
+      wireApi: provider.wireApi || 'responses',
+      requiresOpenAiAuth: Boolean(provider.requiresOpenAiAuth),
+      credentials: normalizeProviderCredentials(provider),
+      models: normalizeProviderModels(provider.models ?? []),
+    }))
+    .filter((provider) => provider.id.length > 0 && provider.name.length > 0)
+
+  if (!normalized.some((provider) => provider.isDefault) && normalized.length > 0) {
+    return normalized.map((provider, index) => ({ ...provider, isDefault: index === 0 }))
+  }
+  return normalized
+}
+
 function normalizeProviderModels(models: ProviderModel[]): ProviderModel[] {
   return models.map((model) => {
     const id = model.id.trim()
@@ -355,7 +410,7 @@ function inferReasoningMode(modelId: string, modelName: string): ModelReasoningM
   return normalized.includes('minimax-m3') ? 'toggle' : 'none'
 }
 
-function emptyPersistedWorkspaceState(): PersistedWorkspaceState {
+export function emptyWorkspaceHistoryState(): WorkspaceHistoryState {
   return {
     activeProjectId: null,
     currentWorkspaceTaskId: null,

@@ -292,7 +292,10 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
             }
             SlashCommand::Permissions => {
-                self.open_permissions_popup();
+                self.add_info_message(
+                    "The /permissions command is disabled in CodeForge.".to_string(),
+                    None,
+                );
             }
             SlashCommand::Vim => {
                 self.toggle_vim_mode_and_notify();

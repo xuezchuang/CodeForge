@@ -254,12 +254,10 @@ For documentation-only edits, use the smallest safe check that proves the change
 
 ## Reporting
 
-When reporting code locations to the user, use copyable Visual Studio style:
+When reporting code locations to the user, use direct clickable VS Code links, one per line. Do not put them in a fenced code block, and do not use file cards or rich previews as the primary format:
 
-```text
-src\components\TraceDrawer.tsx:130
-src-tauri\src\agent_runner.rs:249
-```
+[TraceDrawer.tsx:130](vscode://file/D:/code/snowAgents/src/components/TraceDrawer.tsx:130)
+[agent_runner.rs:249](vscode://file/D:/code/snowAgents/src-tauri/src/agent_runner.rs:249)
 
 Summarize:
 

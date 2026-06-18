@@ -73,7 +73,24 @@ Keep CLI changes aligned with this repository's Rust/Tauri ownership model. The 
 
 CodeForge CLI is a first-class product surface, not just a helper launcher.
 
-The first CLI milestone is to make the CodeForge command-line experience closely match the Codex CLI/TUI interaction model while still running CodeForge's own Rust/Tauri backend, provider settings, workspace state, trace system, Visual Studio bridge, and CodeForge-owned tools.
+The first CLI milestone is to make the CodeForge command-line experience closely match the useful parts of the Codex CLI interaction model while still running CodeForge's own Rust/Tauri backend, provider settings, workspace state, trace system, Visual Studio bridge, and CodeForge-owned tools.
+
+### CodeForge TUI Ownership
+
+The terminal UI under `src-tui` is CodeForge TUI. It is CodeForge-owned code, even when it was copied from or adapted from Codex sources.
+
+Use Codex as a reference implementation for terminal interaction details, event shapes, rendering behavior, and useful UI patterns. Do not describe the product architecture as "running Codex TUI", and do not treat CodeForge as a thin wrapper around Codex.
+
+The intended CLI/TUI architecture is:
+
+```text
+codeforge.exe
+-> CodeForge TUI
+-> CodeForge-owned backend adapter / app-server-like event source
+-> CodeForge provider, config, tool, trace, workspace, and Visual Studio integrations
+```
+
+Codex backend integration should be incremental. Prefer vertical slices that make one CodeForge behavior work end-to-end over importing large Codex subsystems. Do not wholesale adopt Codex core, Codex sandboxing, OpenAI account/auth flows, cloud config, plugin loading, or broad MCP/runtime machinery unless the user explicitly asks for a specific piece and the ownership boundary is clear.
 
 Use the in-repository Codex checkout as the primary reference for CLI/TUI behavior:
 
@@ -83,11 +100,11 @@ codex\codex-rs\tui\
 codex\codex-rs\app-server-protocol\
 ```
 
-The goal is not to embed the whole Codex core runtime as CodeForge's architecture. CodeForge should selectively copy, adapt, or reimplement the parts it needs.
+The goal is not to embed the whole Codex core runtime as CodeForge's architecture. CodeForge should selectively copy, adapt, or reimplement the parts it needs, then rename and own those pieces as CodeForge code where appropriate.
 
 Prioritize the CLI surface first:
 
-- Codex-like interactive terminal UI.
+- CodeForge interactive terminal UI with Codex-inspired behavior.
 - Composer/input behavior.
 - Slash command popup and command routing.
 - `/goal` style goal management.
@@ -96,7 +113,7 @@ Prioritize the CLI surface first:
 - Clear command parsing and error behavior.
 - Traceable agent/tool activity.
 
-Then build the tool layer interface:
+Then build the CodeForge tool layer interface:
 
 - Tool schema definitions.
 - Tool invocation request/response types.
@@ -105,7 +122,7 @@ Then build the tool layer interface:
 - Trace event mapping for tool calls.
 - A small registry for CodeForge-owned tools.
 
-Only implement tools CodeForge actually needs. Do not bring over broad Codex features just because they exist.
+Only implement tools CodeForge actually needs. Do not bring over broad Codex features just because they exist. For the next milestone, focus on CodeForge-owned tools instead of Codex sandbox/runtime integration.
 
 CodeForge tools should support coding workflows, especially local C++ / Visual Studio project understanding. Preferred early tools include:
 
@@ -125,7 +142,7 @@ goal/set
 goal/clear
 ```
 
-Do not expose arbitrary shell execution as a generic tool. If build or test support is needed, implement explicit safe tools with fixed command templates, workspace confinement, user confirmation, and trace output.
+Do not expose arbitrary shell execution as a generic tool. Do not adopt Codex sandboxing as the first answer to tool execution. If build or test support is needed, implement explicit CodeForge tools such as `build_solution` or `run_tests` with fixed command templates, workspace confinement, user confirmation, and trace output.
 
 Copying or adapting Codex CLI/TUI/tool-interface code is allowed when it directly serves the CodeForge CLI goal.
 

@@ -69,7 +69,6 @@ use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadInjectItemsResponse;
-use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListParams;
@@ -126,10 +125,12 @@ use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
@@ -193,6 +194,10 @@ pub(crate) struct AppServerSession {
     default_model: Option<String>,
     available_models: Vec<ModelPreset>,
     stub_config: Option<Config>,
+    stub_event_tx: Option<mpsc::Sender<codex_app_server_client::AppServerEvent>>,
+    stub_event_rx: Option<mpsc::Receiver<codex_app_server_client::AppServerEvent>>,
+    stub_trace_store: Option<Arc<crate::codeforge_trace_store::TraceStore>>,
+    stub_goal_slot: Option<Arc<std::sync::RwLock<Option<crate::codeforge_goal_state::GoalState>>>>,
     external_agent_config_import_completion_pending: AtomicBool,
 }
 
@@ -238,11 +243,33 @@ impl AppServerSession {
             default_model: None,
             available_models: Vec::new(),
             stub_config: None,
+            stub_event_tx: None,
+            stub_event_rx: None,
+            stub_trace_store: None,
+            stub_goal_slot: None,
             external_agent_config_import_completion_pending: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn stub(thread_params_mode: ThreadParamsMode, config: Config) -> Self {
+        let (event_tx, event_rx) = crate::codeforge_backend::event_channel();
+        let codeforge_home = config.codex_home.to_path_buf();
+        let stub_trace_store = match crate::codeforge_trace_store::TraceStore::new(&codeforge_home)
+        {
+            Ok(store) => Some(Arc::new(store)),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to initialize CodeForge TUI trace store");
+                None
+            }
+        };
+        let initial_goal = crate::codeforge_goal_state::load(&codeforge_home)
+            .map_err(|err| {
+                tracing::warn!(error = %err, "failed to load CodeForge TUI goal state");
+                err
+            })
+            .ok()
+            .flatten();
+        let stub_goal_slot = Some(Arc::new(std::sync::RwLock::new(initial_goal)));
         Self {
             client: None,
             next_request_id: 1,
@@ -252,6 +279,10 @@ impl AppServerSession {
             default_model: None,
             available_models: Vec::new(),
             stub_config: Some(config),
+            stub_event_tx: Some(event_tx),
+            stub_event_rx: Some(event_rx),
+            stub_trace_store,
+            stub_goal_slot,
             external_agent_config_import_completion_pending: AtomicBool::new(false),
         }
     }
@@ -516,7 +547,10 @@ impl AppServerSession {
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
         match self.client.as_mut() {
             Some(client) => client.next_event().await,
-            None => None,
+            None => match self.stub_event_rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => None,
+            },
         }
     }
 
@@ -874,27 +908,32 @@ impl AppServerSession {
             let config = self
                 .stub_config
                 .as_ref()
-                .wrap_err("stub app-server is missing CodeForge config")?;
-            let reply = match crate::codeforge_direct_chat::complete(config, &model, &prompt).await
-            {
-                Ok(reply) => reply,
-                Err(err) => format!("CodeForge direct chat failed: {err}"),
-            };
+                .wrap_err("stub app-server is missing CodeForge config")?
+                .clone();
+            let event_tx = self.stub_event_tx.as_ref().wrap_err(
+                "stub app-server is missing the in-process event channel. The TUI must initialize AppServerSession::stub() before turn_start.",
+            )?;
+            let mut backend = crate::codeforge_backend::CodeForgeBackend::new(event_tx.clone())
+                .with_codeforge_home(config.codex_home.to_path_buf());
+            if let Some(store) = self.stub_trace_store.as_ref() {
+                backend = backend.with_trace_store(store.clone());
+            }
+            if let Some(slot) = self.stub_goal_slot.as_ref() {
+                backend = backend.with_goal_slot(slot.clone());
+            }
+            let workspace_root = cwd.clone();
+            let handle =
+                backend.spawn_turn(Arc::new(config), thread_id, model, prompt, workspace_root);
             return Ok(TurnStartResponse {
                 turn: Turn {
-                    id: format!("stub-turn-{}", Uuid::new_v4()),
-                    items: vec![ThreadItem::AgentMessage {
-                        id: format!("stub-agent-{}", Uuid::new_v4()),
-                        text: reply,
-                        phase: None,
-                        memory_citation: None,
-                    }],
+                    id: handle.turn_id,
+                    items: Vec::new(),
                     items_view: Default::default(),
-                    status: codex_app_server_protocol::TurnStatus::Completed,
+                    status: codex_app_server_protocol::TurnStatus::InProgress,
                     error: None,
-                    started_at: None,
+                    started_at: Some(handle.started_at_ms / 1000),
                     completed_at: None,
-                    duration_ms: Some(0),
+                    duration_ms: None,
                 },
             });
         }

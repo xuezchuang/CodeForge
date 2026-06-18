@@ -60,6 +60,7 @@ codex-utils-sandbox-summary = { path = "../codex/codex-rs/utils/sandbox-summary"
 codex-utils-sleep-inhibitor = { path = "../codex/codex-rs/utils/sleep-inhibitor" }
 codex-utils-string = { path = "../codex/codex-rs/utils/string" }
 color-eyre = "0.6.3"
+futures = "0.3"
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 derive_more = { version = "2", features = ["is_variant"] }
 diffy = "0.4.2"
@@ -79,7 +80,7 @@ ratatui = { version = "0.29.0", features = [
 ] }
 ratatui-macros = "0.6.0"
 regex-lite = "0.1.8"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
 rmcp = { version = "1.7.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

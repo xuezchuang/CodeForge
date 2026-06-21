@@ -78,8 +78,16 @@ function ChatMessage({
       .catch(() => undefined)
   }
 
+  const messageClassName = [
+    'chat-message',
+    isUser ? 'user' : 'assistant',
+    message.status === 'failed' ? 'failed' : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+
   return (
-    <article className={isUser ? 'chat-message user' : 'chat-message assistant'}>
+    <article className={messageClassName}>
       <div className="message-avatar">
         {isUser ? (
           <UserRound size={16} aria-hidden="true" />
@@ -292,14 +300,6 @@ function RunningAssistantContent({
 
   return (
     <>
-      <p className="markdown-paragraph running-thinking-line">
-        <span>Thinking</span>
-        <span className="thinking-dots" aria-hidden="true">
-          <span>.</span>
-          <span>.</span>
-          <span>.</span>
-        </span>
-      </p>
       {thinkingSummary && thinkingSummary.items.length > 0 ? (
         <div className="running-thinking-steps">
           {thinkingSummary.items.map((item) => (
@@ -325,6 +325,14 @@ function RunningAssistantContent({
           onTraceChanged={onTraceChanged}
         />
       ) : null}
+      <p className="markdown-paragraph running-thinking-line">
+        <span>Thinking</span>
+        <span className="thinking-dots" aria-hidden="true">
+          <span>.</span>
+          <span>.</span>
+          <span>.</span>
+        </span>
+      </p>
     </>
   )
 }
@@ -825,9 +833,12 @@ function createThinkingSummary(
     (event, index) =>
       isVisibleThinkingEvent(event) && !isSupersededToolCall(event, events, index),
   )
-  const items = visibleEvents
+  const items = orderThinkingItems(
+    visibleEvents
     .map(createThinkingItem)
-    .filter((item): item is ThinkingItem => item !== null)
+      .filter((item): item is ThinkingItem => item !== null),
+    options.running,
+  )
 
   if (items.length === 0) {
     return null
@@ -841,6 +852,15 @@ function createThinkingSummary(
     items: items.slice(0, THINKING_MAX_VISIBLE_ITEMS),
     omitted: Math.max(0, items.length - THINKING_MAX_VISIBLE_ITEMS),
   }
+}
+
+function orderThinkingItems(items: ThinkingItem[], running: boolean): ThinkingItem[] {
+  if (!running) {
+    return items
+  }
+  const modelThoughtItems = items.filter((item) => item.progressive)
+  const otherItems = items.filter((item) => !item.progressive)
+  return [...otherItems, ...modelThoughtItems]
 }
 
 function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {

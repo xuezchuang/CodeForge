@@ -12,7 +12,11 @@ import type { ChangeEvent, ClipboardEvent, KeyboardEvent } from 'react'
 import type { ProviderConfig } from '../types/provider'
 import type { ModelReasoningMode } from '../types/provider'
 import type { MessageAttachment } from '../types/task'
-import { getSelectableModels, type SelectableModel } from '../utils/providerModels'
+import {
+  getDefaultSelectableModel,
+  getSelectableModels,
+  type SelectableModel,
+} from '../utils/providerModels'
 
 interface ComposerProps {
   providers: ProviderConfig[]
@@ -53,9 +57,13 @@ function Composer({
   const [attachments, setAttachments] = useState<MessageAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState('')
   const selectableModels = useMemo(() => getSelectableModels(providers), [providers])
+  const defaultSelectableModel = useMemo(
+    () => getDefaultSelectableModel(providers, selectableModels),
+    [providers, selectableModels],
+  )
   const selectedModel =
     selectableModels.find((model) => model.id === selectedModelId) ??
-    selectableModels[0] ??
+    defaultSelectableModel ??
     null
   const selectedModelReasoningMode = useMemo(
     () => resolveReasoningMode(selectedModel, providers),

@@ -38,6 +38,51 @@ export function getSelectableModels(providers: ProviderConfig[]): SelectableMode
   })
 }
 
+export function getDefaultSelectableModel(
+  providers: ProviderConfig[],
+  selectableModels: SelectableModel[],
+): SelectableModel | null {
+  const provider =
+    providers.find((provider) => provider.isDefault) ??
+    providers.find((provider) => provider.enabled) ??
+    providers[0]
+  if (!provider) {
+    return selectableModels[0] ?? null
+  }
+
+  const providerModels = selectableModels.filter((model) => model.providerId === provider.id)
+  if (providerModels.length === 0) {
+    return selectableModels[0] ?? null
+  }
+
+  const defaultModel = provider.defaultModel.trim()
+  const defaultCredential = provider.defaultCredentialId.trim()
+  if (defaultModel && defaultCredential) {
+    const model = providerModels.find(
+      (model) => model.modelId === defaultModel && model.credentialId === defaultCredential,
+    )
+    if (model) {
+      return model
+    }
+  }
+
+  if (defaultModel) {
+    const model = providerModels.find((model) => model.modelId === defaultModel)
+    if (model) {
+      return model
+    }
+  }
+
+  if (defaultCredential) {
+    const model = providerModels.find((model) => model.credentialId === defaultCredential)
+    if (model) {
+      return model
+    }
+  }
+
+  return providerModels[0] ?? selectableModels[0] ?? null
+}
+
 function providerUsesCredentials(provider: ProviderConfig): boolean {
   return provider.type !== 'ollama' && provider.type !== 'codex-cli'
 }

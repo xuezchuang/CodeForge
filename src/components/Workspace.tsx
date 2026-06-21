@@ -215,7 +215,7 @@ function Workspace({
           taskId: traceEvent.taskId,
           events:
             current?.taskId === traceEvent.taskId ?
-              appendTraceEvent(current.events, traceEvent)
+              upsertTraceEvent(current.events, traceEvent)
             : [traceEvent],
         }))
         setState((current) =>
@@ -641,7 +641,7 @@ function appendTraceEventToSession(
     return state
   }
 
-  const nextTaskTraceEvents = appendTraceEvent(task.traceEvents, traceEvent)
+  const nextTaskTraceEvents = upsertTraceEvent(task.traceEvents, traceEvent)
 
   return {
     ...state,
@@ -656,7 +656,7 @@ function appendTraceEventToSession(
               if (message.id !== pendingAssistantMessageId) {
                 return message
               }
-              const nextMessageTraceEvents = appendTraceEvent(
+              const nextMessageTraceEvents = upsertTraceEvent(
                 message.traceEvents ?? [],
                 traceEvent,
               )
@@ -665,7 +665,7 @@ function appendTraceEventToSession(
                 taskId: traceEvent.taskId,
                 content: createRunningAssistantContent(nextMessageTraceEvents),
                 traceEvents: nextMessageTraceEvents,
-                status: 'running',
+                status: hasFailedTrace(nextMessageTraceEvents) ? 'failed' : 'running',
               }
             })
           : task.messages,
@@ -714,12 +714,20 @@ function taskHasTraceSelection(task: AgentTask, taskId: string): boolean {
   )
 }
 
-function appendTraceEvent(
+function upsertTraceEvent(
   events: ToolTraceEvent[],
   traceEvent: ToolTraceEvent,
 ): ToolTraceEvent[] {
-  if (events.some((event) => event.id === traceEvent.id)) {
-    return events
+  let replaced = false
+  const nextEvents = events.map((event) => {
+    if (event.id !== traceEvent.id) {
+      return event
+    }
+    replaced = true
+    return traceEvent
+  })
+  if (replaced) {
+    return nextEvents
   }
   return [...events, traceEvent]
 }

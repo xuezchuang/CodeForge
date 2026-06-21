@@ -8,14 +8,17 @@ import {
   CircleAlert,
   CircleCheck,
   CircleX,
+  ChevronRight,
   Clock3,
   Download,
   FileText,
+  Maximize2,
   Search,
   X,
   Zap,
 } from 'lucide-react'
 import type { ToolTraceEvent, TraceStatus } from '../types/trace'
+import { JsonTree } from './TraceEventRow'
 
 interface TraceDrawerProps {
   open: boolean
@@ -24,7 +27,19 @@ interface TraceDrawerProps {
   onClose: () => void
 }
 
-type TraceTab = 'overview' | 'request' | 'tool' | 'response'
+type TraceTab = 'overview' | 'request' | 'response'
+type TraceRawKind = 'request' | 'response'
+
+const traceRawDefaultCollapsedKeys = [
+  'tool',
+  'tools',
+  'tool_call',
+  'tool_calls',
+  'toolCall',
+  'toolCalls',
+  'available_tools',
+  'availableTools',
+]
 
 interface TraceRound {
   id: string
@@ -79,6 +94,18 @@ interface TraceMessage {
   content: string
 }
 
+interface TraceRawDialogState {
+  round: TraceRound
+  kind: TraceRawKind
+}
+
+type TraceToolDetailDialogState =
+  | { kind: 'call'; toolCall: TraceToolCall }
+  | { kind: 'result'; toolResult: TraceToolResult }
+
+type OpenTraceRawJson = (round: TraceRound, kind: TraceRawKind) => void
+type OpenTraceToolDetail = (detail: TraceToolDetailDialogState) => void
+
 interface TraceRunSummary {
   totalDurationMs: number | null
   requestCount: number
@@ -109,6 +136,8 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
   const [selectedRoundId, setSelectedRoundId] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<TraceTab>('overview')
   const [selectedToolId, setSelectedToolId] = useState<string | null>(null)
+  const [rawDialog, setRawDialog] = useState<TraceRawDialogState | null>(null)
+  const [toolDetailDialog, setToolDetailDialog] = useState<TraceToolDetailDialogState | null>(null)
   const rounds = useMemo(() => createTraceRounds(traceEvents), [traceEvents])
   const tokenSummary = useMemo(() => createTraceTokenSummary(traceEvents), [traceEvents])
   const runSummary = useMemo(() => createTraceRunSummary(traceEvents, rounds), [rounds, traceEvents])
@@ -120,16 +149,24 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        onClose()
+        if (toolDetailDialog) {
+          setToolDetailDialog(null)
+        } else if (rawDialog) {
+          setRawDialog(null)
+        } else {
+          onClose()
+        }
       }
     }
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [onClose, open])
+  }, [onClose, open, rawDialog, toolDetailDialog])
 
   useEffect(() => {
     if (!open) {
+      setRawDialog(null)
+      setToolDetailDialog(null)
       return
     }
 
@@ -160,6 +197,14 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
     }
   }
 
+  const openRawDialog: OpenTraceRawJson = (round, kind) => {
+    setRawDialog({ round, kind })
+  }
+
+  const openToolDetailDialog: OpenTraceToolDetail = (detail) => {
+    setToolDetailDialog(detail)
+  }
+
   return (
     <div className="trace-modal-backdrop" onMouseDown={handleBackdropMouseDown}>
       <aside
@@ -188,7 +233,12 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
             onSelectRound={setSelectedRoundId}
           />
           <main className="trace-chain-main">
-            <TraceTabBar activeTab={activeTab} onSelectTab={setActiveTab} />
+            <TraceTabBar
+              activeTab={activeTab}
+              round={selectedRound}
+              onSelectTab={setActiveTab}
+              onOpenRawJson={openRawDialog}
+            />
             <div className="trace-chain-content">
               {!selectedRound ? (
                 <div className="trace-detail-empty">No trace round selected.</div>
@@ -198,6 +248,7 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
                   activeTab={activeTab}
                   selectedToolId={selectedToolId}
                   onSelectTool={setSelectedToolId}
+                  onOpenToolDetail={openToolDetailDialog}
                 />
               )}
             </div>
@@ -210,6 +261,20 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
           taskId={taskId}
         />
       </aside>
+      {rawDialog ? (
+        <TraceRawJsonDialog
+          round={rawDialog.round}
+          kind={rawDialog.kind}
+          onChangeKind={(kind) => setRawDialog((current) => current ? { ...current, kind } : current)}
+          onClose={() => setRawDialog(null)}
+        />
+      ) : null}
+      {toolDetailDialog ? (
+        <TraceToolDetailDialog
+          detail={toolDetailDialog}
+          onClose={() => setToolDetailDialog(null)}
+        />
+      ) : null}
     </div>
   )
 }
@@ -376,34 +441,80 @@ function TraceRoundSidebar({
 
 function TraceTabBar({
   activeTab,
+  round,
   onSelectTab,
+  onOpenRawJson,
 }: {
   activeTab: TraceTab
+  round: TraceRound | null
   onSelectTab: (tab: TraceTab) => void
+  onOpenRawJson: OpenTraceRawJson
 }) {
   const tabs: Array<{ id: TraceTab; label: string }> = [
     { id: 'overview', label: '概览' },
     { id: 'request', label: 'Request' },
-    { id: 'tool', label: 'Tool' },
     { id: 'response', label: 'Response' },
   ]
+  const rawAction = traceTabRawAction(activeTab, round)
 
   return (
     <div className="trace-chain-tabs" role="tablist" aria-label="Trace views">
-      {tabs.map((tab) => (
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab.id === activeTab}
-          className={tab.id === activeTab ? 'trace-chain-tab active' : 'trace-chain-tab'}
-          onClick={() => onSelectTab(tab.id)}
-          key={tab.id}
-        >
-          {tab.label}
-        </button>
-      ))}
+      <div className="trace-chain-tab-list">
+        {tabs.map((tab) => (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab.id === activeTab}
+            className={tab.id === activeTab ? 'trace-chain-tab active' : 'trace-chain-tab'}
+            onClick={() => onSelectTab(tab.id)}
+            key={tab.id}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      <div className="trace-chain-tab-actions">
+        {rawAction && round ? (
+          <button
+            type="button"
+            className="trace-json-open-button"
+            onClick={() => onOpenRawJson(round, rawAction.kind)}
+          >
+            <Maximize2 size={14} aria-hidden="true" />
+            {rawAction.label}
+          </button>
+        ) : null}
+      </div>
     </div>
   )
+}
+
+function traceTabRawAction(
+  activeTab: TraceTab,
+  round: TraceRound | null,
+): { kind: TraceRawKind; label: string } | null {
+  if (!round) {
+    return null
+  }
+  if (activeTab === 'overview') {
+    return {
+      kind: 'response',
+      label: '查看 Raw',
+    }
+  }
+  if (activeTab === 'request') {
+    return {
+      kind: 'request',
+      label: '查看 Request Raw',
+    }
+  }
+  if (activeTab === 'response') {
+    return {
+      kind: 'response',
+      label: '查看 Response Raw',
+    }
+  }
+  return null
 }
 
 function TraceRoundContent({
@@ -411,32 +522,26 @@ function TraceRoundContent({
   activeTab,
   selectedToolId,
   onSelectTool,
+  onOpenToolDetail,
 }: {
   round: TraceRound
   activeTab: TraceTab
   selectedToolId: string | null
   onSelectTool: (toolId: string) => void
+  onOpenToolDetail: OpenTraceToolDetail
 }) {
   if (activeTab === 'request') {
     return <TraceRequestView round={round} />
   }
-  if (activeTab === 'tool') {
-    return (
-      <TraceToolView
-        round={round}
-        selectedToolId={selectedToolId}
-        onSelectTool={onSelectTool}
-      />
-    )
-  }
   if (activeTab === 'response') {
-    return <TraceResponseView round={round} />
+    return <TraceResponseView round={round} onOpenToolDetail={onOpenToolDetail} />
   }
   return (
     <TraceOverviewView
       round={round}
       selectedToolId={selectedToolId}
       onSelectTool={onSelectTool}
+      onOpenToolDetail={onOpenToolDetail}
     />
   )
 }
@@ -445,10 +550,12 @@ function TraceOverviewView({
   round,
   selectedToolId,
   onSelectTool,
+  onOpenToolDetail,
 }: {
   round: TraceRound
   selectedToolId: string | null
   onSelectTool: (toolId: string) => void
+  onOpenToolDetail: OpenTraceToolDetail
 }) {
   return (
     <div className="trace-chain-scroll">
@@ -458,7 +565,7 @@ function TraceOverviewView({
         count={round.toolCalls.length}
         hint="这些工具将在当前 Response 中按顺序调用"
       >
-        <TraceToolCallGrid toolCalls={round.toolCalls} />
+        <TraceToolCallGrid toolCalls={round.toolCalls} onOpenToolDetail={onOpenToolDetail} />
       </TraceSection>
       <TraceSection
         title="Tool 执行结果"
@@ -469,6 +576,7 @@ function TraceOverviewView({
           toolResults={round.toolResults}
           selectedToolId={selectedToolId}
           onSelectTool={onSelectTool}
+          onOpenToolDetail={onOpenToolDetail}
         />
       </TraceSection>
     </div>
@@ -476,17 +584,45 @@ function TraceOverviewView({
 }
 
 function TraceRequestView({ round }: { round: TraceRound }) {
+  const [expandedMessageIds, setExpandedMessageIds] = useState<Set<string>>(() => new Set())
+
+  const toggleMessage = (messageId: string) => {
+    setExpandedMessageIds((current) => {
+      const next = new Set(current)
+      if (next.has(messageId)) {
+        next.delete(messageId)
+      } else {
+        next.add(messageId)
+      }
+      return next
+    })
+  }
+
   return (
     <div className="trace-chain-scroll">
       <TraceRoundSummary round={round} />
-      <section className="trace-chain-grid two">
+      <section className="trace-request-stack">
         <TraceSection title="Messages" count={round.messages.length}>
           <div className="trace-message-list">
             {round.messages.map((message) => (
-              <div className="trace-message-row" key={message.id}>
-                <span>{formatTimestamp(round.request?.startedAt ?? null)}</span>
+              <div
+                className={`trace-message-row ${traceMessageRoleClass(message.role)} ${
+                  expandedMessageIds.has(message.id) ? 'expanded' : ''
+                }`}
+                key={message.id}
+              >
+                <span className="trace-message-dot" aria-hidden="true" />
                 <em>{message.role || 'message'}</em>
                 <p>{message.content || '(empty)'}</p>
+                <button
+                  type="button"
+                  className="trace-message-expand"
+                  onClick={() => toggleMessage(message.id)}
+                  aria-label={expandedMessageIds.has(message.id) ? 'Collapse message' : 'Expand message'}
+                  aria-expanded={expandedMessageIds.has(message.id)}
+                >
+                  <ChevronRight className="trace-message-chevron" size={15} aria-hidden="true" />
+                </button>
               </div>
             ))}
             {round.messages.length === 0 ? (
@@ -498,54 +634,28 @@ function TraceRequestView({ round }: { round: TraceRound }) {
           <TraceToolDefinitionGrid tools={round.availableTools} />
         </TraceSection>
       </section>
-      <TraceJsonBlock title="原始 Request JSON" value={round.request?.input ?? null} />
     </div>
   )
 }
 
-function TraceToolView({
+function TraceResponseView({
   round,
-  selectedToolId,
-  onSelectTool,
+  onOpenToolDetail,
 }: {
   round: TraceRound
-  selectedToolId: string | null
-  onSelectTool: (toolId: string) => void
+  onOpenToolDetail: OpenTraceToolDetail
 }) {
-  const selectedResult =
-    round.toolResults.find((result) => result.id === selectedToolId) ?? round.toolResults[0] ?? null
-
-  return (
-    <div className="trace-tool-layout">
-      <div className="trace-chain-scroll">
-        <TraceSection
-          title="本次 Response 计划调用工具"
-          count={round.toolCalls.length}
-          hint="点击工具结果查看输入、输出和原始 JSON"
-        >
-          <TraceToolCallGrid toolCalls={round.toolCalls} />
-        </TraceSection>
-        <TraceSection title="执行结果" count={round.toolResults.length}>
-          <TraceToolResultGrid
-            toolResults={round.toolResults}
-            selectedToolId={selectedToolId}
-            onSelectTool={onSelectTool}
-          />
-        </TraceSection>
-      </div>
-      <TraceToolDetailPanel result={selectedResult} />
-    </div>
-  )
-}
-
-function TraceResponseView({ round }: { round: TraceRound }) {
   const preview = responsePreview(round.response)
 
   return (
     <div className="trace-chain-scroll">
       <TraceRoundSummary round={round} />
       <TraceSection title="本次 Response 决定调用的工具" count={round.toolCalls.length}>
-        <TraceToolCallGrid toolCalls={round.toolCalls} compact />
+        <TraceToolCallGrid
+          toolCalls={round.toolCalls}
+          compact
+          onOpenToolDetail={onOpenToolDetail}
+        />
       </TraceSection>
       <TraceSection title="Response 预览">
         {preview ? (
@@ -554,7 +664,6 @@ function TraceResponseView({ round }: { round: TraceRound }) {
           <div className="trace-card-empty">No natural-language response captured.</div>
         )}
       </TraceSection>
-      <TraceJsonBlock title="原始 Response JSON" value={round.response?.output ?? null} open />
     </div>
   )
 }
@@ -613,9 +722,11 @@ function TraceSection({
 function TraceToolCallGrid({
   toolCalls,
   compact = false,
+  onOpenToolDetail,
 }: {
   toolCalls: TraceToolCall[]
   compact?: boolean
+  onOpenToolDetail?: OpenTraceToolDetail
 }) {
   if (toolCalls.length === 0) {
     return <div className="trace-card-empty">No tool calls in this response.</div>
@@ -624,11 +735,16 @@ function TraceToolCallGrid({
   return (
     <div className={compact ? 'trace-tool-call-strip' : 'trace-tool-call-grid'}>
       {toolCalls.map((tool) => (
-        <div className="trace-tool-call-card" key={tool.id}>
+        <button
+          type="button"
+          className="trace-tool-call-card"
+          onClick={() => onOpenToolDetail?.({ kind: 'call', toolCall: tool })}
+          key={tool.id}
+        >
           <span>{tool.index}</span>
           <strong>{tool.name}</strong>
           {!compact ? <p>{compactJson(tool.argumentsValue, 120)}</p> : null}
-        </div>
+        </button>
       ))}
     </div>
   )
@@ -656,10 +772,12 @@ function TraceToolResultGrid({
   toolResults,
   selectedToolId,
   onSelectTool,
+  onOpenToolDetail,
 }: {
   toolResults: TraceToolResult[]
   selectedToolId: string | null
   onSelectTool: (toolId: string) => void
+  onOpenToolDetail: OpenTraceToolDetail
 }) {
   if (toolResults.length === 0) {
     return <div className="trace-card-empty">No tool results captured for this round.</div>
@@ -673,7 +791,10 @@ function TraceToolResultGrid({
           className={
             result.id === selectedToolId ? 'trace-tool-result-card selected' : 'trace-tool-result-card'
           }
-          onClick={() => onSelectTool(result.id)}
+          onClick={() => {
+            onSelectTool(result.id)
+            onOpenToolDetail({ kind: 'result', toolResult: result })
+          }}
           key={result.id}
         >
           <span>
@@ -693,52 +814,203 @@ function TraceToolResultGrid({
   )
 }
 
-function TraceToolDetailPanel({ result }: { result: TraceToolResult | null }) {
+function TraceRawJsonDialog({
+  round,
+  kind,
+  onChangeKind,
+  onClose,
+}: {
+  round: TraceRound
+  kind: TraceRawKind
+  onChangeKind: (kind: TraceRawKind) => void
+  onClose: () => void
+}) {
+  const rawView = traceRawDialogView(round, kind)
+  const handleBackdropMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.target === event.currentTarget) {
+      onClose()
+    }
+  }
+
   return (
-    <aside className="trace-tool-detail-panel">
-      {!result ? (
-        <div className="trace-detail-empty">Select a tool result.</div>
-      ) : (
-        <>
-          <header>
-            <div>
-              <strong>{result.name}</strong>
-              <StatusPill status={result.status} />
+    <div className="trace-raw-dialog-backdrop" onMouseDown={handleBackdropMouseDown}>
+      <section
+        className="trace-raw-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={rawView.title}
+      >
+        <header>
+          <div className="trace-raw-dialog-heading">
+            <div className="trace-raw-kind-switch" aria-label="Raw JSON source">
+              <button
+                type="button"
+                className={kind === 'request' ? 'active' : ''}
+                onClick={() => onChangeKind('request')}
+              >
+                Request
+              </button>
+              <button
+                type="button"
+                className={kind === 'response' ? 'active' : ''}
+                onClick={() => onChangeKind('response')}
+              >
+                Response
+              </button>
             </div>
-            <small>
-              {formatTimestamp(result.startedAt)} · {formatDurationShort(result.durationMs)}
-            </small>
-          </header>
-          <TraceSection title="输入 (Input)">
-            <pre className="trace-response-preview">{formatJson(result.argumentsValue)}</pre>
-          </TraceSection>
-          <TraceSection title="输出摘要 (Output Summary)">
-            <pre className="trace-response-preview">
-              {result.outputSummary || compactJson(result.rawOutput, 600) || '-'}
-            </pre>
-          </TraceSection>
-          <TraceJsonBlock title="原始响应 (Raw Response)" value={result.rawOutput} />
-        </>
-      )}
-    </aside>
+            <div className="trace-raw-dialog-title">
+              <strong>{rawView.title}</strong>
+              <span>Raw JSON</span>
+            </div>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Close raw JSON">
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+        <JsonTree
+          value={maskSecrets(rawView.value)}
+          defaultExpandAll
+          defaultCollapsedKeys={traceRawDefaultCollapsedKeys}
+          allowLineWrapToggle={false}
+        />
+      </section>
+    </div>
   )
 }
 
-function TraceJsonBlock({
+function TraceToolDetailDialog({
+  detail,
+  onClose,
+}: {
+  detail: TraceToolDetailDialogState
+  onClose: () => void
+}) {
+  const title =
+    detail.kind === 'call' ?
+      `Tool Call #${detail.toolCall.index}: ${detail.toolCall.name}`
+    : `Tool Result #${detail.toolResult.index}: ${detail.toolResult.name}`
+  const subtitle = detail.kind === 'call' ? 'Tool Call' : 'Tool Result'
+  const handleBackdropMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.target === event.currentTarget) {
+      onClose()
+    }
+  }
+
+  return (
+    <div className="trace-raw-dialog-backdrop" onMouseDown={handleBackdropMouseDown}>
+      <section
+        className="trace-raw-dialog trace-tool-detail-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+      >
+        <header>
+          <div className="trace-raw-dialog-heading">
+            <div className="trace-raw-dialog-title">
+              <strong>{title}</strong>
+              <span>{subtitle}</span>
+            </div>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Close tool detail">
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+        <div className="trace-tool-detail-dialog-body">
+          {detail.kind === 'call' ? (
+            <>
+              <TraceToolDetailMeta
+                items={[
+                  ['工具', detail.toolCall.name],
+                  ['序号', String(detail.toolCall.index)],
+                ]}
+              />
+              <TraceToolDetailBlock title="输入">
+                <JsonTree
+                  value={maskSecrets(detail.toolCall.argumentsValue)}
+                  defaultExpandAll
+                  allowLineWrapToggle={false}
+                />
+              </TraceToolDetailBlock>
+            </>
+          ) : (
+            <>
+              <TraceToolDetailMeta
+                items={[
+                  ['工具', detail.toolResult.name],
+                  ['状态', statusLabel(detail.toolResult.status)],
+                  ['开始时间', formatTimestamp(detail.toolResult.startedAt)],
+                  ['耗时', formatDurationShort(detail.toolResult.durationMs)],
+                ]}
+              />
+              <TraceToolDetailBlock title="输入">
+                <JsonTree
+                  value={maskSecrets(detail.toolResult.argumentsValue)}
+                  defaultExpandAll
+                  allowLineWrapToggle={false}
+                />
+              </TraceToolDetailBlock>
+              <TraceToolDetailBlock title="输出">
+                <JsonTree
+                  value={maskSecrets(toolResultDisplayOutput(detail.toolResult))}
+                  defaultExpandAll
+                  allowLineWrapToggle={false}
+                />
+              </TraceToolDetailBlock>
+            </>
+          )}
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function TraceToolDetailMeta({ items }: { items: Array<[string, string]> }) {
+  return (
+    <section className="trace-tool-detail-meta">
+      {items.map(([label, value]) => (
+        <span key={label}>
+          <small>{label}</small>
+          <strong>{value || '-'}</strong>
+        </span>
+      ))}
+    </section>
+  )
+}
+
+function TraceToolDetailBlock({
   title,
-  value,
-  open = false,
+  children,
 }: {
   title: string
-  value: unknown
-  open?: boolean
+  children: ReactNode
 }) {
   return (
-    <details className="trace-json-block" open={open}>
-      <summary>{title}</summary>
-      <pre>{formatJson(value)}</pre>
-    </details>
+    <section className="trace-tool-detail-block">
+      <strong>{title}</strong>
+      {children}
+    </section>
   )
+}
+
+function traceRawDialogView(
+  round: TraceRound,
+  kind: TraceRawKind,
+): { title: string; value: unknown } {
+  if (kind === 'request') {
+    return {
+      title: '原始 Request JSON',
+      value: round.request?.input ?? null,
+    }
+  }
+  return {
+    title: '原始 Response JSON',
+    value: round.response?.output ?? null,
+  }
+}
+
+function traceMessageRoleClass(role: string): string {
+  const normalized = role.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-')
+  return normalized ? `role-${normalized}` : 'role-message'
 }
 
 function StatusPill({ status }: { status: TraceStatus }) {
@@ -1162,6 +1434,17 @@ function readableToolOutput(value: unknown): string {
     output.count !== undefined ? `count=${String(output.count)}` : '',
     compactJson(output, 180),
   ])
+}
+
+function toolResultDisplayOutput(result: TraceToolResult): unknown {
+  const rawOutput = asRecord(result.rawOutput)
+  if (Object.prototype.hasOwnProperty.call(rawOutput, 'output')) {
+    return parseJsonMaybe(rawOutput.output)
+  }
+  if (result.outputSummary) {
+    return parseJsonMaybe(result.outputSummary)
+  }
+  return result.rawOutput
 }
 
 function roundSearchText(round: TraceRound): string {

@@ -149,7 +149,19 @@ const preferredRawJsonKeyOrder = [
   'after',
 ]
 
-export function JsonTree({ value }: { value: unknown }) {
+interface JsonTreeProps {
+  value: unknown
+  defaultExpandAll?: boolean
+  defaultCollapsedKeys?: string[]
+  allowLineWrapToggle?: boolean
+}
+
+export function JsonTree({
+  value,
+  defaultExpandAll = false,
+  defaultCollapsedKeys = [],
+  allowLineWrapToggle = true,
+}: JsonTreeProps) {
   const [expansionCommand, setExpansionCommand] = useState<JsonTreeExpansionCommand>({
     open: null,
     version: 0,
@@ -170,18 +182,20 @@ export function JsonTree({ value }: { value: unknown }) {
     <div className={treeClass}>
       {complex ? (
         <div className="trace-json-tree-toolbar" aria-label="JSON tree controls">
-          <button
-            type="button"
-            className={
-              lineWrap ? 'trace-json-tree-action active' : 'trace-json-tree-action'
-            }
-            onClick={() => setLineWrap((current) => !current)}
-            title={lineWrap ? 'Disable line wrap' : 'Enable line wrap'}
-            aria-label={lineWrap ? 'Disable JSON line wrap' : 'Enable JSON line wrap'}
-            aria-pressed={lineWrap}
-          >
-            <WrapText size={14} aria-hidden="true" />
-          </button>
+          {allowLineWrapToggle ? (
+            <button
+              type="button"
+              className={
+                lineWrap ? 'trace-json-tree-action active' : 'trace-json-tree-action'
+              }
+              onClick={() => setLineWrap((current) => !current)}
+              title={lineWrap ? 'Disable line wrap' : 'Enable line wrap'}
+              aria-label={lineWrap ? 'Disable JSON line wrap' : 'Enable JSON line wrap'}
+              aria-pressed={lineWrap}
+            >
+              <WrapText size={14} aria-hidden="true" />
+            </button>
+          ) : null}
           <button
             type="button"
             className="trace-json-tree-action"
@@ -202,7 +216,13 @@ export function JsonTree({ value }: { value: unknown }) {
           </button>
         </div>
       ) : null}
-      <JsonNode value={value} depth={0} expansionCommand={expansionCommand} />
+      <JsonNode
+        value={value}
+        depth={0}
+        expansionCommand={expansionCommand}
+        defaultExpandAll={defaultExpandAll}
+        defaultCollapsedKeys={defaultCollapsedKeys}
+      />
     </div>
   )
 }
@@ -217,14 +237,22 @@ function JsonNode({
   value,
   depth,
   expansionCommand,
+  defaultExpandAll,
+  defaultCollapsedKeys,
 }: {
   label?: string
   value: unknown
   depth: number
   expansionCommand: JsonTreeExpansionCommand
+  defaultExpandAll: boolean
+  defaultCollapsedKeys: string[]
 }) {
   const complex = isComplexJson(value)
-  const [open, setOpen] = useState(() => expansionCommand.open ?? depth === 0)
+  const [open, setOpen] = useState(
+    () =>
+      expansionCommand.open ??
+      defaultJsonNodeOpen(label, depth, defaultExpandAll, defaultCollapsedKeys),
+  )
 
   useEffect(() => {
     if (expansionCommand.open !== null) {
@@ -273,6 +301,8 @@ function JsonNode({
               value={entryValue}
               depth={depth + 1}
               expansionCommand={expansionCommand}
+              defaultExpandAll={defaultExpandAll}
+              defaultCollapsedKeys={defaultCollapsedKeys}
             />
           ))}
           <div className="trace-json-node trace-json-close" style={jsonNodeStyle(depth)}>
@@ -282,6 +312,26 @@ function JsonNode({
       ) : null}
     </div>
   )
+}
+
+function defaultJsonNodeOpen(
+  label: string | undefined,
+  depth: number,
+  defaultExpandAll: boolean,
+  defaultCollapsedKeys: string[],
+): boolean {
+  if (!defaultExpandAll) {
+    return depth === 0
+  }
+  if (!label) {
+    return true
+  }
+  const normalizedLabel = normalizeJsonKey(label)
+  return !defaultCollapsedKeys.some((key) => normalizeJsonKey(key) === normalizedLabel)
+}
+
+function normalizeJsonKey(value: string): string {
+  return value.replace(/[\s_-]/g, '').toLowerCase()
 }
 
 function JsonPrimitive({ value }: { value: unknown }) {

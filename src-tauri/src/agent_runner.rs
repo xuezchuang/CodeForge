@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
 };
@@ -15,8 +16,9 @@ use crate::tool_trace::{self, MockAgentRun, ToolTraceEvent, TraceEventType, Trac
 use crate::vs_registry::{AppSettings, ProviderConfig, ProviderCredential, ProviderModel};
 
 pub const TOOL_CALL_TEST_PROMPT: &str = "请必须调用 calculator.add 工具计算 1+1，然后告诉我结果。";
-const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
-const MODEL_REQUEST_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_MAX_TOOL_ROUNDS: usize = 32;
+const MODEL_REQUEST_TIMEOUT_SECONDS: u64 = 360;
+const STREAMING_TRACE_INTERVAL_MS: u64 = 750;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,6 +143,12 @@ struct StreamingToolCall {
     arguments: String,
 }
 
+struct StreamingTraceSink<'a> {
+    task_id: &'a str,
+    step_index: u32,
+    on_trace: &'a mut (dyn FnMut(&ToolTraceEvent) + Send),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OpenAiToolCall {
     id: String,
@@ -153,6 +161,13 @@ struct OpenAiToolCall {
 struct OpenAiFunctionCall {
     name: String,
     arguments: String,
+}
+
+fn tool_call_names(tool_calls: &[OpenAiToolCall]) -> Vec<String> {
+    tool_calls
+        .iter()
+        .map(|tool_call| tool_call.function.name.clone())
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,7 +241,7 @@ pub async fn run_agent(
     project: &ProjectSession,
     settings: &AppSettings,
     mut input: AgentRunInput,
-    mut on_trace: impl FnMut(&ToolTraceEvent),
+    mut on_trace: impl FnMut(&ToolTraceEvent) + Send,
 ) -> Result<MockAgentRun, String> {
     let task_id = Uuid::new_v4().to_string();
     let conversation_messages =
@@ -388,7 +403,7 @@ pub async fn run_tool_call_test(
     provider_id: Option<&str>,
     credential_id: Option<&str>,
     model_id: Option<&str>,
-    mut on_trace: impl FnMut(&ToolTraceEvent),
+    mut on_trace: impl FnMut(&ToolTraceEvent) + Send,
 ) -> Result<MockAgentRun, String> {
     let task_id = Uuid::new_v4().to_string();
     let mut traces = Vec::new();
@@ -498,7 +513,7 @@ async fn run_openai_tool_agent_loop(
     step_index: &mut u32,
     max_tool_rounds: usize,
     require_tool_call: bool,
-    on_trace: &mut impl FnMut(&ToolTraceEvent),
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) -> Result<(), String> {
     for round_index in 0..=max_tool_rounds {
         let request =
@@ -522,7 +537,17 @@ async fn run_openai_tool_agent_loop(
         );
         *step_index += 1;
 
-        let completion = match send_chat_completion(selected, &request).await {
+        let completion = match send_chat_completion(
+            selected,
+            &request,
+            Some(StreamingTraceSink {
+                task_id,
+                step_index: *step_index,
+                on_trace: &mut *on_trace,
+            }),
+        )
+        .await
+        {
             Ok(completion) => completion,
             Err(error) => {
                 push_trace(
@@ -605,6 +630,9 @@ async fn run_openai_tool_agent_loop(
         }
 
         if round_index >= max_tool_rounds {
+            let requested_tool_names = tool_call_names(&tool_calls);
+            let requested_tool_names_text = requested_tool_names.join(", ");
+            let requested_tool_count = tool_calls.len();
             push_trace(
                 traces,
                 trace(
@@ -615,10 +643,18 @@ async fn run_openai_tool_agent_loop(
                     "tool_round_budget_reached",
                     Some(json!({
                         "maxToolRounds": max_tool_rounds,
+                        "usedToolRounds": round_index,
+                        "currentModelRound": round_index + 1,
+                        "blockedToolCallCount": requested_tool_count,
+                        "blockedToolNames": requested_tool_names,
                         "requestedToolCalls": tool_calls,
                     })),
                     None,
-                    Some("Tool round budget reached; asking the model to answer with available evidence.".to_string()),
+                    Some(format!(
+                        "Tool round budget reached after {max_tool_rounds} tool rounds; model round {} requested {requested_tool_count} more tool call(s): {}. Asking the model to answer with available evidence.",
+                        round_index + 1,
+                        requested_tool_names_text
+                    )),
                     TraceStatus::Warning,
                     0,
                 ),
@@ -651,7 +687,17 @@ async fn run_openai_tool_agent_loop(
             );
             *step_index += 1;
 
-            let final_completion = match send_chat_completion(selected, &final_request).await {
+            let final_completion = match send_chat_completion(
+                selected,
+                &final_request,
+                Some(StreamingTraceSink {
+                    task_id,
+                    step_index: *step_index,
+                    on_trace: &mut *on_trace,
+                }),
+            )
+            .await
+            {
                 Ok(completion) => completion,
                 Err(error) => {
                     push_trace(
@@ -832,7 +878,7 @@ fn push_assistant_model_message_trace(
     traces: &mut Vec<ToolTraceEvent>,
     step_index: &mut u32,
     response_body: &Value,
-    on_trace: &mut impl FnMut(&ToolTraceEvent),
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) {
     let message = extract_message_from_response(response_body)
         .unwrap_or_default()
@@ -869,7 +915,7 @@ fn push_final_response_trace(
     step_index: &mut u32,
     completion: &ChatCompletionResult,
     warn_if_no_tool_call: bool,
-    on_trace: &mut impl FnMut(&ToolTraceEvent),
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) {
     let final_message = extract_message_from_response(&completion.response_body)
         .unwrap_or_default()
@@ -931,7 +977,7 @@ async fn record_plain_provider_completion(
     task_id: &str,
     traces: &mut Vec<ToolTraceEvent>,
     step_index: u32,
-    on_trace: &mut impl FnMut(&ToolTraceEvent),
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) {
     match call_provider(project, selected, conversation_messages, cli_mode).await {
         Ok(completion) => {
@@ -1023,7 +1069,7 @@ async fn record_codex_cli_completion(
     task_id: &str,
     traces: &mut Vec<ToolTraceEvent>,
     step_index: &mut u32,
-    on_trace: &mut impl FnMut(&ToolTraceEvent),
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) {
     let prompt = build_codex_cli_prompt(project, conversation_messages);
     let model_override = codex_cli_runner::model_override(&selected.model_id);
@@ -1452,7 +1498,7 @@ fn build_chat_completion_request(
     messages: Vec<Value>,
     tools: Option<Vec<Value>>,
 ) -> Value {
-    let uses_streaming = is_codebuddy_provider(selected);
+    let uses_streaming = true;
     let mut request_body = json!({
         "model": selected.model_id,
         "messages": messages,
@@ -1512,6 +1558,7 @@ fn resolved_model_reasoning_mode(model: &ProviderModel) -> &str {
 async fn send_chat_completion(
     selected: &SelectedModel,
     request_body: &Value,
+    streaming_trace: Option<StreamingTraceSink<'_>>,
 ) -> Result<ChatCompletionResult, String> {
     let base_url = selected.provider.base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
@@ -1545,18 +1592,17 @@ async fn send_chat_completion(
     }
 
     let started = Instant::now();
-    let response = model_http_client()?
+    let mut response = model_http_client()?
         .post(&url)
         .headers(headers)
         .json(request_body)
         .send()
         .await
         .map_err(|error| format!("Model request failed: {error}"))?;
-    let duration_ms = started.elapsed().as_millis() as u64;
 
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
         return Err(format!(
             "Model request failed. status={}; body={}",
             status.as_u16(),
@@ -1564,12 +1610,19 @@ async fn send_chat_completion(
         ));
     }
 
-    let response_body = if is_codebuddy_provider(selected) {
-        parse_streaming_chat_completion(&body)?
+    let uses_streaming = request_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let response_body = if uses_streaming {
+        read_streaming_chat_completion(&mut response, request_body, streaming_trace, started)
+            .await?
     } else {
+        let body = response.text().await.unwrap_or_default();
         serde_json::from_str::<Value>(&body)
             .map_err(|error| format!("Model response parse failed: {error}; body={}", body))?
     };
+    let duration_ms = started.elapsed().as_millis() as u64;
 
     let token_usage = extract_token_usage_from_response(&response_body);
     Ok(ChatCompletionResult {
@@ -1638,47 +1691,194 @@ fn add_codebuddy_vscode_headers(headers: &mut HeaderMap) {
     headers.insert(USER_AGENT, HeaderValue::from_static("CodeBuddyIDE/0.0.0"));
 }
 
-fn parse_streaming_chat_completion(body: &str) -> Result<Value, String> {
-    let mut saw_data = false;
-    let mut role = "assistant".to_string();
-    let mut content = String::new();
-    let mut reasoning_content = String::new();
-    let mut finish_reason: Option<String> = None;
-    let mut usage: Option<Value> = None;
-    let mut tool_calls = Vec::<StreamingToolCall>::new();
+async fn read_streaming_chat_completion(
+    response: &mut reqwest::Response,
+    request_body: &Value,
+    mut streaming_trace: Option<StreamingTraceSink<'_>>,
+    request_started: Instant,
+) -> Result<Value, String> {
+    let mut accumulator = StreamingChatCompletionAccumulator::default();
+    let mut body = String::new();
+    let mut line_buffer = String::new();
+    let stream_event_id = Uuid::new_v4().to_string();
+    let stream_started_at = Utc::now().to_rfc3339();
+    let mut last_emit: Option<Instant> = None;
+    let mut emitted_reasoning_chars = 0usize;
 
-    for line in body.lines() {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("Model stream read failed: {error}"))?
+    {
+        let text = String::from_utf8_lossy(&chunk);
+        body.push_str(&text);
+        line_buffer.push_str(&text);
+
+        while let Some(newline_index) = line_buffer.find('\n') {
+            let raw_line = line_buffer[..newline_index]
+                .trim_end_matches('\r')
+                .to_string();
+            line_buffer.drain(..=newline_index);
+            accumulator.accept_line(&raw_line)?;
+        }
+
+        maybe_emit_streaming_thinking(
+            streaming_trace.as_mut(),
+            request_body,
+            &accumulator,
+            &stream_event_id,
+            &stream_started_at,
+            request_started,
+            &mut emitted_reasoning_chars,
+            &mut last_emit,
+            false,
+        );
+    }
+
+    if !line_buffer.trim().is_empty() {
+        accumulator.accept_line(line_buffer.trim_end_matches('\r'))?;
+    }
+
+    maybe_emit_streaming_thinking(
+        streaming_trace.as_mut(),
+        request_body,
+        &accumulator,
+        &stream_event_id,
+        &stream_started_at,
+        request_started,
+        &mut emitted_reasoning_chars,
+        &mut last_emit,
+        true,
+    );
+
+    accumulator
+        .into_response()
+        .map_err(|error| format!("{error}; body={body}"))
+}
+
+fn maybe_emit_streaming_thinking(
+    sink: Option<&mut StreamingTraceSink<'_>>,
+    request_body: &Value,
+    accumulator: &StreamingChatCompletionAccumulator,
+    event_id: &str,
+    stream_started_at: &str,
+    request_started: Instant,
+    emitted_reasoning_chars: &mut usize,
+    last_emit: &mut Option<Instant>,
+    force: bool,
+) {
+    let Some(sink) = sink else {
+        return;
+    };
+    let reasoning = accumulator.reasoning_content();
+    if reasoning.is_empty() {
+        return;
+    }
+
+    let reasoning_chars = reasoning.chars().count();
+    if reasoning_chars == *emitted_reasoning_chars && !(force && last_emit.is_some()) {
+        return;
+    }
+    if !force {
+        if let Some(last_emit) = last_emit {
+            if last_emit.elapsed() < Duration::from_millis(STREAMING_TRACE_INTERVAL_MS) {
+                return;
+            }
+        }
+    }
+
+    let duration_ms = request_started.elapsed().as_millis() as u64;
+    let content = accumulator.content();
+    let event = ToolTraceEvent {
+        id: event_id.to_string(),
+        task_id: sink.task_id.to_string(),
+        step_index: sink.step_index,
+        event_type: TraceEventType::ModelMessage,
+        tool_name: None,
+        title: "streaming_thinking".to_string(),
+        input: Some(json!({
+            "model": request_body.get("model").cloned().unwrap_or(Value::Null),
+            "stream": true,
+        })),
+        output: Some(json!({
+            "reasoning_content": reasoning,
+            "content": content,
+            "model": request_body.get("model").cloned().unwrap_or(Value::Null),
+        })),
+        output_summary: Some(format!("Streaming reasoning ({reasoning_chars} chars)")),
+        started_at: stream_started_at.to_string(),
+        ended_at: if force {
+            Some(Utc::now().to_rfc3339())
+        } else {
+            None
+        },
+        duration_ms: Some(duration_ms),
+        status: if force {
+            TraceStatus::Success
+        } else {
+            TraceStatus::Running
+        },
+    };
+    (sink.on_trace)(&event);
+    *emitted_reasoning_chars = reasoning_chars;
+    *last_emit = Some(Instant::now());
+}
+
+#[derive(Default)]
+struct StreamingChatCompletionAccumulator {
+    saw_data: bool,
+    role: String,
+    content: String,
+    reasoning_content: String,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+    tool_calls: Vec<StreamingToolCall>,
+    error_message: Option<String>,
+}
+
+impl StreamingChatCompletionAccumulator {
+    fn accept_line(&mut self, line: &str) -> Result<(), String> {
         let line = line.trim();
         if !line.starts_with("data:") {
-            continue;
+            return Ok(());
         }
         let data = line.trim_start_matches("data:").trim();
         if data.is_empty() || data == "[DONE]" {
-            continue;
+            return Ok(());
         }
 
-        saw_data = true;
+        self.saw_data = true;
         let chunk = serde_json::from_str::<Value>(data)
             .map_err(|error| format!("Streaming chunk parse failed: {error}; chunk={data}"))?;
+        self.accept_chunk(&chunk);
+        Ok(())
+    }
+
+    fn accept_chunk(&mut self, chunk: &Value) {
+        self.saw_data = true;
+        if let Some(error) = chunk.get("error") {
+            self.error_message = Some(stream_error_message(error));
+            return;
+        }
         if chunk.get("usage").is_some_and(|value| !value.is_null()) {
-            usage = chunk.get("usage").cloned();
+            self.usage = chunk.get("usage").cloned();
         }
 
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-            continue;
+            return;
         };
         for choice in choices {
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                finish_reason = Some(reason.to_string());
+                self.finish_reason = Some(reason.to_string());
             }
             let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
                 continue;
             };
             if let Some(delta_role) = delta.get("role").and_then(Value::as_str) {
-                role = delta_role.to_string();
+                self.role = delta_role.to_string();
             }
             if let Some(delta_content) = delta.get("content").and_then(Value::as_str) {
-                content.push_str(delta_content);
+                self.content.push_str(delta_content);
             }
             if let Some(delta_reasoning) = delta
                 .get("reasoning_content")
@@ -1686,56 +1886,75 @@ fn parse_streaming_chat_completion(body: &str) -> Result<Value, String> {
                 .or_else(|| delta.get("reasoning"))
                 .and_then(Value::as_str)
             {
-                reasoning_content.push_str(delta_reasoning);
+                self.reasoning_content.push_str(delta_reasoning);
             }
             if let Some(delta_tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for delta_tool_call in delta_tool_calls {
-                    merge_streaming_tool_call(&mut tool_calls, delta_tool_call);
+                    merge_streaming_tool_call(&mut self.tool_calls, delta_tool_call);
                 }
             }
         }
     }
 
-    if !saw_data {
-        return Err(format!(
-            "Streaming response had no data chunks. body={body}"
-        ));
+    fn content(&self) -> &str {
+        &self.content
     }
 
-    let tool_calls = streaming_tool_calls_json(&tool_calls);
-    let mut message = if tool_calls.is_empty() {
-        json!({
-            "role": role,
-            "content": content,
-        })
-    } else {
-        json!({
-            "role": role,
-            "content": if content.is_empty() { Value::Null } else { Value::String(content) },
-            "tool_calls": tool_calls,
-        })
-    };
-    if !reasoning_content.is_empty() {
-        message["reasoning_content"] = Value::String(reasoning_content);
+    fn reasoning_content(&self) -> &str {
+        &self.reasoning_content
     }
 
-    let mut response_body = json!({
-        "choices": [{
-            "message": message,
-            "finish_reason": finish_reason.unwrap_or_else(|| "stop".to_string()),
-        }],
-    });
-    if let Some(usage) = usage {
-        response_body["usage"] = usage;
+    fn into_response(self) -> Result<Value, String> {
+        if let Some(error_message) = self.error_message {
+            return Err(format!("Model stream failed: {error_message}"));
+        }
+        if !self.saw_data {
+            return Err("Streaming response had no data chunks".to_string());
+        }
+
+        let tool_calls = streaming_tool_calls_json(&self.tool_calls);
+        let mut message = if tool_calls.is_empty() {
+            json!({
+                "role": if self.role.is_empty() { "assistant" } else { self.role.as_str() },
+                "content": self.content,
+            })
+        } else {
+            json!({
+                "role": if self.role.is_empty() { "assistant" } else { self.role.as_str() },
+                "content": if self.content.is_empty() { Value::Null } else { Value::String(self.content) },
+                "tool_calls": tool_calls,
+            })
+        };
+        if !self.reasoning_content.is_empty() {
+            message["reasoning_content"] = Value::String(self.reasoning_content);
+        }
+
+        let mut response_body = json!({
+            "choices": [{
+                "message": message,
+                "finish_reason": self.finish_reason.unwrap_or_else(|| "stop".to_string()),
+            }],
+        });
+        if let Some(usage) = self.usage {
+            response_body["usage"] = usage;
+        }
+        Ok(response_body)
     }
-    Ok(response_body)
+}
+
+fn stream_error_message(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
 }
 
 fn merge_streaming_tool_call(tool_calls: &mut Vec<StreamingToolCall>, delta_tool_call: &Value) {
     let index = delta_tool_call
         .get("index")
         .and_then(Value::as_u64)
-        .unwrap_or(tool_calls.len() as u64) as usize;
+        .unwrap_or(0) as usize;
     while tool_calls.len() <= index {
         tool_calls.push(StreamingToolCall::default());
     }
@@ -1748,6 +1967,12 @@ fn merge_streaming_tool_call(tool_calls: &mut Vec<StreamingToolCall>, delta_tool
         tool_call.call_type = Some(call_type.to_string());
     }
     let Some(function) = delta_tool_call.get("function").and_then(Value::as_object) else {
+        if let Some(name) = delta_tool_call.get("name").and_then(Value::as_str) {
+            tool_call.name = Some(name.to_string());
+        }
+        if let Some(arguments) = delta_tool_call.get("arguments").and_then(Value::as_str) {
+            tool_call.arguments.push_str(arguments);
+        }
         return;
     };
     if let Some(name) = function.get("name").and_then(Value::as_str) {
@@ -1763,7 +1988,10 @@ fn streaming_tool_calls_json(tool_calls: &[StreamingToolCall]) -> Vec<Value> {
         .iter()
         .enumerate()
         .filter(|(_, tool_call)| {
-            tool_call.id.is_some() || tool_call.name.is_some() || !tool_call.arguments.is_empty()
+            tool_call
+                .name
+                .as_deref()
+                .is_some_and(|name| !name.is_empty())
         })
         .map(|(index, tool_call)| {
             json!({
@@ -1799,7 +2027,7 @@ async fn call_openai_compatible(
 ) -> Result<ProviderCompletion, String> {
     let messages = build_openai_messages(project, conversation_messages, cli_mode);
     let request_body = build_chat_completion_request(selected, messages, None);
-    let completion = send_chat_completion(selected, &request_body).await?;
+    let completion = send_chat_completion(selected, &request_body, None).await?;
     let response_body = completion.response_body.clone();
     let parsed = serde_json::from_value::<OpenAiChatResponse>(response_body.clone())
         .map_err(|error| format!("Model response parse failed: {error}; body={response_body}"))?;
@@ -2418,7 +2646,7 @@ fn compact_json(value: &Value) -> String {
 fn push_trace(
     traces: &mut Vec<ToolTraceEvent>,
     event: ToolTraceEvent,
-    on_trace: &mut impl FnMut(&ToolTraceEvent),
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) {
     on_trace(&event);
     traces.push(event);
@@ -2496,6 +2724,8 @@ mod tests {
             Some(tool_registry::tool_definitions()),
         );
 
+        assert_eq!(request["stream"], json!(true));
+        assert_eq!(request["stream_options"]["include_usage"], json!(true));
         assert_eq!(request["tool_choice"], json!("auto"));
         let names = request_tool_names(&request);
         assert!(names.contains(&tool_registry::WORKSPACE_LIST_DIR_TOOL_NAME.to_string()));
@@ -2519,6 +2749,43 @@ mod tests {
         assert_eq!(tool_message["tool_call_id"], json!("call_1"));
         assert_eq!(tool_message["name"], json!(CALCULATOR_ADD_TOOL_NAME));
         assert_eq!(tool_message["content"], json!("{\"result\":2}"));
+    }
+
+    #[test]
+    fn streaming_tool_call_chunks_without_index_are_merged() {
+        let mut accumulator = StreamingChatCompletionAccumulator::default();
+        accumulator.accept_chunk(&json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": tool_registry::WORKSPACE_READ_FILE_TOOL_NAME }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }));
+        accumulator.accept_chunk(&json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "function": { "arguments": "{\"path\":\"sample.txt\"}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }));
+
+        let response = accumulator.into_response().unwrap();
+        let tool_call = parse_tool_calls(&response).unwrap().remove(0);
+
+        assert_eq!(tool_call.id, "call_1");
+        assert_eq!(
+            tool_call.function.name,
+            tool_registry::WORKSPACE_READ_FILE_TOOL_NAME
+        );
+        assert_eq!(tool_call.function.arguments, "{\"path\":\"sample.txt\"}");
     }
 
     #[test]
@@ -2940,10 +3207,19 @@ mod tests {
                         .unwrap()
                         .expect("expected chat completion request");
                     let request_body = read_request_body(&mut request);
+                    let parsed_request = serde_json::from_str::<Value>(&request_body).unwrap();
+                    let wants_stream = parsed_request
+                        .get("stream")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     request
-                        .respond(json_response(response_body))
+                        .respond(if wants_stream {
+                            sse_response(response_body)
+                        } else {
+                            json_response(response_body)
+                        })
                         .expect("mock response should be sent");
-                    serde_json::from_str::<Value>(&request_body).unwrap()
+                    parsed_request
                 })
                 .collect::<Vec<_>>()
         });
@@ -2959,5 +3235,90 @@ mod tests {
     fn json_response(body: Value) -> Response<std::io::Cursor<Vec<u8>>> {
         Response::from_string(body.to_string())
             .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
+    }
+
+    fn sse_response(body: Value) -> Response<std::io::Cursor<Vec<u8>>> {
+        let mut stream_body = String::new();
+        for chunk in chat_completion_stream_chunks(&body) {
+            stream_body.push_str("data: ");
+            stream_body.push_str(&chunk.to_string());
+            stream_body.push_str("\n\n");
+        }
+        stream_body.push_str("data: [DONE]\n\n");
+        Response::from_string(stream_body)
+            .with_header(Header::from_bytes("Content-Type", "text/event-stream").unwrap())
+    }
+
+    fn chat_completion_stream_chunks(body: &Value) -> Vec<Value> {
+        let choice = body
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
+        let finish_reason = choice
+            .get("finish_reason")
+            .cloned()
+            .unwrap_or_else(|| json!("stop"));
+        let mut chunks = vec![json!({
+            "choices": [{
+                "delta": { "role": "assistant" },
+                "finish_reason": null
+            }]
+        })];
+
+        if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
+            chunks.push(json!({
+                "choices": [{
+                    "delta": { "reasoning_content": reasoning },
+                    "finish_reason": null
+                }]
+            }));
+        }
+
+        if let Some(content) = message.get("content").and_then(Value::as_str) {
+            if !content.is_empty() {
+                chunks.push(json!({
+                    "choices": [{
+                        "delta": { "content": content },
+                        "finish_reason": null
+                    }]
+                }));
+            }
+        }
+
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for (index, tool_call) in tool_calls.iter().enumerate() {
+                let function = tool_call
+                    .get("function")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                chunks.push(json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "id": tool_call.get("id").cloned().unwrap_or_else(|| json!(format!("call_{}", index + 1))),
+                                "type": tool_call.get("type").cloned().unwrap_or_else(|| json!("function")),
+                                "function": {
+                                    "name": function.get("name").cloned().unwrap_or_else(|| json!("")),
+                                    "arguments": function.get("arguments").cloned().unwrap_or_else(|| json!("")),
+                                }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                }));
+            }
+        }
+
+        chunks.push(json!({
+            "choices": [{
+                "delta": {},
+                "finish_reason": finish_reason
+            }]
+        }));
+        chunks
     }
 }

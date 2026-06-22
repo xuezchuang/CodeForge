@@ -1,0 +1,1394 @@
+use std::cmp;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use regex::{Regex, RegexBuilder};
+use serde_json::{json, Value};
+
+use crate::file_search::{FileSearchOptions, MatchType};
+use crate::path_utils::normalize_display_path;
+
+const DEFAULT_MAX_READ_LINES: usize = 300;
+const DEFAULT_MAX_RESULTS: usize = 100;
+const MAX_RESULTS_LIMIT: usize = 500;
+const DEFAULT_CONTENT_CONTEXT_LINES: usize = 2;
+const DEFAULT_FILE_CONTEXT_BEFORE: usize = 30;
+const DEFAULT_FILE_CONTEXT_AFTER: usize = 30;
+const MAX_CONTEXT_LINES: usize = 200;
+const BINARY_SAMPLE_BYTES: usize = 8192;
+const SEARCH_CONTENT_SCAN_LIMIT: usize = 25_000;
+const SEARCH_SCAN_TIMEOUT_MS: u128 = 12_000;
+
+const IGNORED_DIRS: &[&str] = &[
+    ".git",
+    ".vs",
+    "bin",
+    "obj",
+    "build",
+    "out",
+    "node_modules",
+    ".cache",
+];
+
+const IGNORED_SEARCH_PATHS: &[&[&str]] = &[&[".claude", "worktrees"]];
+
+const DEFAULT_CONTENT_EXTENSIONS: &[&str] = &[
+    ".h", ".hpp", ".c", ".cpp", ".cc", ".cxx", ".inl", ".ixx", ".cs", ".sln", ".vcxproj", ".props",
+    ".targets", ".json", ".xml", ".txt", ".md",
+];
+
+pub fn list_dir(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let raw_path = required_string(arguments, "path")?;
+    let dir = resolve_existing_path(&workspace, &raw_path)?;
+    if !dir.is_dir() {
+        return Err(format!(
+            "not_directory: {}",
+            relative_or_display(&workspace, &dir)
+        ));
+    }
+
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    let mut entries = Vec::new();
+    for entry in sorted_read_dir(&dir)? {
+        let path = entry.path();
+        if path.is_dir() {
+            if is_ignored_dir(&path) {
+                continue;
+            }
+            let canonical = canonicalize_path(&path)
+                .map_err(|error| format!("read_dir_failed: {}: {error}", path.display()))?;
+            let relative = relative_path(&workspace, &canonical);
+            directories.push(relative.clone());
+            entries.push(json!({
+                "path": relative,
+                "type": "directory",
+            }));
+        } else if path.is_file() {
+            let canonical = canonicalize_path(&path)
+                .map_err(|error| format!("file_not_found: {}: {error}", path.display()))?;
+            let relative = relative_path(&workspace, &canonical);
+            files.push(relative.clone());
+            entries.push(json!({
+                "path": relative,
+                "type": "file",
+            }));
+        }
+    }
+
+    directories.sort_by_key(|path| path.to_ascii_lowercase());
+    files.sort_by_key(|path| path.to_ascii_lowercase());
+    entries.sort_by_key(|entry| {
+        entry
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    });
+
+    Ok(json!({
+        "path": relative_path(&workspace, &dir),
+        "directories": directories,
+        "files": files,
+        "entries": entries,
+    }))
+}
+
+pub fn read_file(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let raw_path = required_string(arguments, "path")?;
+    let file = resolve_existing_path(&workspace, &raw_path)?;
+    ensure_regular_text_file(&workspace, &file)?;
+
+    let start_line = optional_usize(arguments, "start_line", 1)?;
+    if start_line == 0 {
+        return Err("invalid_range: start_line must be >= 1".to_string());
+    }
+    let requested_end_line = optional_usize_value(arguments, "end_line")?;
+    if let Some(end_line) = requested_end_line {
+        if end_line < start_line {
+            return Err("invalid_range: end_line must be >= start_line".to_string());
+        }
+    }
+
+    let max_end_line = start_line.saturating_add(DEFAULT_MAX_READ_LINES - 1);
+    let requested_end = requested_end_line.unwrap_or(max_end_line);
+    let desired_end = cmp::min(requested_end, max_end_line);
+    let (lines, total_lines) = collect_line_range(&file, start_line, desired_end, true)?;
+
+    let actual_start_line = if lines.is_empty() { 0 } else { start_line };
+    let actual_end_line = lines
+        .last()
+        .and_then(|line| line.get("line"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let truncated = requested_end > desired_end || total_lines > actual_end_line as usize;
+    let message = if truncated {
+        Some(format!(
+            "too_many_results: file has {total_lines} lines; use start_line/end_line to read more"
+        ))
+    } else {
+        None
+    };
+    let text = lines
+        .iter()
+        .filter_map(|line| line.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(json!({
+        "file": relative_path(&workspace, &file),
+        "totalLines": total_lines,
+        "startLine": actual_start_line,
+        "endLine": actual_end_line,
+        "maxLines": DEFAULT_MAX_READ_LINES,
+        "truncated": truncated,
+        "message": message,
+        "text": text,
+        "lines": lines,
+    }))
+}
+
+pub fn search_file(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let pattern = required_string(arguments, "pattern")?;
+    let root = resolve_search_root(&workspace, arguments)?;
+    let max_results = max_results(arguments)?;
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return Err("invalid_arguments: pattern must not be empty".to_string());
+    }
+
+    let search_result = crate::file_search::run(
+        pattern,
+        vec![root.clone()],
+        FileSearchOptions {
+            limit: std::num::NonZero::new(max_results)
+                .ok_or_else(|| "invalid_arguments: max_results must be >= 1".to_string())?,
+            exclude: ignored_search_excludes(),
+            threads: std::num::NonZero::new(2).expect("2 is non-zero"),
+            compute_indices: true,
+            respect_gitignore: true,
+        },
+        Some(Arc::new(AtomicBool::new(false))),
+    )
+    .map_err(|error| format!("search_failed: {error}"))?;
+    let total_matches = search_result.total_match_count;
+    let matches = search_result
+        .matches
+        .into_iter()
+        .map(|entry| {
+            let absolute = entry.full_path();
+            let canonical = canonicalize_path(&absolute).unwrap_or(absolute);
+            json!({
+                "path": relative_path(&workspace, &canonical),
+                "type": match entry.match_type {
+                    MatchType::Directory => "directory",
+                    MatchType::File => "file",
+                },
+                "score": entry.score,
+                "indices": entry.indices.unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let truncated = total_matches > matches.len();
+    let paths = matches
+        .iter()
+        .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "root": relative_path(&workspace, &root),
+        "pattern": pattern,
+        "matches": matches,
+        "paths": paths,
+        "count": cmp::min(total_matches, max_results),
+        "totalMatches": total_matches,
+        "shown": matches.len(),
+        "complete": true,
+        "maxResults": max_results,
+        "truncated": truncated,
+        "engine": "codex-file-search",
+        "message": if truncated {
+            Some(format!("too_many_results: returned first {max_results} of {total_matches} matches"))
+        } else {
+            None
+        }
+    }))
+}
+
+pub fn search_content(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let query = required_string(arguments, "query")?;
+    if query.trim().is_empty() {
+        return Err("invalid_arguments: query must not be empty".to_string());
+    }
+
+    let root = resolve_search_root(&workspace, arguments)?;
+    let file_glob = optional_string(arguments, "file_glob")?;
+    let max_results = max_results(arguments)?;
+    let context_lines = optional_usize(arguments, "context_lines", DEFAULT_CONTENT_CONTEXT_LINES)?
+        .min(MAX_CONTEXT_LINES);
+    let case_sensitive = optional_bool(arguments, "case_sensitive", false)?;
+    let regex = optional_bool(arguments, "regex", false)?;
+    let compiled_regex = if regex {
+        Some(compile_regex(&query, case_sensitive)?)
+    } else {
+        None
+    };
+
+    if ripgrep_available() {
+        search_content_with_rg(
+            &workspace,
+            &root,
+            &query,
+            file_glob.as_deref(),
+            max_results,
+            context_lines,
+            case_sensitive,
+            regex,
+        )
+    } else {
+        search_content_with_fallback(
+            &workspace,
+            &root,
+            &query,
+            file_glob.as_deref(),
+            max_results,
+            context_lines,
+            case_sensitive,
+            compiled_regex.as_ref(),
+        )
+    }
+}
+
+pub fn edit_file(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let raw_file = required_string(arguments, "file")?;
+    let search = required_string(arguments, "search")?;
+    let replace = required_string(arguments, "replace")?;
+    if search.is_empty() {
+        return Err("invalid_arguments: search must not be empty".to_string());
+    }
+    let file = resolve_existing_path(&workspace, &raw_file)?;
+    ensure_regular_text_file(&workspace, &file)?;
+    let original = fs::read_to_string(&file).map_err(|error| {
+        format!(
+            "read_failed: {}: {error}",
+            relative_or_display(&workspace, &file)
+        )
+    })?;
+    let count = original.matches(&search).count();
+    if count == 0 {
+        return Err(format!(
+            "edit_not_applied: search text not found in {}",
+            relative_path(&workspace, &file)
+        ));
+    }
+    if count > 1 {
+        return Err(format!("ambiguous_edit: search text matched {count} times in {}; provide a larger unique block", relative_path(&workspace, &file)));
+    }
+    let updated = original.replacen(&search, &replace, 1);
+    fs::write(&file, updated).map_err(|error| {
+        format!(
+            "write_failed: {}: {error}",
+            relative_or_display(&workspace, &file)
+        )
+    })?;
+    Ok(json!({
+        "file": relative_path(&workspace, &file),
+        "replacements": 1,
+    }))
+}
+
+pub fn write_file(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let raw_file = required_string(arguments, "file")?;
+    let content = required_string(arguments, "content")?;
+    let file = resolve_write_path(&workspace, &raw_file)?;
+    let bytes = content.len();
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create_dir_failed: {}: {error}", parent.display()))?;
+    }
+    fs::write(&file, &content).map_err(|error| {
+        format!(
+            "write_failed: {}: {error}",
+            relative_or_display(&workspace, &file)
+        )
+    })?;
+    Ok(json!({
+        "file": relative_path(&workspace, &file),
+        "bytes": bytes,
+    }))
+}
+
+pub async fn shell_command(
+    workspace_root: &str,
+    arguments: &Value,
+    allow_shell: bool,
+    assume_yes: bool,
+) -> Result<Value, String> {
+    if !allow_shell {
+        return Err("rejected: shell_command is disabled for this run".to_string());
+    }
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let command = required_string(arguments, "command")?;
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("invalid_arguments: command must not be empty".to_string());
+    }
+    assess_shell_command(command, assume_yes)?;
+    let timeout_ms = optional_usize(arguments, "timeout_ms", 60_000)?.min(60_000) as u64;
+
+    let mut process = if cfg!(windows) {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    };
+    process
+        .current_dir(&workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("shell_spawn_failed: {error}"))?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| format!("shell_wait_failed: {error}"))?
+            .is_some()
+        {
+            break;
+        }
+        if started.elapsed() >= Duration::from_millis(timeout_ms) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("timeout: shell command exceeded {timeout_ms}ms"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("shell_wait_failed: {error}"))?;
+    Ok(json!({
+        "command": command,
+        "statusCode": output.status.code(),
+        "success": output.status.success(),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr),
+    }))
+}
+
+fn resolve_write_path(workspace: &Path, raw_path: &str) -> Result<PathBuf, String> {
+    let normalized = normalize_display_path(raw_path);
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return Err("invalid_arguments: file must not be empty".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        return Err(format!(
+            "path_outside_workspace: {}",
+            display_input_path(raw_path)
+        ));
+    }
+    let candidate = workspace.join(path);
+    let parent = candidate.parent().unwrap_or(workspace);
+    let canonical_parent = if parent.exists() {
+        canonicalize_path(parent).map_err(|_| format!("path_not_found: {}", parent.display()))?
+    } else {
+        let existing = nearest_existing_parent(parent)?;
+        canonicalize_path(&existing)
+            .map_err(|_| format!("path_not_found: {}", existing.display()))?
+    };
+    ensure_inside_workspace(workspace, &canonical_parent, raw_path)?;
+    Ok(candidate)
+}
+
+fn nearest_existing_parent(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path;
+    loop {
+        if current.exists() {
+            return Ok(current.to_path_buf());
+        }
+        current = current
+            .parent()
+            .ok_or_else(|| format!("path_not_found: {}", path.display()))?;
+    }
+}
+
+fn assess_shell_command(command: &str, assume_yes: bool) -> Result<(), String> {
+    let lower = command.to_ascii_lowercase();
+    let compact = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let high_risk = [
+        "rm -rf",
+        "del /",
+        "format",
+        "shutdown",
+        "invoke-webrequest",
+        "| iex",
+        "curl",
+        "| sh",
+    ];
+    if compact.contains("rm -rf")
+        || compact.contains("del /s")
+        || compact.contains("del /q")
+        || compact.contains("format")
+        || compact.contains("shutdown")
+        || (compact.contains("invoke-webrequest") && compact.contains("| iex"))
+        || (compact.contains("curl") && compact.contains("| sh"))
+    {
+        return Err("rejected: high-risk shell command is blocked".to_string());
+    }
+    let install_like = ["npm install", "pip install", "cargo install"];
+    if install_like.iter().any(|pattern| compact.contains(pattern)) && !assume_yes {
+        return Err("rejected: install commands require --yes confirmation".to_string());
+    }
+    let _ = high_risk;
+    Ok(())
+}
+
+pub fn get_file_context(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let raw_path = required_string(arguments, "path")?;
+    let line = required_usize(arguments, "line")?;
+    if line == 0 {
+        return Err("invalid_range: line must be >= 1".to_string());
+    }
+
+    let file = resolve_existing_path(&workspace, &raw_path)?;
+    ensure_regular_text_file(&workspace, &file)?;
+    let before =
+        optional_usize(arguments, "before", DEFAULT_FILE_CONTEXT_BEFORE)?.min(MAX_CONTEXT_LINES);
+    let after =
+        optional_usize(arguments, "after", DEFAULT_FILE_CONTEXT_AFTER)?.min(MAX_CONTEXT_LINES);
+    let start = line.saturating_sub(before).max(1);
+    let end = line.saturating_add(after);
+    let (lines, _) = collect_line_range(&file, start, end, false)?;
+    if !lines
+        .iter()
+        .any(|entry| entry.get("line").and_then(Value::as_u64) == Some(line as u64))
+    {
+        return Err(format!(
+            "line_out_of_range: {}:{}",
+            relative_path(&workspace, &file),
+            line
+        ));
+    }
+
+    let actual_start_line = lines
+        .first()
+        .and_then(|entry| entry.get("line"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let actual_end_line = lines
+        .last()
+        .and_then(|entry| entry.get("line"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    Ok(json!({
+        "file": relative_path(&workspace, &file),
+        "line": line,
+        "before": before,
+        "after": after,
+        "startLine": actual_start_line,
+        "endLine": actual_end_line,
+        "lines": lines,
+    }))
+}
+
+fn search_content_with_rg(
+    workspace: &Path,
+    root: &Path,
+    query: &str,
+    file_glob: Option<&str>,
+    max_results: usize,
+    context_lines: usize,
+    case_sensitive: bool,
+    regex: bool,
+) -> Result<Value, String> {
+    let mut command = Command::new("rg");
+    command
+        .current_dir(root)
+        .arg("--json")
+        .arg("--line-number")
+        .arg("--column")
+        .arg("--hidden")
+        .arg("--follow")
+        .arg("--color")
+        .arg("never");
+    if !case_sensitive {
+        command.arg("--ignore-case");
+    }
+    if !regex {
+        command.arg("--fixed-strings");
+    }
+    add_ignore_globs(&mut command);
+    if let Some(glob) = file_glob.filter(|glob| !glob.trim().is_empty()) {
+        command.arg("--glob").arg(glob);
+    } else {
+        add_default_content_globs(&mut command);
+    }
+    command.arg(query).arg(".");
+
+    let output = command
+        .output()
+        .map_err(|error| format!("search_failed: failed to run rg: {error}"))?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if regex {
+            return Err(format!("invalid_regex: {stderr}"));
+        }
+        return Err(format!("search_failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    for line in stdout.lines() {
+        let parsed = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if parsed.get("type").and_then(Value::as_str) != Some("match") {
+            continue;
+        }
+        if matches.len() >= max_results {
+            truncated = true;
+            break;
+        }
+        let Some(data) = parsed.get("data") else {
+            continue;
+        };
+        let Some(path_text) = data
+            .get("path")
+            .and_then(|path| path.get("text"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let path = resolve_rg_path(workspace, root, path_text)?;
+        let line_number = data.get("line_number").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if line_number == 0 {
+            continue;
+        }
+        let columns = data
+            .get("submatches")
+            .and_then(Value::as_array)
+            .map(|submatches| {
+                submatches
+                    .iter()
+                    .filter_map(|submatch| {
+                        submatch
+                            .get("start")
+                            .and_then(Value::as_u64)
+                            .map(|column| column + 1)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|columns| !columns.is_empty())
+            .unwrap_or_else(|| vec![1]);
+        let text = data
+            .get("lines")
+            .and_then(|lines| lines.get("text"))
+            .and_then(Value::as_str)
+            .map(trim_line_end)
+            .unwrap_or_default();
+        let (before, after) = read_before_after(&path, line_number, context_lines, context_lines)?;
+        matches.push(json!({
+            "file": relative_path(workspace, &path),
+            "line": line_number,
+            "column": columns[0],
+            "columns": columns,
+            "text": text,
+            "before": before,
+            "after": after,
+        }));
+    }
+
+    Ok(json!({
+        "query": query,
+        "root": relative_path(workspace, root),
+        "fileGlob": file_glob,
+        "maxResults": max_results,
+        "contextLines": context_lines,
+        "caseSensitive": case_sensitive,
+        "regex": regex,
+        "engine": "rg",
+        "matches": matches,
+        "count": matches.len(),
+        "truncated": truncated,
+        "message": if truncated {
+            Some(format!("too_many_results: returned first {max_results} matches"))
+        } else {
+            None
+        },
+    }))
+}
+
+fn search_content_with_fallback(
+    workspace: &Path,
+    root: &Path,
+    query: &str,
+    file_glob: Option<&str>,
+    max_results: usize,
+    context_lines: usize,
+    case_sensitive: bool,
+    regex: Option<&Regex>,
+) -> Result<Value, String> {
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    let mut scan_limited = false;
+    let started = Instant::now();
+    let normalized_query = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_ascii_lowercase()
+    };
+
+    let scanned_files = walk_files_until(workspace, root, &mut |path, scanned| {
+        if matches.len() >= max_results {
+            truncated = true;
+            return Ok(WalkControl::Stop);
+        }
+        if scanned > SEARCH_CONTENT_SCAN_LIMIT
+            || started.elapsed().as_millis() >= SEARCH_SCAN_TIMEOUT_MS
+        {
+            scan_limited = true;
+            return Ok(WalkControl::Stop);
+        }
+        if !content_file_allowed(workspace, path, file_glob) {
+            return Ok(WalkControl::Continue);
+        }
+        if is_binary_file(path)? {
+            return Ok(WalkControl::Continue);
+        }
+
+        let mut line_number = 0usize;
+        let file = File::open(path).map_err(|error| {
+            format!(
+                "file_not_found: {}: {error}",
+                relative_path(workspace, path)
+            )
+        })?;
+        let mut reader = BufReader::new(file);
+        let mut bytes = Vec::new();
+        while reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|error| format!("read_failed: {}: {error}", relative_path(workspace, path)))?
+            > 0
+        {
+            line_number += 1;
+            let line = bytes_to_line(&bytes);
+            let columns = find_columns(&line, &normalized_query, case_sensitive, regex);
+            if !columns.is_empty() {
+                if matches.len() >= max_results {
+                    truncated = true;
+                    return Ok(WalkControl::Stop);
+                }
+                let (before, after) =
+                    read_before_after(path, line_number, context_lines, context_lines)?;
+                matches.push(json!({
+                    "file": relative_path(workspace, path),
+                    "line": line_number,
+                    "column": columns[0],
+                    "columns": columns,
+                    "text": line,
+                    "before": before,
+                    "after": after,
+                }));
+            }
+            bytes.clear();
+        }
+        Ok(WalkControl::Continue)
+    })?;
+
+    Ok(json!({
+        "query": query,
+        "root": relative_path(workspace, root),
+        "fileGlob": file_glob,
+        "maxResults": max_results,
+        "contextLines": context_lines,
+        "caseSensitive": case_sensitive,
+        "regex": regex.is_some(),
+        "engine": "fallback",
+        "matches": matches,
+        "count": matches.len(),
+        "scannedFiles": scanned_files,
+        "complete": !truncated && !scan_limited,
+        "truncated": truncated || scan_limited,
+        "message": if scan_limited {
+            Some(format!(
+                "search_limited: scanned {scanned_files} files before returning partial results; narrow root or file_glob"
+            ))
+        } else if truncated {
+            Some(format!("too_many_results: returned first {max_results} matches"))
+        } else {
+            None
+        },
+    }))
+}
+
+fn canonical_workspace_root(workspace_root: &str) -> Result<PathBuf, String> {
+    let raw = normalize_display_path(workspace_root);
+    let path = PathBuf::from(raw.trim());
+    let canonical = canonicalize_path(&path)
+        .map_err(|error| format!("workspace_not_found: {}: {error}", path.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("workspace_not_found: {}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
+fn canonicalize_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    fs::canonicalize(path)
+}
+
+fn resolve_existing_path(workspace: &Path, raw_path: &str) -> Result<PathBuf, String> {
+    let normalized = normalize_display_path(raw_path);
+    let trimmed = normalized.trim();
+    let candidate = if trimmed.is_empty() || trimmed == "." {
+        workspace.to_path_buf()
+    } else {
+        let path = PathBuf::from(trimmed);
+        if path.is_absolute() {
+            path
+        } else {
+            workspace.join(path)
+        }
+    };
+    let canonical = canonicalize_path(&candidate)
+        .map_err(|_| format!("file_not_found: {}", display_input_path(raw_path)))?;
+    ensure_inside_workspace(workspace, &canonical, raw_path)?;
+    Ok(canonical)
+}
+
+fn resolve_search_root(workspace: &Path, arguments: &Value) -> Result<PathBuf, String> {
+    let root = optional_string(arguments, "root")?.unwrap_or_else(|| ".".to_string());
+    let path = resolve_existing_path(workspace, &root)?;
+    if !path.is_dir() {
+        return Err(format!(
+            "not_directory: {}",
+            relative_or_display(workspace, &path)
+        ));
+    }
+    Ok(path)
+}
+
+fn resolve_rg_path(workspace: &Path, root: &Path, path_text: &str) -> Result<PathBuf, String> {
+    let raw = normalize_display_path(path_text);
+    let path = PathBuf::from(raw.trim());
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    let canonical = canonicalize_path(&candidate)
+        .map_err(|_| format!("file_not_found: {}", candidate.display()))?;
+    ensure_inside_workspace(workspace, &canonical, path_text)?;
+    Ok(canonical)
+}
+
+fn ensure_inside_workspace(workspace: &Path, path: &Path, raw_path: &str) -> Result<(), String> {
+    if path == workspace || path.starts_with(workspace) {
+        return Ok(());
+    }
+    Err(format!(
+        "path_outside_workspace: {}",
+        display_input_path(raw_path)
+    ))
+}
+
+fn ensure_regular_text_file(workspace: &Path, file: &Path) -> Result<(), String> {
+    if !file.is_file() {
+        return Err(format!(
+            "not_file: {}",
+            relative_or_display(workspace, file)
+        ));
+    }
+    if is_binary_file(file)? {
+        return Err(format!(
+            "binary_file: {}",
+            relative_or_display(workspace, file)
+        ));
+    }
+    Ok(())
+}
+
+fn is_binary_file(path: &Path) -> Result<bool, String> {
+    let mut file =
+        File::open(path).map_err(|error| format!("file_not_found: {}: {error}", path.display()))?;
+    let mut buffer = [0u8; BINARY_SAMPLE_BYTES];
+    let read = file
+        .read(&mut buffer)
+        .map_err(|error| format!("read_failed: {}: {error}", path.display()))?;
+    Ok(buffer[..read].contains(&0))
+}
+
+fn sorted_read_dir(path: &Path) -> Result<Vec<fs::DirEntry>, String> {
+    let mut entries = fs::read_dir(path)
+        .map_err(|error| format!("read_dir_failed: {}: {error}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read_dir_failed: {}: {error}", path.display()))?;
+    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase());
+    Ok(entries)
+}
+
+enum WalkControl {
+    Continue,
+    Stop,
+}
+
+fn walk_files_until(
+    workspace: &Path,
+    root: &Path,
+    visit: &mut impl FnMut(&Path, usize) -> Result<WalkControl, String>,
+) -> Result<usize, String> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut scanned = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in sorted_read_dir(&dir)? {
+            let path = entry.path();
+            if path.is_dir() {
+                if is_ignored_dir(&path) {
+                    continue;
+                }
+                let canonical = canonicalize_path(&path)
+                    .map_err(|error| format!("read_dir_failed: {}: {error}", path.display()))?;
+                ensure_inside_workspace(workspace, &canonical, &path.to_string_lossy())?;
+                stack.push(canonical);
+            } else if path.is_file() {
+                let canonical = canonicalize_path(&path)
+                    .map_err(|error| format!("file_not_found: {}: {error}", path.display()))?;
+                ensure_inside_workspace(workspace, &canonical, &path.to_string_lossy())?;
+                scanned += 1;
+                if matches!(visit(&canonical, scanned)?, WalkControl::Stop) {
+                    return Ok(scanned);
+                }
+            }
+        }
+    }
+    Ok(scanned)
+}
+
+fn is_ignored_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            IGNORED_DIRS
+                .iter()
+                .any(|ignored| name.eq_ignore_ascii_case(ignored))
+        })
+}
+
+fn ignored_search_excludes() -> Vec<String> {
+    let mut excludes = IGNORED_DIRS
+        .iter()
+        .map(|ignored| format!("**/{ignored}/**"))
+        .collect::<Vec<_>>();
+    excludes.extend(
+        IGNORED_SEARCH_PATHS
+            .iter()
+            .map(|ignored_path| format!("**/{}/**", ignored_path.join("/"))),
+    );
+    excludes
+}
+
+fn collect_line_range(
+    file: &Path,
+    start_line: usize,
+    end_line: usize,
+    count_total: bool,
+) -> Result<(Vec<Value>, usize), String> {
+    let opened =
+        File::open(file).map_err(|error| format!("file_not_found: {}: {error}", file.display()))?;
+    let mut reader = BufReader::new(opened);
+    let mut line_number = 0usize;
+    let mut lines = Vec::new();
+    let mut bytes = Vec::new();
+    while reader
+        .read_until(b'\n', &mut bytes)
+        .map_err(|error| format!("read_failed: {}: {error}", file.display()))?
+        > 0
+    {
+        line_number += 1;
+        if line_number >= start_line && line_number <= end_line {
+            lines.push(json!({
+                "line": line_number,
+                "text": bytes_to_line(&bytes),
+            }));
+        }
+        bytes.clear();
+        if !count_total && line_number >= end_line {
+            break;
+        }
+    }
+    Ok((lines, line_number))
+}
+
+fn read_before_after(
+    file: &Path,
+    line: usize,
+    before: usize,
+    after: usize,
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let start = line.saturating_sub(before).max(1);
+    let end = line.saturating_add(after);
+    let (lines, _) = collect_line_range(file, start, end, false)?;
+    let before_lines = lines
+        .iter()
+        .filter(|entry| entry.get("line").and_then(Value::as_u64).unwrap_or(0) < line as u64)
+        .cloned()
+        .collect::<Vec<_>>();
+    let after_lines = lines
+        .iter()
+        .filter(|entry| entry.get("line").and_then(Value::as_u64).unwrap_or(0) > line as u64)
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok((before_lines, after_lines))
+}
+
+fn bytes_to_line(bytes: &[u8]) -> String {
+    let mut end = bytes.len();
+    if end > 0 && bytes[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b'\r' {
+        end -= 1;
+    }
+    String::from_utf8_lossy(&bytes[..end]).to_string()
+}
+
+fn trim_line_end(text: &str) -> String {
+    text.trim_end_matches(&['\r', '\n'][..]).to_string()
+}
+
+fn find_columns(
+    line: &str,
+    normalized_query: &str,
+    case_sensitive: bool,
+    regex: Option<&Regex>,
+) -> Vec<usize> {
+    if let Some(regex) = regex {
+        return regex
+            .find_iter(line)
+            .map(|matched| matched.start() + 1)
+            .collect();
+    }
+
+    let haystack = if case_sensitive {
+        line.to_string()
+    } else {
+        line.to_ascii_lowercase()
+    };
+    let mut columns = Vec::new();
+    let mut offset = 0usize;
+    while let Some(found) = haystack[offset..].find(normalized_query) {
+        let column = offset + found + 1;
+        columns.push(column);
+        offset += found + normalized_query.len().max(1);
+        if offset >= haystack.len() {
+            break;
+        }
+    }
+    columns
+}
+
+fn content_file_allowed(workspace: &Path, path: &Path, file_glob: Option<&str>) -> bool {
+    let rel = relative_path(workspace, path);
+    if let Some(glob) = file_glob.filter(|glob| !glob.trim().is_empty()) {
+        return matches_file_glob(&rel, glob);
+    }
+    preferred_content_file(path)
+}
+
+fn preferred_content_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!(".{}", extension).to_ascii_lowercase())
+        .is_some_and(|extension| DEFAULT_CONTENT_EXTENSIONS.contains(&extension.as_str()))
+}
+
+fn matches_file_glob(relative_path: &str, glob: &str) -> bool {
+    let path = relative_path.replace('\\', "/").to_ascii_lowercase();
+    let pattern = glob.replace('\\', "/").to_ascii_lowercase();
+    let file_name = Path::new(relative_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(relative_path)
+        .to_ascii_lowercase();
+    wildcard_match(&path, &pattern) || wildcard_match(&file_name, &pattern)
+}
+
+fn wildcard_match(text: &str, pattern: &str) -> bool {
+    let text = text.chars().collect::<Vec<_>>();
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let (mut text_i, mut pattern_i) = (0usize, 0usize);
+    let mut star_i = None;
+    let mut star_text_i = 0usize;
+    while text_i < text.len() {
+        if pattern_i < pattern.len()
+            && (pattern[pattern_i] == '?' || pattern[pattern_i] == text[text_i])
+        {
+            text_i += 1;
+            pattern_i += 1;
+        } else if pattern_i < pattern.len() && pattern[pattern_i] == '*' {
+            star_i = Some(pattern_i);
+            star_text_i = text_i;
+            pattern_i += 1;
+        } else if let Some(star) = star_i {
+            pattern_i = star + 1;
+            star_text_i += 1;
+            text_i = star_text_i;
+        } else {
+            return false;
+        }
+    }
+    while pattern_i < pattern.len() && pattern[pattern_i] == '*' {
+        pattern_i += 1;
+    }
+    pattern_i == pattern.len()
+}
+
+fn compile_regex(query: &str, case_sensitive: bool) -> Result<Regex, String> {
+    RegexBuilder::new(query)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|error| format!("invalid_regex: {error}"))
+}
+
+fn ripgrep_available() -> bool {
+    Command::new("rg")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn add_ignore_globs(command: &mut Command) {
+    for ignored in IGNORED_DIRS {
+        command.arg("--glob").arg(format!("!**/{ignored}/**"));
+    }
+    for ignored_path in IGNORED_SEARCH_PATHS {
+        command
+            .arg("--glob")
+            .arg(format!("!**/{}/**", ignored_path.join("/")));
+    }
+}
+
+fn add_default_content_globs(command: &mut Command) {
+    for extension in DEFAULT_CONTENT_EXTENSIONS {
+        command.arg("--glob").arg(format!("**/*{extension}"));
+    }
+}
+
+fn relative_path(workspace: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(workspace).unwrap_or(path);
+    let text = normalize_display_path(&relative.to_string_lossy()).replace('\\', "/");
+    if text.is_empty() {
+        ".".to_string()
+    } else {
+        text
+    }
+}
+
+fn relative_or_display(workspace: &Path, path: &Path) -> String {
+    if path.starts_with(workspace) {
+        relative_path(workspace, path)
+    } else {
+        normalize_display_path(&path.to_string_lossy())
+    }
+}
+
+fn display_input_path(path: &str) -> String {
+    normalize_display_path(path).replace('\\', "/")
+}
+
+fn required_string(arguments: &Value, key: &str) -> Result<String, String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("invalid_arguments: missing string field `{key}`"))
+}
+
+fn optional_string(arguments: &Value, key: &str) -> Result<Option<String>, String> {
+    match arguments.get(key) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        _ => Err(format!("invalid_arguments: `{key}` must be a string")),
+    }
+}
+
+fn required_usize(arguments: &Value, key: &str) -> Result<usize, String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| format!("invalid_arguments: missing numeric field `{key}`"))
+}
+
+fn optional_usize(arguments: &Value, key: &str, default: usize) -> Result<usize, String> {
+    optional_usize_value(arguments, key).map(|value| value.unwrap_or(default))
+}
+
+fn optional_usize_value(arguments: &Value, key: &str) -> Result<Option<usize>, String> {
+    match arguments.get(key) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| format!("invalid_arguments: `{key}` must be a non-negative integer")),
+        _ => Err(format!("invalid_arguments: `{key}` must be a number")),
+    }
+}
+
+fn optional_bool(arguments: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match arguments.get(key) {
+        Some(Value::Null) | None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        _ => Err(format!("invalid_arguments: `{key}` must be a boolean")),
+    }
+}
+
+fn max_results(arguments: &Value) -> Result<usize, String> {
+    let requested = optional_usize(arguments, "max_results", DEFAULT_MAX_RESULTS)?;
+    if requested == 0 {
+        return Err("invalid_arguments: max_results must be >= 1".to_string());
+    }
+    Ok(requested.min(MAX_RESULTS_LIMIT))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestWorkspace {
+        root: PathBuf,
+    }
+
+    impl TestWorkspace {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("snowagent-workspace-tools-{unique}"));
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.root.join(relative)
+        }
+
+        fn write_text(&self, relative: &str, text: &str) {
+            let path = self.path(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, text).unwrap();
+        }
+
+        fn write_bytes(&self, relative: &str, bytes: &[u8]) {
+            let path = self.path(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, bytes).unwrap();
+        }
+
+        fn root_str(&self) -> String {
+            self.root.to_string_lossy().to_string()
+        }
+    }
+
+    impl Drop for TestWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn list_dir_sorts_and_ignores_default_dirs() {
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path("src")).unwrap();
+        fs::create_dir_all(workspace.path(".git")).unwrap();
+        workspace.write_text("b.txt", "b");
+        workspace.write_text("a.txt", "a");
+
+        let result = list_dir(&workspace.root_str(), &json!({ "path": "." })).unwrap();
+
+        assert_eq!(result["directories"], json!(["src"]));
+        assert_eq!(result["files"], json!(["a.txt", "b.txt"]));
+        assert_eq!(result["entries"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn read_file_returns_numbered_range_and_large_file_hint() {
+        let workspace = TestWorkspace::new();
+        let text = (1..=350)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        workspace.write_text("large.cpp", &text);
+
+        let result = read_file(&workspace.root_str(), &json!({ "path": "large.cpp" })).unwrap();
+
+        assert_eq!(result["totalLines"], json!(350));
+        assert_eq!(result["startLine"], json!(1));
+        assert_eq!(result["endLine"], json!(300));
+        assert_eq!(result["truncated"], json!(true));
+        assert!(result["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("line 1\nline 2"));
+        assert_eq!(result["lines"].as_array().unwrap().len(), 300);
+        assert!(result["message"]
+            .as_str()
+            .unwrap()
+            .contains("too_many_results"));
+    }
+
+    #[test]
+    fn read_file_rejects_binary_files() {
+        let workspace = TestWorkspace::new();
+        workspace.write_bytes("data.bin", &[0, 1, 2, 3]);
+
+        let error = read_file(&workspace.root_str(), &json!({ "path": "data.bin" })).unwrap_err();
+
+        assert!(error.contains("binary_file"));
+    }
+
+    #[test]
+    fn paths_cannot_escape_workspace() {
+        let workspace = TestWorkspace::new();
+        let outside = std::env::temp_dir().join(format!(
+            "snowagent-outside-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&outside, "outside").unwrap();
+
+        let error = read_file(
+            &workspace.root_str(),
+            &json!({ "path": outside.to_string_lossy() }),
+        )
+        .unwrap_err();
+
+        let _ = fs::remove_file(outside);
+        assert!(error.contains("path_outside_workspace"));
+    }
+
+    #[test]
+    fn search_file_orders_exact_filename_before_contains() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text("src/main.cpp", "main");
+        workspace.write_text("src/my_main.cpp", "main");
+        workspace.write_text("src/other.cpp", "main");
+
+        let result = search_file(
+            &workspace.root_str(),
+            &json!({ "pattern": "main.cpp", "max_results": 10 }),
+        )
+        .unwrap();
+
+        assert_eq!(result["matches"][0]["path"], json!("src/main.cpp"));
+        assert_eq!(result["matches"][0]["type"], json!("file"));
+        assert_eq!(result["paths"][0], json!("src/main.cpp"));
+        assert_eq!(result["paths"][1], json!("src/my_main.cpp"));
+        assert_eq!(result["engine"], json!("codex-file-search"));
+    }
+
+    #[test]
+    fn search_file_excludes_claude_worktrees() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text(".claude/worktrees/tmp/src/main.cpp", "main");
+        workspace.write_text("src/main.cpp", "main");
+
+        let result = search_file(
+            &workspace.root_str(),
+            &json!({ "pattern": "main.cpp", "max_results": 10 }),
+        )
+        .unwrap();
+        let paths = result["paths"].as_array().unwrap();
+
+        assert_eq!(paths, &[json!("src/main.cpp")]);
+    }
+
+    #[test]
+    fn search_content_finds_matches_with_context_and_columns() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text("src/code.cpp", "before\nneedle here needle\nafter\n");
+
+        let result = search_content(
+            &workspace.root_str(),
+            &json!({
+                "query": "needle",
+                "file_glob": "*.cpp",
+                "context_lines": 1,
+                "max_results": 10
+            }),
+        )
+        .unwrap();
+        let first = &result["matches"][0];
+
+        assert_eq!(first["file"], json!("src/code.cpp"));
+        assert_eq!(first["line"], json!(2));
+        assert_eq!(first["column"], json!(1));
+        assert_eq!(first["columns"], json!([1, 13]));
+        assert_eq!(first["before"][0]["text"], json!("before"));
+        assert_eq!(first["after"][0]["text"], json!("after"));
+        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_content_reports_invalid_regex() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text("src/code.cpp", "text");
+
+        let error = search_content(
+            &workspace.root_str(),
+            &json!({ "query": "[", "regex": true }),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("invalid_regex"));
+    }
+
+    #[test]
+    fn get_file_context_returns_requested_window() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text("src/code.cpp", "one\ntwo\nthree\nfour\nfive\n");
+
+        let result = get_file_context(
+            &workspace.root_str(),
+            &json!({ "path": "src/code.cpp", "line": 3, "before": 1, "after": 1 }),
+        )
+        .unwrap();
+
+        assert_eq!(result["startLine"], json!(2));
+        assert_eq!(result["endLine"], json!(4));
+        assert_eq!(result["lines"].as_array().unwrap().len(), 3);
+    }
+}

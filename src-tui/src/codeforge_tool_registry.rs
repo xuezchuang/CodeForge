@@ -634,90 +634,30 @@ fn register_vs_get_error_list(registry: &mut ToolRegistry) {
 mod tools {
     use super::*;
 
-    /// Maximum bytes an `Output` payload is allowed to occupy before we
-    /// truncate it. The TUI transcript and the model context both dislike
-    /// runaway reads.
-    const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-
-    /// Directories that are always skipped by list_dir / search_content.
-    const IGNORED_DIRS: &[&str] = &[
-        ".git",
-        ".vs",
-        "bin",
-        "obj",
-        "build",
-        "out",
-        "node_modules",
-        ".cache",
-        "target",
-    ];
-
     pub(super) fn read_file(
         invocation: ToolInvocation,
         context: ToolExecutionContext,
     ) -> ToolOutput {
         let started = Instant::now();
-        let path = match read_workspace_path(&invocation.arguments, "path", &context) {
-            Ok(path) => path,
-            Err(err) => return err.to_output(started.elapsed().as_millis() as u64),
+        let workspace_root = match workspace_root_string(&context, "read_file") {
+            Ok(root) => root,
+            Err(err) => return ToolOutput::error(err, started.elapsed().as_millis() as u64),
         };
-        let start_line = invocation
-            .arguments
-            .get("start_line")
-            .and_then(Value::as_u64)
-            .map(|value| value.max(1) as usize);
-        let end_line = invocation
-            .arguments
-            .get("end_line")
-            .and_then(Value::as_u64)
-            .map(|value| value.max(1) as usize);
-
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                return ToolOutput::error(
-                    format!("read_file: failed to read {}: {err}", path.display()),
+        match codeforge_core::workspace_tools::read_file(&workspace_root, &invocation.arguments) {
+            Ok(output) => {
+                let read_lines = output["lines"].as_array().map_or(0, Vec::len);
+                let file = output["file"].as_str().unwrap_or("<unknown>").to_string();
+                ToolOutput::ok_with_summary(
+                    output,
                     started.elapsed().as_millis() as u64,
-                );
+                    format!("read {read_lines} lines from {file}"),
+                )
             }
-        };
-        if let Some(kind) = looks_binary(&bytes) {
-            return ToolOutput::error(
-                format!("read_file: refusing to return binary file ({kind})"),
+            Err(err) => ToolOutput::error(
+                format!("read_file: {err}"),
                 started.elapsed().as_millis() as u64,
-            );
-        }
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().collect();
-        let total = lines.len();
-        let start = start_line.unwrap_or(1);
-        let end = end_line.unwrap_or(start.saturating_add(299).min(total));
-        if start > total {
-            return ToolOutput::error(
-                format!("read_file: start_line {start} is past end of file ({total} lines)"),
-                started.elapsed().as_millis() as u64,
-            );
-        }
-        let mut body = String::new();
-        for (idx, line) in lines.iter().enumerate().take(end).skip(start - 1) {
-            body.push_str(&format!("{:>5}  {}\n", idx + 1, line));
-        }
-        truncate_output(&mut body);
-        ToolOutput::ok_with_summary(
-            json!({
-                "path": relative_display(&path, &context),
-                "totalLines": total,
-                "startLine": start,
-                "endLine": end.min(total),
-                "text": body,
-            }),
-            started.elapsed().as_millis() as u64,
-            format!(
-                "read {} lines from {}",
-                end.min(total).saturating_sub(start - 1) + 1,
-                path.display()
             ),
-        )
+        }
     }
 
     pub(super) fn list_dir(
@@ -725,47 +665,25 @@ mod tools {
         context: ToolExecutionContext,
     ) -> ToolOutput {
         let started = Instant::now();
-        let path = match read_workspace_path(&invocation.arguments, "path", &context) {
-            Ok(path) => path,
-            Err(err) => return err.to_output(started.elapsed().as_millis() as u64),
+        let workspace_root = match workspace_root_string(&context, "list_dir") {
+            Ok(root) => root,
+            Err(err) => return ToolOutput::error(err, started.elapsed().as_millis() as u64),
         };
-        let entries = match std::fs::read_dir(&path) {
-            Ok(entries) => entries,
-            Err(err) => {
-                return ToolOutput::error(
-                    format!("list_dir: failed to read {}: {err}", path.display()),
+        match codeforge_core::workspace_tools::list_dir(&workspace_root, &invocation.arguments) {
+            Ok(output) => {
+                let directories = output["directories"].as_array().map_or(0, Vec::len);
+                let files = output["files"].as_array().map_or(0, Vec::len);
+                ToolOutput::ok_with_summary(
+                    output,
                     started.elapsed().as_millis() as u64,
-                );
+                    format!("{directories} directories, {files} files"),
+                )
             }
-        };
-        let mut dirs: Vec<String> = Vec::new();
-        let mut files: Vec<String> = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if IGNORED_DIRS.contains(&name.as_str()) {
-                continue;
-            }
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
-            if file_type.is_dir() {
-                dirs.push(name);
-            } else if file_type.is_file() {
-                files.push(name);
-            }
+            Err(err) => ToolOutput::error(
+                format!("list_dir: {err}"),
+                started.elapsed().as_millis() as u64,
+            ),
         }
-        dirs.sort();
-        files.sort();
-        ToolOutput::ok_with_summary(
-            json!({
-                "path": relative_display(&path, &context),
-                "dirs": dirs,
-                "files": files,
-            }),
-            started.elapsed().as_millis() as u64,
-            format!("{} directories, {} files", dirs.len(), files.len()),
-        )
     }
 
     pub(super) fn search_content(
@@ -773,117 +691,27 @@ mod tools {
         context: ToolExecutionContext,
     ) -> ToolOutput {
         let started = Instant::now();
-        let query = match invocation.arguments.get("query").and_then(Value::as_str) {
-            Some(query) => query,
-            None => {
-                return ToolOutput::error(
-                    "search: missing 'query' argument".to_string(),
+        let workspace_root = match workspace_root_string(&context, "search") {
+            Ok(root) => root,
+            Err(err) => return ToolOutput::error(err, started.elapsed().as_millis() as u64),
+        };
+        match codeforge_core::workspace_tools::search_content(
+            &workspace_root,
+            &invocation.arguments,
+        ) {
+            Ok(output) => {
+                let count = output["count"].as_u64().unwrap_or(0);
+                ToolOutput::ok_with_summary(
+                    output,
                     started.elapsed().as_millis() as u64,
-                );
+                    format!("{count} match{}", if count == 1 { "" } else { "es" }),
+                )
             }
-        };
-        let root = if invocation.arguments.get("root").is_some() {
-            match read_workspace_path(&invocation.arguments, "root", &context) {
-                Ok(path) => path,
-                Err(err) => return err.to_output(started.elapsed().as_millis() as u64),
-            }
-        } else {
-            match context.workspace_root.as_ref() {
-                Some(root) => root.clone(),
-                None => {
-                    return ToolOutput::error(
-                        "search: no workspace root configured for this tool".to_string(),
-                        started.elapsed().as_millis() as u64,
-                    );
-                }
-            }
-        };
-        let max_results = invocation
-            .arguments
-            .get("max_results")
-            .and_then(Value::as_u64)
-            .unwrap_or(100) as usize;
-        let context_lines = invocation
-            .arguments
-            .get("context_lines")
-            .and_then(Value::as_u64)
-            .unwrap_or(2) as usize;
-        let case_sensitive = invocation
-            .arguments
-            .get("case_sensitive")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let use_regex = invocation
-            .arguments
-            .get("regex")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let file_glob = invocation
-            .arguments
-            .get("file_glob")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-
-        let matcher = match build_matcher(query, case_sensitive, use_regex) {
-            Ok(matcher) => matcher,
-            Err(err) => {
-                return ToolOutput::error(
-                    format!("search: {err}"),
-                    started.elapsed().as_millis() as u64,
-                );
-            }
-        };
-
-        let mut matches = Vec::new();
-        let mut truncated = false;
-        let walk_error = walk_files(&root, &file_glob, &mut |path| {
-            if matches.len() >= max_results {
-                truncated = true;
-                return false;
-            }
-            let Ok(bytes) = std::fs::read(path) else {
-                return true;
-            };
-            if looks_binary(&bytes).is_some() {
-                return true;
-            }
-            let text = String::from_utf8_lossy(&bytes);
-            for (idx, line) in text.lines().enumerate() {
-                if let Some(hit) = matcher(line) {
-                    let (before, after) = context_lines_for(&text, idx, context_lines);
-                    matches.push(json!({
-                        "file": relative_display(path, &context),
-                        "line": idx + 1,
-                        "column": hit + 1,
-                        "text": line,
-                        "before": before,
-                        "after": after,
-                    }));
-                    if matches.len() >= max_results {
-                        truncated = true;
-                        return false;
-                    }
-                }
-            }
-            true
-        });
-        if let Err(err) = walk_error {
-            return ToolOutput::error(
-                format!("search: failed to walk {}: {err}", root.display()),
+            Err(err) => ToolOutput::error(
+                format!("search: {err}"),
                 started.elapsed().as_millis() as u64,
-            );
+            ),
         }
-        let count = matches.len();
-        ToolOutput::ok_with_summary(
-            json!({
-                "root": relative_display(&root, &context),
-                "query": query,
-                "matches": matches,
-                "truncated": truncated,
-            }),
-            started.elapsed().as_millis() as u64,
-            format!("{count} match{}", if count == 1 { "" } else { "es" }),
-        )
     }
 
     pub(super) fn edit_file(
@@ -1267,11 +1095,15 @@ mod tools {
     // Shared helpers
     // -----------------------------------------------------------------------
 
-    fn truncate_output(body: &mut String) {
-        if body.len() > MAX_OUTPUT_BYTES {
-            body.truncate(MAX_OUTPUT_BYTES);
-            body.push_str("\n... [truncated]");
-        }
+    fn workspace_root_string(
+        context: &ToolExecutionContext,
+        tool_name: &str,
+    ) -> Result<String, String> {
+        context
+            .workspace_root
+            .as_ref()
+            .map(|root| root.to_string_lossy().to_string())
+            .ok_or_else(|| format!("{tool_name}: no workspace root configured for this tool"))
     }
 
     fn looks_binary(bytes: &[u8]) -> Option<&'static str> {
@@ -1289,105 +1121,6 @@ mod tools {
             return Some("non-printable content");
         }
         None
-    }
-
-    fn context_lines_for(
-        text: &str,
-        idx: usize,
-        context_lines: usize,
-    ) -> (Vec<String>, Vec<String>) {
-        let lines: Vec<&str> = text.lines().collect();
-        let start = idx.saturating_sub(context_lines);
-        let end = (idx + context_lines + 1).min(lines.len());
-        let before = lines[start..idx]
-            .iter()
-            .map(|line| line.to_string())
-            .collect();
-        let after = lines[(idx + 1)..end]
-            .iter()
-            .map(|line| line.to_string())
-            .collect();
-        (before, after)
-    }
-
-    type WalkFn<'a> = dyn FnMut(&Path) -> bool + 'a;
-
-    fn walk_files(
-        root: &Path,
-        file_glob: &Option<String>,
-        visit: &mut WalkFn<'_>,
-    ) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(root)? {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            let name = entry.file_name().to_string_lossy().to_string();
-            if IGNORED_DIRS.contains(&name.as_str()) {
-                continue;
-            }
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
-            if file_type.is_dir() {
-                walk_files(&path, file_glob, visit)?;
-            } else if file_type.is_file() {
-                if let Some(glob) = file_glob {
-                    if !glob_matches(glob, &name) {
-                        continue;
-                    }
-                }
-                if !visit(&path) {
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn glob_matches(glob: &str, name: &str) -> bool {
-        if glob == "*" || glob == "*.*" {
-            return true;
-        }
-        if !glob.contains('*') {
-            return name == glob;
-        }
-        let mut pattern = String::from("^");
-        for ch in glob.chars() {
-            match ch {
-                '*' => pattern.push_str(".*"),
-                '.' | '(' | ')' | '+' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => {
-                    pattern.push('\\');
-                    pattern.push(ch);
-                }
-                _ => pattern.push(ch),
-            }
-        }
-        pattern.push('$');
-        regex_lite::Regex::new(&pattern)
-            .map(|regex| regex.is_match(name))
-            .unwrap_or(false)
-    }
-
-    fn build_matcher(
-        query: &str,
-        case_sensitive: bool,
-        use_regex: bool,
-    ) -> Result<Box<dyn Fn(&str) -> Option<usize> + '_>, String> {
-        if use_regex {
-            let regex = regex_lite::RegexBuilder::new(query)
-                .case_insensitive(!case_sensitive)
-                .build()
-                .map_err(|err| format!("invalid regex: {err}"))?;
-            Ok(Box::new(move |line| regex.find(line).map(|m| m.start())))
-        } else if case_sensitive {
-            Ok(Box::new(move |line| line.find(query)))
-        } else {
-            let needle = query.to_lowercase();
-            Ok(Box::new(move |line| line.to_lowercase().find(&needle)))
-        }
     }
 
     struct PathError {

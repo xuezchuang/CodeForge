@@ -818,17 +818,14 @@ function createPendingAssistantMessage(taskId: string, attachmentCount = 0): Cha
 
 function createRunningAssistantContent(
   traces: ToolTraceEvent[],
-  attachmentCount = 0,
+  _attachmentCount = 0,
 ): string {
   const latestTrace = traces.at(-1)
   if (!latestTrace) {
-    const imageText =
-      attachmentCount > 0 ?
-        `Preparing ${attachmentCount} image${attachmentCount === 1 ? '' : 's'} and model request.`
-      : 'Preparing model request.'
-    return `Thinking...\n\n${imageText}`
+    return 'Thinking...\n\n'
   }
-  return `Thinking...\n\n${describeRunningTrace(latestTrace)}`
+  const detail = describeRunningTrace(latestTrace)
+  return detail ? `Thinking...\n\n${detail}` : 'Thinking...\n\n'
 }
 
 function describeRunningTrace(event: ToolTraceEvent): string {
@@ -838,13 +835,10 @@ function describeRunningTrace(event: ToolTraceEvent): string {
     return appendRunningDetail('Step failed', detail)
   }
   if (event.type === 'llm_request') {
-    return appendRunningDetail('Sending model request', detail)
+    return ''
   }
   if (event.type === 'llm_response') {
-    return appendRunningDetail(
-      'Received model response; updating the thinking trace',
-      detail,
-    )
+    return ''
   }
   if (event.type === 'tool_call') {
     return appendRunningDetail(
@@ -854,10 +848,7 @@ function describeRunningTrace(event: ToolTraceEvent): string {
   }
   if (event.type === 'tool_result') {
     if (event.toolName === 'chat_completion') {
-      return appendRunningDetail(
-        'Received model response; updating the thinking trace',
-        detail,
-      )
+      return ''
     }
     return appendRunningDetail(
       `Completed ${runningToolLabel(event.toolName)}`,
@@ -865,10 +856,13 @@ function describeRunningTrace(event: ToolTraceEvent): string {
     )
   }
   if (event.type === 'final_response') {
-    return appendRunningDetail('Composing final response', detail)
+    return ''
   }
   if (event.type === 'model_message') {
-    return appendRunningDetail('Reading model message', detail)
+    return ''
+  }
+  if (event.type === 'system_event') {
+    return ''
   }
   return appendRunningDetail(event.outputSummary ?? event.title ?? 'Working', detail)
 }
@@ -1027,6 +1021,9 @@ function formatToolsListMessage(tools: ToolDefinitionSummary[]): string {
 }
 
 function hasFailedTrace(traces: ToolTraceEvent[]): boolean {
+  if (traces.some((event) => event.type === 'final_response' && event.status === 'success')) {
+    return false
+  }
   return traces.some((event) => event.status === 'failed')
 }
 

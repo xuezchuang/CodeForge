@@ -14,6 +14,7 @@ import {
   ThumbsDown,
   ThumbsUp,
   UserRound,
+  X,
 } from 'lucide-react'
 import CodeLink from './CodeLink'
 import { containsCodeLink, renderTextWithCodeLinks } from './codeLinkText'
@@ -49,18 +50,14 @@ function ChatMessage({
   const animateThinkingPrefix =
     isRunningAssistant && displayContent.startsWith(THINKING_PREFIX)
   const [copiedTarget, setCopiedTarget] = useState<'user' | 'assistant' | null>(null)
+  const [activeToolTrace, setActiveToolTrace] = useState<ToolTraceEvent | null>(null)
   const thinkingSummary = useMemo(
     () =>
       createThinkingSummary(message.traceEvents ?? [], {
         nowMs: thinkingNowMs,
         running: isRunningAssistant,
-        startedAt: message.createdAt,
-        initialText:
-          displayContent.startsWith(THINKING_PREFIX) ?
-            displayContent.slice(THINKING_PREFIX.length).trim()
-          : 'Preparing model request.',
       }),
-    [displayContent, isRunningAssistant, message.createdAt, message.traceEvents, thinkingNowMs],
+    [isRunningAssistant, message.traceEvents, thinkingNowMs],
   )
   const copyText = (value: string, target: 'user' | 'assistant') => {
     if (!navigator.clipboard) {
@@ -87,6 +84,7 @@ function ChatMessage({
     .join(' ')
 
   return (
+    <>
     <article className={messageClassName}>
       <div className="message-avatar">
         {isUser ? (
@@ -106,6 +104,7 @@ function ChatMessage({
           <ThinkingPanel
             summary={thinkingSummary}
             defaultOpen={false}
+            onToolTraceOpen={setActiveToolTrace}
           />
         ) : null}
         {message.attachments && message.attachments.length > 0 ? (
@@ -191,6 +190,7 @@ function ChatMessage({
               onCodeLinkResult={onCodeLinkResult}
               onCodeLinkError={onCodeLinkError}
               onTraceChanged={() => onTraceChanged(message.taskId)}
+              onToolTraceOpen={setActiveToolTrace}
             />
           </div>
         ) : null}
@@ -242,6 +242,97 @@ function ChatMessage({
         ) : null}
       </div>
     </article>
+    {activeToolTrace ? (
+      <ToolTraceModal event={activeToolTrace} onClose={() => setActiveToolTrace(null)} />
+    ) : null}
+    </>
+  )
+}
+
+interface ToolTraceModalProps {
+  event: ToolTraceEvent
+  onClose: () => void
+}
+
+function ToolTraceModal({ event, onClose }: ToolTraceModalProps) {
+  useEffect(() => {
+    const onKeyDown = (keyboardEvent: KeyboardEvent) => {
+      if (keyboardEvent.key === 'Escape') {
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [onClose])
+
+  const input = asRecord(event.input)
+  const argumentsValue = asRecord(input.arguments)
+  const hasArguments = Object.keys(argumentsValue).length > 0
+  const inputText = prettyTraceValue(event.input)
+  const outputText = prettyTraceValue(event.output)
+  const summary = event.outputSummary?.trim() ?? ''
+
+  return (
+    <div
+      className="tool-trace-modal-backdrop"
+      role="presentation"
+      onMouseDown={(mouseEvent) => {
+        if (mouseEvent.target === mouseEvent.currentTarget) {
+          onClose()
+        }
+      }}
+    >
+      <section className="tool-trace-modal" role="dialog" aria-modal="true" aria-label="Tool trace">
+        <header className="tool-trace-modal-header">
+          <div>
+            <span>{event.type === 'tool_call' ? 'Tool call' : 'Tool result'}</span>
+            <strong>{event.toolName ?? event.title}</strong>
+          </div>
+          <button
+            type="button"
+            className="tool-trace-close"
+            aria-label="Close tool trace"
+            onClick={onClose}
+          >
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+        <div className="tool-trace-modal-body">
+          <dl className="tool-trace-meta">
+            <div>
+              <dt>Status</dt>
+              <dd>{event.status}</dd>
+            </div>
+            <div>
+              <dt>Duration</dt>
+              <dd>{formatDuration(event.durationMs) || '0 ms'}</dd>
+            </div>
+            <div>
+              <dt>Step</dt>
+              <dd>{event.stepIndex}</dd>
+            </div>
+          </dl>
+          {summary ? (
+            <section className="tool-trace-section">
+              <h4>Summary</h4>
+              <pre>{maskSensitiveText(summary)}</pre>
+            </section>
+          ) : null}
+          <section className="tool-trace-section">
+            <h4>Arguments</h4>
+            <pre>
+              {hasArguments ? prettyTraceValue(argumentsValue) : inputText || 'No arguments captured.'}
+            </pre>
+          </section>
+          <section className="tool-trace-section">
+            <h4>Output</h4>
+            <pre>{outputText || 'No output captured yet.'}</pre>
+          </section>
+        </div>
+      </section>
+    </div>
   )
 }
 
@@ -256,6 +347,7 @@ interface MarkdownMessageProps {
 
 interface RunningAssistantContentProps extends MarkdownMessageProps {
   thinkingSummary: ThinkingSummary | null
+  onToolTraceOpen: (event: ToolTraceEvent) => void
 }
 
 interface MarkdownCodeBlockProps {
@@ -294,6 +386,7 @@ function RunningAssistantContent({
   onCodeLinkResult,
   onCodeLinkError,
   onTraceChanged,
+  onToolTraceOpen,
 }: RunningAssistantContentProps) {
   const detail = text.startsWith(THINKING_PREFIX) ? text.slice(THINKING_PREFIX.length) : text
   const latestItemId = thinkingSummary?.items.at(-1)?.id ?? null
@@ -307,6 +400,7 @@ function RunningAssistantContent({
               key={item.id}
               item={item}
               autoOpen={item.id === latestItemId}
+              onToolTraceOpen={onToolTraceOpen}
             />
           ))}
           {thinkingSummary.omitted > 0 ? (
@@ -627,6 +721,7 @@ interface ThinkingSummary {
 interface ThinkingItem {
   id: string
   kind: 'search' | 'read' | 'list' | 'tool' | 'model' | 'message' | 'error'
+  event: ToolTraceEvent
   text: string
   detail?: string
   details: string[]
@@ -643,9 +738,11 @@ const THINKING_MAX_VISIBLE_ITEMS = 50
 function ThinkingPanel({
   summary,
   defaultOpen,
+  onToolTraceOpen,
 }: {
   summary: ThinkingSummary
   defaultOpen: boolean
+  onToolTraceOpen: (event: ToolTraceEvent) => void
 }) {
   const [open, setOpen] = useState(defaultOpen)
   const [visibleItemCount, setVisibleItemCount] = useState(() =>
@@ -712,6 +809,7 @@ function ThinkingPanel({
                 key={item.id}
                 item={item}
                 autoOpen={defaultOpen && item.id === latestVisibleItemId}
+                onToolTraceOpen={onToolTraceOpen}
               />
             ))}
             {summary.omitted > 0 ? (
@@ -729,14 +827,17 @@ function ThinkingPanel({
 function ThinkingItemRow({
   item,
   autoOpen,
+  onToolTraceOpen,
 }: {
   item: ThinkingItem
   autoOpen: boolean
+  onToolTraceOpen: (event: ToolTraceEvent) => void
 }) {
   const displayText = useProgressiveText(item.text, item.progressive && autoOpen)
-
-  return (
-    <div className={`thinking-item ${item.status} ${item.kind}`}>
+  const clickable = item.event ? isClickableToolTrace(item.event) : false
+  const className = `thinking-item ${item.status} ${item.kind}${clickable ? ' clickable' : ''}`
+  const content = (
+    <>
       <ThinkingIcon kind={item.kind} />
       <div className="thinking-item-body">
         <div className="thinking-item-main">
@@ -745,8 +846,23 @@ function ThinkingItemRow({
           <small>{item.duration || item.status}</small>
         </div>
       </div>
-    </div>
+    </>
   )
+
+  if (clickable && item.event) {
+    return (
+      <button
+        type="button"
+        className={className}
+        title="View tool trace"
+        onClick={() => onToolTraceOpen(item.event as ToolTraceEvent)}
+      >
+        {content}
+      </button>
+    )
+  }
+
+  return <div className={className}>{content}</div>
 }
 
 function useProgressiveText(text: string, enabled: boolean): string {
@@ -793,45 +909,27 @@ function ThinkingIcon({ kind }: { kind: ThinkingItem['kind'] }) {
   return <Bot size={13} aria-hidden="true" />
 }
 
+function isClickableToolTrace(event: ToolTraceEvent): boolean {
+  return Boolean(
+    event.toolName &&
+      (event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'error'),
+  )
+}
+
 function createThinkingSummary(
   events: ToolTraceEvent[],
-  options: { nowMs: number; running: boolean; startedAt: string; initialText: string },
+  options: { nowMs: number; running: boolean },
 ): ThinkingSummary | null {
   if (events.length === 0) {
-    if (!options.running) {
-      return null
-    }
-    const startedMs = Date.parse(options.startedAt)
-    return {
-      toolCalls: 0,
-      llmCalls: 0,
-      steps: 1,
-      workedFor:
-        Number.isFinite(startedMs) ?
-          formatElapsedMs(Math.max(1000, options.nowMs - startedMs))
-        : '',
-      items: [
-        {
-          id: 'waiting-for-first-trace',
-          kind: 'model',
-          text: options.initialText || 'Preparing model request.',
-          detail: 'waiting for backend trace',
-          details: [],
-          status: 'running',
-          duration:
-            Number.isFinite(startedMs) ?
-              formatElapsedMs(Math.max(1000, options.nowMs - startedMs))
-            : 'running',
-          progressive: false,
-        },
-      ],
-      omitted: 0,
-    }
+    return null
   }
 
   const visibleEvents = events.filter(
     (event, index) =>
-      isVisibleThinkingEvent(event) && !isSupersededToolCall(event, events, index),
+      isVisibleThinkingEvent(event) &&
+      !isSupersededToolCall(event, events, index) &&
+      !isDuplicateThinkingEvent(event, events, index) &&
+      !isDuplicateSearchEvent(event, events, index),
   )
   const items = orderThinkingItems(
     visibleEvents
@@ -876,6 +974,7 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
     return {
       id: event.id,
       kind: 'model',
+      event,
       text: thinkingText,
       detail: modelLabel(input, asRecord(event.output)),
       details: thinkingDetailsForEvent(event, toolName, argumentsValue),
@@ -893,16 +992,108 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
 }
 
 function isVisibleThinkingEvent(event: ToolTraceEvent): boolean {
+  if (event.toolName === 'open_code_link') {
+    return false
+  }
   if (event.type === 'llm_response' || event.type === 'model_message') {
     return Boolean(modelThinkingContent(asRecord(event.input), asRecord(event.output), event))
   }
   if (event.type === 'llm_request' || event.type === 'system_event') {
-    return true
+    return false
   }
   if (event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'error') {
     return true
   }
   return false
+}
+
+function isDuplicateThinkingEvent(
+  event: ToolTraceEvent,
+  events: ToolTraceEvent[],
+  index: number,
+): boolean {
+  if (event.type !== 'llm_response' && event.type !== 'model_message') {
+    return false
+  }
+  const text = normalizedThinkingText(event)
+  if (!text) {
+    return false
+  }
+  return events.slice(0, index).some((earlier) => {
+    if (earlier.type !== 'llm_response' && earlier.type !== 'model_message') {
+      return false
+    }
+    return normalizedThinkingText(earlier) === text
+  })
+}
+
+function isDuplicateSearchEvent(
+  event: ToolTraceEvent,
+  events: ToolTraceEvent[],
+  index: number,
+): boolean {
+  const term = normalizedSearchTerm(event)
+  if (!term) {
+    return false
+  }
+  const toolName = event.toolName ?? ''
+  if (isFileSearchToolName(toolName)) {
+    const laterContentSearch = events.slice(index + 1).some((later) => {
+      return isContentSearchToolName(later.toolName ?? '') && normalizedSearchTerm(later) === term
+    })
+    if (laterContentSearch) {
+      return true
+    }
+  }
+  return events.slice(0, index).some((earlier) => {
+    const earlierTerm = normalizedSearchTerm(earlier)
+    if (!earlierTerm || earlierTerm !== term) {
+      return false
+    }
+    if (isContentSearchToolName(toolName)) {
+      return isContentSearchToolName(earlier.toolName ?? '')
+    }
+    return true
+  })
+}
+
+function normalizedThinkingText(event: ToolTraceEvent): string {
+  return modelThinkingContent(asRecord(event.input), asRecord(event.output), event)
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function normalizedSearchTerm(event: ToolTraceEvent): string {
+  if (event.type !== 'tool_result' && event.type !== 'error') {
+    return ''
+  }
+  if (!isSearchToolName(event.toolName ?? '')) {
+    return ''
+  }
+  const argumentsValue = asRecord(asRecord(event.input).arguments)
+  return firstRawText([argumentsValue.query, argumentsValue.pattern])
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+}
+
+function isSearchToolName(toolName: string): boolean {
+  return isFileSearchToolName(toolName) || isContentSearchToolName(toolName)
+}
+
+function isFileSearchToolName(toolName: string): boolean {
+  return (
+    toolName === 'search_file' ||
+    toolName === 'workspace/search_file'
+  )
+}
+
+function isContentSearchToolName(toolName: string): boolean {
+  return (
+    toolName === 'search_content' ||
+    toolName === 'workspace/search' ||
+    toolName === 'workspace/search_content'
+  )
 }
 
 function isSupersededToolCall(
@@ -933,6 +1124,7 @@ function baseThinkingItem(
   return {
     id: event.id,
     kind: thinkingKind(event, toolName),
+    event,
     text: defaultThinkingText(event, toolName),
     detail,
     details: thinkingDetailsForEvent(event, toolName, asRecord(asRecord(event.input).arguments)),
@@ -1398,6 +1590,17 @@ function compactJson(value: unknown, maxLength: number): string {
   }
 }
 
+function prettyTraceValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return ''
+  }
+  try {
+    return maskSensitiveText(JSON.stringify(value, null, 2))
+  } catch {
+    return maskSensitiveText(String(value))
+  }
+}
+
 function stableJson(value: unknown): string {
   try {
     return JSON.stringify(value)
@@ -1481,9 +1684,6 @@ function formatWorkedFor(
 }
 
 function hasTerminalTraceEvent(events: ToolTraceEvent[]): boolean {
-  if (events.some((event) => event.status === 'failed' || event.type === 'error')) {
-    return true
-  }
   if (events.some((event) => event.type === 'final_response')) {
     return true
   }

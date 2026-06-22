@@ -154,6 +154,7 @@ interface JsonTreeProps {
   defaultExpandAll?: boolean
   defaultCollapsedKeys?: string[]
   allowLineWrapToggle?: boolean
+  quoteStrings?: boolean
 }
 
 export function JsonTree({
@@ -161,6 +162,7 @@ export function JsonTree({
   defaultExpandAll = false,
   defaultCollapsedKeys = [],
   allowLineWrapToggle = true,
+  quoteStrings = true,
 }: JsonTreeProps) {
   const [expansionCommand, setExpansionCommand] = useState<JsonTreeExpansionCommand>({
     open: null,
@@ -222,6 +224,7 @@ export function JsonTree({
         expansionCommand={expansionCommand}
         defaultExpandAll={defaultExpandAll}
         defaultCollapsedKeys={defaultCollapsedKeys}
+        quoteStrings={quoteStrings}
       />
     </div>
   )
@@ -239,6 +242,7 @@ function JsonNode({
   expansionCommand,
   defaultExpandAll,
   defaultCollapsedKeys,
+  quoteStrings,
 }: {
   label?: string
   value: unknown
@@ -246,6 +250,7 @@ function JsonNode({
   expansionCommand: JsonTreeExpansionCommand
   defaultExpandAll: boolean
   defaultCollapsedKeys: string[]
+  quoteStrings: boolean
 }) {
   const complex = isComplexJson(value)
   const [open, setOpen] = useState(
@@ -264,7 +269,7 @@ function JsonNode({
     return (
       <div className="trace-json-node" style={jsonNodeStyle(depth)}>
         {label ? <span className="trace-json-key">{label}: </span> : null}
-        <JsonPrimitive value={value} />
+        <JsonPrimitive value={value} quoteStrings={quoteStrings} />
       </div>
     )
   }
@@ -303,6 +308,7 @@ function JsonNode({
               expansionCommand={expansionCommand}
               defaultExpandAll={defaultExpandAll}
               defaultCollapsedKeys={defaultCollapsedKeys}
+              quoteStrings={quoteStrings}
             />
           ))}
           <div className="trace-json-node trace-json-close" style={jsonNodeStyle(depth)}>
@@ -334,9 +340,9 @@ function normalizeJsonKey(value: string): string {
   return value.replace(/[\s_-]/g, '').toLowerCase()
 }
 
-function JsonPrimitive({ value }: { value: unknown }) {
+function JsonPrimitive({ value, quoteStrings }: { value: unknown; quoteStrings: boolean }) {
   if (typeof value === 'string') {
-    return <JsonString value={value} />
+    return <JsonString value={value} quoteStrings={quoteStrings} />
   }
   if (typeof value === 'number') {
     return <span className="trace-json-number">{String(value)}</span>
@@ -350,10 +356,23 @@ function JsonPrimitive({ value }: { value: unknown }) {
   return <span>{JSON.stringify(value)}</span>
 }
 
-function JsonString({ value }: { value: string }) {
-  const lines = value.split(/\r\n|\r|\n/)
+function JsonString({ value, quoteStrings }: { value: string; quoteStrings: boolean }) {
+  const displayValue = quoteStrings ? value : readableJsonString(value)
+  const lines = displayValue.split(/\r\n|\r|\n/)
+  if (!quoteStrings) {
+    return (
+      <span className="trace-json-string trace-json-string-readable">
+        {lines.map((line, index) => (
+          <span key={index}>
+            {index > 0 ? <br /> : null}
+            {line}
+          </span>
+        ))}
+      </span>
+    )
+  }
   if (lines.length === 1) {
-    return <span className="trace-json-string">{JSON.stringify(value)}</span>
+    return <span className="trace-json-string">{JSON.stringify(displayValue)}</span>
   }
 
   return (
@@ -368,6 +387,10 @@ function JsonString({ value }: { value: string }) {
       <span>"</span>
     </span>
   )
+}
+
+function readableJsonString(value: string): string {
+  return value.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\"/g, '"')
 }
 
 function escapeJsonStringContent(value: string): string {

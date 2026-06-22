@@ -1785,6 +1785,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "codeforge-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossbeam-channel",
+ "ignore",
+ "nucleo",
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "codeforge-tui"
 version = "0.1.0"
 dependencies = [
@@ -1793,6 +1808,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "codeforge-core",
  "codex-ansi-escape",
  "codex-app-server-client",
  "codex-app-server-protocol",

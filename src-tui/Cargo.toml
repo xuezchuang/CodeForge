@@ -19,6 +19,7 @@ anyhow = "1"
 base64 = "0.22.1"
 chrono = { version = "0.4.43", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+codeforge-core = { path = "../crates/codeforge-core" }
 codex-ansi-escape = { path = "../codex/codex-rs/ansi-escape" }
 codex-app-server-client = { path = "../codex/codex-rs/app-server-client" }
 codex-app-server-protocol = { path = "../codex/codex-rs/app-server-protocol" }

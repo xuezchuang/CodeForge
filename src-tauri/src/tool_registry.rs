@@ -77,7 +77,6 @@ pub fn tool_definitions() -> Vec<Value> {
     let mut tools = workspace_tool_definitions();
     tools.extend([
         list_dir_definition(),
-        search_file_definition(),
         get_file_context_definition(),
         vs_current_solution_definition(),
         vs_current_document_definition(),
@@ -116,6 +115,7 @@ pub fn cli_tool_definitions(
 fn workspace_tool_definitions() -> Vec<Value> {
     vec![
         read_file_definition(),
+        search_file_definition(),
         search_content_definition(),
         edit_file_definition(),
         write_file_definition(),
@@ -288,7 +288,7 @@ fn search_file_definition() -> Value {
         "type": "function",
         "function": {
             "name": SEARCH_FILE_TOOL_NAME,
-            "description": "Search for files by fuzzy filename or path inside the workspace. Results are ranked by exact filename, filename contains, fuzzy filename, then path matches.",
+            "description": "Codex-style fuzzy search for file and directory paths inside the workspace. Use this to locate filenames or paths, not to search file contents.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -754,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_include_workspace_search_tools() {
+    fn tool_definitions_expose_codex_style_workspace_tools() {
         let names = tool_definitions()
             .into_iter()
             .filter_map(|tool| {

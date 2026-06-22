@@ -561,13 +561,6 @@ function TraceOverviewView({
     <div className="trace-chain-scroll">
       <TraceRoundSummary round={round} />
       <TraceSection
-        title="本次 Response 计划调用工具"
-        count={round.toolCalls.length}
-        hint="这些工具将在当前 Response 中按顺序调用"
-      >
-        <TraceToolCallGrid toolCalls={round.toolCalls} onOpenToolDetail={onOpenToolDetail} />
-      </TraceSection>
-      <TraceSection
         title="Tool 执行结果"
         count={round.toolResults.length}
         hint="以下为当前回合工具执行结果，已作为后续上下文使用"
@@ -929,6 +922,7 @@ function TraceToolDetailDialog({
                   value={maskSecrets(detail.toolCall.argumentsValue)}
                   defaultExpandAll
                   allowLineWrapToggle={false}
+                  quoteStrings={false}
                 />
               </TraceToolDetailBlock>
             </>
@@ -947,20 +941,35 @@ function TraceToolDetailDialog({
                   value={maskSecrets(detail.toolResult.argumentsValue)}
                   defaultExpandAll
                   allowLineWrapToggle={false}
+                  quoteStrings={false}
                 />
               </TraceToolDetailBlock>
               <TraceToolDetailBlock title="输出">
-                <JsonTree
-                  value={maskSecrets(toolResultDisplayOutput(detail.toolResult))}
-                  defaultExpandAll
-                  allowLineWrapToggle={false}
-                />
+                <TraceToolResultPreview result={detail.toolResult} />
               </TraceToolDetailBlock>
             </>
           )}
         </div>
       </section>
     </div>
+  )
+}
+
+function TraceToolResultPreview({ result }: { result: TraceToolResult }) {
+  const output = toolResultDisplayOutput(result)
+  const readableText = typeof output === 'string' ? readableToolText(output) : ''
+
+  if (readableText) {
+    return <pre className="trace-tool-readable-output">{readableText}</pre>
+  }
+
+  return (
+    <JsonTree
+      value={maskSecrets(output)}
+      defaultExpandAll
+      allowLineWrapToggle={false}
+      quoteStrings={false}
+    />
   )
 }
 
@@ -1439,12 +1448,20 @@ function readableToolOutput(value: unknown): string {
 function toolResultDisplayOutput(result: TraceToolResult): unknown {
   const rawOutput = asRecord(result.rawOutput)
   if (Object.prototype.hasOwnProperty.call(rawOutput, 'output')) {
-    return parseJsonMaybe(rawOutput.output)
+    return parseJsonMaybeDeep(rawOutput.output)
   }
   if (result.outputSummary) {
-    return parseJsonMaybe(result.outputSummary)
+    return parseJsonMaybeDeep(result.outputSummary)
   }
-  return result.rawOutput
+  return parseJsonMaybeDeep(result.rawOutput)
+}
+
+function readableToolText(value: unknown): string {
+  if (typeof value === 'string') {
+    return normalizeReadableText(value)
+  }
+  const record = asRecord(value)
+  return firstText([record.message, record.summary, record.error])
 }
 
 function roundSearchText(round: TraceRound): string {
@@ -1577,6 +1594,21 @@ function parseJsonMaybe(value: unknown): unknown {
   } catch {
     return value
   }
+}
+
+function parseJsonMaybeDeep(value: unknown): unknown {
+  let current = value
+  for (let index = 0; index < 3; index += 1) {
+    if (typeof current !== 'string') {
+      return current
+    }
+    const parsed = parseJsonMaybe(current)
+    if (parsed === current) {
+      return normalizeReadableText(current)
+    }
+    current = parsed
+  }
+  return current
 }
 
 function compactJson(value: unknown, maxLength: number): string {

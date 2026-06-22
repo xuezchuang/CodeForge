@@ -10,11 +10,11 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
+codeforge-core = { path = "../crates/codeforge-core" }
 crossterm = "0.28"
 ratatui = "0.29"
 dirs = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

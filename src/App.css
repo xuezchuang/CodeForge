@@ -1453,6 +1453,10 @@ button:focus-visible {
   gap: 1px;
 }
 
+.running-thinking-line > span:first-child {
+  animation: thinking-word-pulse 1.2s infinite ease-in-out;
+}
+
 .running-thinking-steps {
   display: grid;
   gap: 7px;
@@ -1618,6 +1622,28 @@ button:focus-visible {
   line-height: 1.45;
 }
 
+button.thinking-item {
+  width: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.thinking-item.clickable:hover .thinking-item-main span,
+button.thinking-item.clickable:focus-visible .thinking-item-main span {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+button.thinking-item:focus-visible {
+  outline: 2px solid #5aa7ff;
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
 .thinking-item svg {
   flex: 0 0 auto;
   color: #667085;
@@ -1689,6 +1715,131 @@ button:focus-visible {
 .thinking-more {
   color: #667085;
   font-size: 12px;
+}
+
+.tool-trace-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(8 10 12 / 62%);
+}
+
+.tool-trace-modal {
+  width: min(820px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #20242c;
+  box-shadow: 0 22px 70px rgb(15 23 42 / 30%);
+}
+
+.tool-trace-modal-header {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border-bottom: 1px solid #e4e7ec;
+  padding: 12px 14px;
+}
+
+.tool-trace-modal-header div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.tool-trace-modal-header span {
+  color: #667085;
+  font-size: 12px;
+}
+
+.tool-trace-modal-header strong {
+  overflow-wrap: anywhere;
+  font-size: 15px;
+}
+
+.tool-trace-close {
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: #667085;
+  cursor: pointer;
+}
+
+.tool-trace-close:hover {
+  background: #f1f5f9;
+  color: #20242c;
+}
+
+.tool-trace-modal-body {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.tool-trace-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.tool-trace-meta div {
+  border: 1px solid #e4e7ec;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #f8fafc;
+}
+
+.tool-trace-meta dt {
+  color: #667085;
+  font-size: 11px;
+}
+
+.tool-trace-meta dd {
+  margin: 2px 0 0;
+  color: #20242c;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.tool-trace-section {
+  display: grid;
+  gap: 6px;
+}
+
+.tool-trace-section h4 {
+  margin: 0;
+  color: #344054;
+  font-size: 12px;
+}
+
+.tool-trace-section pre {
+  max-height: 280px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid #d7dde7;
+  border-radius: 8px;
+  padding: 10px;
+  background: #f7f9fc;
+  color: #18202a;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
 }
 
 .message-actions {
@@ -2039,6 +2190,17 @@ button:focus-visible {
     opacity: 0.28;
   }
   40% {
+    opacity: 1;
+  }
+}
+
+@keyframes thinking-word-pulse {
+  0%,
+  100% {
+    opacity: 0.52;
+  }
+
+  45% {
     opacity: 1;
   }
 }
@@ -3221,10 +3383,17 @@ pre {
   width: 100%;
   justify-self: stretch;
   box-sizing: border-box;
-  padding: 14px 44px 240px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 14px 44px 136px;
   gap: 28px;
   scrollbar-color: #4c5558 transparent;
   scrollbar-width: thin;
+}
+
+.app-root.codex-style .chat-timeline > .chat-message:first-child {
+  margin-top: auto;
 }
 
 .app-root.codex-style .chat-timeline::-webkit-scrollbar {
@@ -3430,6 +3599,48 @@ pre {
 .app-root.codex-style .thinking-item.failed .thinking-item-main span,
 .app-root.codex-style .thinking-item.failed svg {
   color: #ff9aa4;
+}
+
+.app-root.codex-style .tool-trace-modal-backdrop {
+  background: rgb(0 0 0 / 66%);
+}
+
+.app-root.codex-style .tool-trace-modal {
+  border-color: #30383a;
+  background: #111414;
+  color: #e7ecef;
+  box-shadow: 0 22px 70px rgb(0 0 0 / 46%);
+}
+
+.app-root.codex-style .tool-trace-modal-header {
+  border-bottom-color: #2a3032;
+}
+
+.app-root.codex-style .tool-trace-modal-header span,
+.app-root.codex-style .tool-trace-meta dt,
+.app-root.codex-style .tool-trace-section h4 {
+  color: #8d979b;
+}
+
+.app-root.codex-style .tool-trace-modal-header strong,
+.app-root.codex-style .tool-trace-meta dd {
+  color: #f1f4f5;
+}
+
+.app-root.codex-style .tool-trace-close {
+  color: #9ca6aa;
+}
+
+.app-root.codex-style .tool-trace-close:hover {
+  background: #202526;
+  color: #f1f4f5;
+}
+
+.app-root.codex-style .tool-trace-meta div,
+.app-root.codex-style .tool-trace-section pre {
+  border-color: #30383a;
+  background: #0d1011;
+  color: #dce3e5;
 }
 
 .app-root.codex-style .message-actions {
@@ -5518,6 +5729,25 @@ pre {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.trace-json-string-readable {
+  color: #7fffb3;
+}
+
+.trace-tool-readable-output {
+  min-width: 0;
+  max-height: 520px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid #1f2f3d;
+  border-radius: 7px;
+  background: #050a0f;
+  color: #d8e4ec;
+  padding: 12px;
+  font: 12px/1.55 ui-monospace, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .trace-card-empty {

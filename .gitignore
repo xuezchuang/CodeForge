@@ -63,3 +63,7 @@ temp
 
 # TUI project generated build artifacts
 src-tui/target
+
+# Internal library crate generated artifacts
+crates/*/target
+crates/codeforge-core/Cargo.lock

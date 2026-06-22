@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::agent::stream::StreamingChatCompletionAccumulator;
 use crate::codex_cli_runner::{self, CODEX_CLI_PROVIDER_TYPE, CODEX_CLI_TOOL_NAME};
 use crate::goal_state::GoalState;
 use crate::project_registry::ProjectSession;
@@ -133,14 +134,6 @@ struct ChatCompletionResult {
     request_body: Value,
     response_body: Value,
     token_usage: TokenUsage,
-}
-
-#[derive(Debug, Default)]
-struct StreamingToolCall {
-    id: Option<String>,
-    call_type: Option<String>,
-    name: Option<String>,
-    arguments: String,
 }
 
 struct StreamingTraceSink<'a> {
@@ -1822,194 +1815,6 @@ fn maybe_emit_streaming_thinking(
     (sink.on_trace)(&event);
     *emitted_reasoning_chars = reasoning_chars;
     *last_emit = Some(Instant::now());
-}
-
-#[derive(Default)]
-struct StreamingChatCompletionAccumulator {
-    saw_data: bool,
-    role: String,
-    content: String,
-    reasoning_content: String,
-    finish_reason: Option<String>,
-    usage: Option<Value>,
-    tool_calls: Vec<StreamingToolCall>,
-    error_message: Option<String>,
-}
-
-impl StreamingChatCompletionAccumulator {
-    fn accept_line(&mut self, line: &str) -> Result<(), String> {
-        let line = line.trim();
-        if !line.starts_with("data:") {
-            return Ok(());
-        }
-        let data = line.trim_start_matches("data:").trim();
-        if data.is_empty() || data == "[DONE]" {
-            return Ok(());
-        }
-
-        self.saw_data = true;
-        let chunk = serde_json::from_str::<Value>(data)
-            .map_err(|error| format!("Streaming chunk parse failed: {error}; chunk={data}"))?;
-        self.accept_chunk(&chunk);
-        Ok(())
-    }
-
-    fn accept_chunk(&mut self, chunk: &Value) {
-        self.saw_data = true;
-        if let Some(error) = chunk.get("error") {
-            self.error_message = Some(stream_error_message(error));
-            return;
-        }
-        if chunk.get("usage").is_some_and(|value| !value.is_null()) {
-            self.usage = chunk.get("usage").cloned();
-        }
-
-        let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-            return;
-        };
-        for choice in choices {
-            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                self.finish_reason = Some(reason.to_string());
-            }
-            let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
-                continue;
-            };
-            if let Some(delta_role) = delta.get("role").and_then(Value::as_str) {
-                self.role = delta_role.to_string();
-            }
-            if let Some(delta_content) = delta.get("content").and_then(Value::as_str) {
-                self.content.push_str(delta_content);
-            }
-            if let Some(delta_reasoning) = delta
-                .get("reasoning_content")
-                .or_else(|| delta.get("reasoningContent"))
-                .or_else(|| delta.get("reasoning"))
-                .and_then(Value::as_str)
-            {
-                self.reasoning_content.push_str(delta_reasoning);
-            }
-            if let Some(delta_tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                for delta_tool_call in delta_tool_calls {
-                    merge_streaming_tool_call(&mut self.tool_calls, delta_tool_call);
-                }
-            }
-        }
-    }
-
-    fn content(&self) -> &str {
-        &self.content
-    }
-
-    fn reasoning_content(&self) -> &str {
-        &self.reasoning_content
-    }
-
-    fn into_response(self) -> Result<Value, String> {
-        if let Some(error_message) = self.error_message {
-            return Err(format!("Model stream failed: {error_message}"));
-        }
-        if !self.saw_data {
-            return Err("Streaming response had no data chunks".to_string());
-        }
-
-        let tool_calls = streaming_tool_calls_json(&self.tool_calls);
-        let mut message = if tool_calls.is_empty() {
-            json!({
-                "role": if self.role.is_empty() { "assistant" } else { self.role.as_str() },
-                "content": self.content,
-            })
-        } else {
-            json!({
-                "role": if self.role.is_empty() { "assistant" } else { self.role.as_str() },
-                "content": if self.content.is_empty() { Value::Null } else { Value::String(self.content) },
-                "tool_calls": tool_calls,
-            })
-        };
-        if !self.reasoning_content.is_empty() {
-            message["reasoning_content"] = Value::String(self.reasoning_content);
-        }
-
-        let mut response_body = json!({
-            "choices": [{
-                "message": message,
-                "finish_reason": self.finish_reason.unwrap_or_else(|| "stop".to_string()),
-            }],
-        });
-        if let Some(usage) = self.usage {
-            response_body["usage"] = usage;
-        }
-        Ok(response_body)
-    }
-}
-
-fn stream_error_message(error: &Value) -> String {
-    error
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| error.to_string())
-}
-
-fn merge_streaming_tool_call(tool_calls: &mut Vec<StreamingToolCall>, delta_tool_call: &Value) {
-    let index = delta_tool_call
-        .get("index")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
-    while tool_calls.len() <= index {
-        tool_calls.push(StreamingToolCall::default());
-    }
-
-    let tool_call = &mut tool_calls[index];
-    if let Some(id) = delta_tool_call.get("id").and_then(Value::as_str) {
-        tool_call.id = Some(id.to_string());
-    }
-    if let Some(call_type) = delta_tool_call.get("type").and_then(Value::as_str) {
-        tool_call.call_type = Some(call_type.to_string());
-    }
-    let Some(function) = delta_tool_call.get("function").and_then(Value::as_object) else {
-        if let Some(name) = delta_tool_call.get("name").and_then(Value::as_str) {
-            tool_call.name = Some(name.to_string());
-        }
-        if let Some(arguments) = delta_tool_call.get("arguments").and_then(Value::as_str) {
-            tool_call.arguments.push_str(arguments);
-        }
-        return;
-    };
-    if let Some(name) = function.get("name").and_then(Value::as_str) {
-        tool_call.name = Some(name.to_string());
-    }
-    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-        tool_call.arguments.push_str(arguments);
-    }
-}
-
-fn streaming_tool_calls_json(tool_calls: &[StreamingToolCall]) -> Vec<Value> {
-    tool_calls
-        .iter()
-        .enumerate()
-        .filter(|(_, tool_call)| {
-            tool_call
-                .name
-                .as_deref()
-                .is_some_and(|name| !name.is_empty())
-        })
-        .map(|(index, tool_call)| {
-            json!({
-                "id": tool_call
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("call_{}", index + 1)),
-                "type": tool_call
-                    .call_type
-                    .clone()
-                    .unwrap_or_else(|| "function".to_string()),
-                "function": {
-                    "name": tool_call.name.clone().unwrap_or_default(),
-                    "arguments": tool_call.arguments,
-                },
-            })
-        })
-        .collect()
 }
 
 fn model_http_client() -> Result<reqwest::Client, String> {

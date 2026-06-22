@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod agent_runner;
 pub mod app_state;
 pub mod code_link;

@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import CodeLink from './CodeLink'
 
 const codeLinkPattern =
-  /((?:[A-Za-z]:[\\/](?:[^<>:"|?*\r\n]+[\\/])*[^<>:"|?*\r\n]+\.(?:c|cc|cpp|cxx|h|hh|hpp|cs|ts|tsx|rs|ini|uplugin|uproject))|(?:(?:[\w()+@.-]+[\\/])+[\w()+@.-]+\.(?:c|cc|cpp|cxx|h|hh|hpp|cs|ts|tsx|rs|ini|uplugin|uproject))):\d+(?::\d+)?/gi
+  /((?:[A-Za-z]:[\\/](?:[^<>:"|?*\r\n]+[\\/])*[^<>:"|?*\r\n]+\.(?:c|cc|cpp|cxx|h|hh|hpp|cs|ts|tsx|rs|ini|uplugin|uproject))|(?:[^\s<>:"|?*\r\n\\/]+[\\/](?:[^\s<>:"|?*\r\n\\/][^<>:"|?*\r\n\\/]*[\\/])*[^\s<>:"|?*\r\n\\/][^<>:"|?*\r\n\\/]*\.(?:c|cc|cpp|cxx|h|hh|hpp|cs|ts|tsx|rs|ini|uplugin|uproject))):\d+(?::\d+)?/gi
 const markdownLinkLikePattern = /\[([^\]\r\n]+)\](?:\(([^)\r\n]+)\))?/g
 
 export function renderTextWithCodeLinks(

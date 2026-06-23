@@ -14,6 +14,7 @@ pub mod tool_trace;
 pub mod vs_bridge_client;
 pub mod vs_bridge_service;
 pub mod vs_registry;
+pub mod window_activation;
 pub mod workspace_tools;
 
 pub mod goal_state;

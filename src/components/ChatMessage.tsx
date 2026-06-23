@@ -103,7 +103,7 @@ function ChatMessage({
         {!isUser && thinkingSummary && !isRunningAssistant ? (
           <ThinkingPanel
             summary={thinkingSummary}
-            defaultOpen={false}
+            defaultOpen={displayContent.startsWith(THINKING_PREFIX)}
             onToolTraceOpen={setActiveToolTrace}
           />
         ) : null}
@@ -356,6 +356,7 @@ interface MarkdownCodeBlockProps {
 }
 
 const THINKING_PREFIX = 'Thinking...\n\n'
+const THINKING_RUNNING_TEXT = 'Thinking...'
 
 function useThinkingClock(enabled: boolean): number {
   const [nowMs, setNowMs] = useState(() => Date.now())
@@ -389,26 +390,15 @@ function RunningAssistantContent({
   onToolTraceOpen,
 }: RunningAssistantContentProps) {
   const detail = text.startsWith(THINKING_PREFIX) ? text.slice(THINKING_PREFIX.length) : text
-  const latestItemId = thinkingSummary?.items.at(-1)?.id ?? null
 
   return (
     <>
       {thinkingSummary && thinkingSummary.items.length > 0 ? (
-        <div className="running-thinking-steps">
-          {thinkingSummary.items.map((item) => (
-            <ThinkingItemRow
-              key={item.id}
-              item={item}
-              autoOpen={item.id === latestItemId}
-              onToolTraceOpen={onToolTraceOpen}
-            />
-          ))}
-          {thinkingSummary.omitted > 0 ? (
-            <div className="thinking-more">
-              {thinkingSummary.omitted} more trace steps are available in Trace.
-            </div>
-          ) : null}
-        </div>
+        <ThinkingPanel
+          summary={thinkingSummary}
+          defaultOpen
+          onToolTraceOpen={onToolTraceOpen}
+        />
       ) : detail.trim().length > 0 ? (
         <MarkdownMessage
           text={detail}
@@ -419,13 +409,17 @@ function RunningAssistantContent({
           onTraceChanged={onTraceChanged}
         />
       ) : null}
-      <p className="markdown-paragraph running-thinking-line">
-        <span>Thinking</span>
-        <span className="thinking-dots" aria-hidden="true">
-          <span>.</span>
-          <span>.</span>
-          <span>.</span>
-        </span>
+      <p className="markdown-paragraph running-thinking-line" aria-label={THINKING_RUNNING_TEXT}>
+        {THINKING_RUNNING_TEXT.split('').map((character, index) => (
+          <span
+            key={`${character}-${index}`}
+            className="thinking-character"
+            style={{ animationDelay: `${index * 0.075}s` }}
+            aria-hidden="true"
+          >
+            {character}
+          </span>
+        ))}
       </p>
     </>
   )
@@ -931,12 +925,9 @@ function createThinkingSummary(
       !isDuplicateThinkingEvent(event, events, index) &&
       !isDuplicateSearchEvent(event, events, index),
   )
-  const items = orderThinkingItems(
-    visibleEvents
+  const items = visibleEvents
     .map(createThinkingItem)
-      .filter((item): item is ThinkingItem => item !== null),
-    options.running,
-  )
+    .filter((item): item is ThinkingItem => item !== null)
 
   if (items.length === 0) {
     return null
@@ -950,15 +941,6 @@ function createThinkingSummary(
     items: items.slice(0, THINKING_MAX_VISIBLE_ITEMS),
     omitted: Math.max(0, items.length - THINKING_MAX_VISIBLE_ITEMS),
   }
-}
-
-function orderThinkingItems(items: ThinkingItem[], running: boolean): ThinkingItem[] {
-  if (!running) {
-    return items
-  }
-  const modelThoughtItems = items.filter((item) => item.progressive)
-  const otherItems = items.filter((item) => !item.progressive)
-  return [...otherItems, ...modelThoughtItems]
 }
 
 function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
@@ -992,6 +974,9 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
 }
 
 function isVisibleThinkingEvent(event: ToolTraceEvent): boolean {
+  if (event.type === 'user_message') {
+    return false
+  }
   if (event.toolName === 'open_code_link') {
     return false
   }
@@ -1138,6 +1123,9 @@ function thinkingKind(
   event: ToolTraceEvent,
   toolName: string,
 ): ThinkingItem['kind'] {
+  if (event.type === 'user_message') {
+    return 'message'
+  }
   if (event.type === 'error' || event.status === 'failed') {
     return 'error'
   }

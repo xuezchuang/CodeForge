@@ -43,6 +43,86 @@ pub async fn call_vs_list_project_files(
     call_vs_endpoint(endpoint, "listProjectFiles", Value::Object(payload)).await
 }
 
+pub async fn call_vs_search_file(
+    endpoint: Option<&str>,
+    workspace_root: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let mut payload = Map::new();
+    payload.insert(
+        "workspaceRoot".to_string(),
+        Value::String(workspace_root.to_string()),
+    );
+    if let Some(pattern) = string_argument(arguments, "pattern", "pattern") {
+        payload.insert("pattern".to_string(), Value::String(pattern));
+    }
+    if let Some(root) = string_argument(arguments, "root", "root") {
+        payload.insert("root".to_string(), Value::String(root));
+    }
+    if let Some(max_results) = integer_argument(arguments, "maxResults", "max_results") {
+        payload.insert("maxResults".to_string(), json!(max_results));
+    }
+    if let Some(project_name) = string_argument(arguments, "projectName", "project_name") {
+        payload.insert("projectName".to_string(), Value::String(project_name));
+    }
+    if let Some(project_unique_name) =
+        string_argument(arguments, "projectUniqueName", "project_unique_name")
+    {
+        payload.insert(
+            "projectUniqueName".to_string(),
+            Value::String(project_unique_name),
+        );
+    }
+
+    call_vs_endpoint(endpoint, "searchFiles", Value::Object(payload)).await
+}
+
+pub async fn call_vs_search_content(
+    endpoint: Option<&str>,
+    workspace_root: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let mut payload = Map::new();
+    payload.insert(
+        "workspaceRoot".to_string(),
+        Value::String(workspace_root.to_string()),
+    );
+    if let Some(query) = string_argument(arguments, "query", "query") {
+        payload.insert("query".to_string(), Value::String(query));
+    }
+    if let Some(root) = string_argument(arguments, "root", "root") {
+        payload.insert("root".to_string(), Value::String(root));
+    }
+    if let Some(file_glob) = string_argument(arguments, "fileGlob", "file_glob") {
+        payload.insert("fileGlob".to_string(), Value::String(file_glob));
+    }
+    if let Some(max_results) = integer_argument(arguments, "maxResults", "max_results") {
+        payload.insert("maxResults".to_string(), json!(max_results));
+    }
+    if let Some(context_lines) = integer_argument(arguments, "contextLines", "context_lines") {
+        payload.insert("contextLines".to_string(), json!(context_lines));
+    }
+    if let Some(case_sensitive) = bool_argument(arguments, "caseSensitive", "case_sensitive") {
+        payload.insert("caseSensitive".to_string(), json!(case_sensitive));
+    }
+    if let Some(regex) = bool_argument(arguments, "regex", "regex") {
+        payload.insert("regex".to_string(), json!(regex));
+    }
+    if let Some(project_name) = string_argument(arguments, "projectName", "project_name") {
+        payload.insert("projectName".to_string(), Value::String(project_name));
+    }
+    if let Some(project_unique_name) =
+        string_argument(arguments, "projectUniqueName", "project_unique_name")
+    {
+        payload.insert(
+            "projectUniqueName".to_string(),
+            Value::String(project_unique_name),
+        );
+    }
+
+    call_vs_endpoint(endpoint, "searchContent", Value::Object(payload)).await
+}
+
 pub async fn call_vs_get_error_list(endpoint: Option<&str>) -> Result<Value, String> {
     call_vs_endpoint(endpoint, "getErrorList", json!({})).await
 }
@@ -160,4 +240,11 @@ fn integer_argument(arguments: &Value, camel_key: &str, snake_key: &str) -> Opti
         .get(camel_key)
         .or_else(|| arguments.get(snake_key))
         .and_then(Value::as_u64)
+}
+
+fn bool_argument(arguments: &Value, camel_key: &str, snake_key: &str) -> Option<bool> {
+    arguments
+        .get(camel_key)
+        .or_else(|| arguments.get(snake_key))
+        .and_then(Value::as_bool)
 }

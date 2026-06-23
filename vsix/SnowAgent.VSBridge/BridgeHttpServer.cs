@@ -91,6 +91,14 @@ namespace SnowAgent.VSBridge
                 {
                     response = await HandleListProjectFilesAsync(request.Body).ConfigureAwait(false);
                 }
+                else if (IsPost(requestLine, "/searchFiles"))
+                {
+                    response = await HandleSearchFilesAsync(request.Body).ConfigureAwait(false);
+                }
+                else if (IsPost(requestLine, "/searchContent"))
+                {
+                    response = await HandleSearchContentAsync(request.Body).ConfigureAwait(false);
+                }
                 else if (IsPost(requestLine, "/getErrorList"))
                 {
                     response = await package.GetErrorListAsync().ConfigureAwait(false);
@@ -209,6 +217,71 @@ namespace SnowAgent.VSBridge
                     Message = ex.Message,
                     ProjectName = null,
                     Files = new ProjectFileDto[0],
+                    Truncated = false,
+                };
+            }
+        }
+
+        private async Task<BridgeResponse> HandleSearchFilesAsync(string body)
+        {
+            try
+            {
+                var request = string.IsNullOrWhiteSpace(body)
+                    ? new SearchFilesRequest()
+                    : JsonUtil.Deserialize<SearchFilesRequest>(body);
+                return await package.SearchFilesAsync(request).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                return new SearchFilesResponse
+                {
+                    Ok = false,
+                    Message = ex.Message,
+                    Root = ".",
+                    Pattern = null,
+                    Matches = new SearchFileMatchDto[0],
+                    Paths = new string[0],
+                    Count = 0,
+                    TotalMatches = 0,
+                    Shown = 0,
+                    Complete = false,
+                    MaxResults = 0,
+                    ScannedFiles = 0,
+                    Truncated = false,
+                    Engine = "vsix-solution-file-search",
+                    Source = "vsix",
+                };
+            }
+        }
+
+        private async Task<BridgeResponse> HandleSearchContentAsync(string body)
+        {
+            try
+            {
+                var request = string.IsNullOrWhiteSpace(body)
+                    ? new SearchContentRequest()
+                    : JsonUtil.Deserialize<SearchContentRequest>(body);
+                return await package.SearchContentAsync(request).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                return new SearchContentResponse
+                {
+                    Ok = false,
+                    Message = ex.Message,
+                    Query = null,
+                    Root = ".",
+                    FileGlob = null,
+                    MaxResults = 0,
+                    ContextLines = 0,
+                    CaseSensitive = false,
+                    Regex = false,
+                    Engine = "vsix-solution-content-search",
+                    Source = "vsix",
+                    Matches = new SearchContentMatchDto[0],
+                    Count = 0,
+                    ScannedFiles = 0,
+                    Complete = false,
                     Truncated = false,
                 };
             }

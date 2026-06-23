@@ -1,10 +1,23 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::path_utils::normalize_display_path;
 use crate::project_registry::ProjectSession;
 use crate::tool_trace::ToolTraceEvent;
+
+const MAX_SUFFIX_SCAN_FILES: usize = 50_000;
+const IGNORED_SUFFIX_SCAN_DIRS: &[&str] = &[
+    ".git",
+    ".vs",
+    "bin",
+    "obj",
+    "build",
+    "out",
+    "node_modules",
+    ".cache",
+];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,13 +131,20 @@ fn split_numeric_suffix(value: &str) -> Option<(&str, u32)> {
 fn resolve_path(repo_root: &str, path_part: &str) -> Result<String, String> {
     let normalized = path_part.trim().replace('/', "\\");
     let path = Path::new(&normalized);
+    let repo_root_path = Path::new(repo_root);
     let candidate = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        Path::new(repo_root).join(path)
+        repo_root_path.join(path)
     };
 
     if !candidate.exists() {
+        if !path.is_absolute() {
+            if let Some(suffix_match) = resolve_by_unique_suffix(repo_root_path, path_part)? {
+                return Ok(suffix_match);
+            }
+        }
+
         return Err(format!(
             "File does not exist: {}",
             normalize_display_path(&candidate.to_string_lossy())
@@ -138,6 +158,98 @@ fn resolve_path(repo_root: &str, path_part: &str) -> Result<String, String> {
         )
     })?;
     Ok(normalize_display_path(&canonical.to_string_lossy()))
+}
+
+fn resolve_by_unique_suffix(repo_root: &Path, path_part: &str) -> Result<Option<String>, String> {
+    let repo_root = match repo_root.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let suffix = normalize_display_path(path_part)
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase();
+    if suffix.is_empty() || !suffix.contains('/') {
+        return Ok(None);
+    }
+
+    let mut matches = Vec::new();
+    let mut scanned = 0usize;
+    find_suffix_matches(&repo_root, &repo_root, &suffix, &mut matches, &mut scanned)?;
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => {
+            let canonical = matches[0].canonicalize().map_err(|error| {
+                format!(
+                    "Code link path canonicalization failed {}: {error}",
+                    matches[0].display()
+                )
+            })?;
+            Ok(Some(normalize_display_path(&canonical.to_string_lossy())))
+        }
+        _ => Err(format!(
+            "Code link path is ambiguous: {} matched {} files; include more path segments",
+            normalize_display_path(path_part),
+            matches.len()
+        )),
+    }
+}
+
+fn find_suffix_matches(
+    repo_root: &Path,
+    dir: &Path,
+    suffix: &str,
+    matches: &mut Vec<PathBuf>,
+    scanned: &mut usize,
+) -> Result<(), String> {
+    if *scanned >= MAX_SUFFIX_SCAN_FILES || matches.len() > 1 {
+        return Ok(());
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            if is_ignored_suffix_scan_dir(&path) {
+                continue;
+            }
+            find_suffix_matches(repo_root, &path, suffix, matches, scanned)?;
+            if *scanned >= MAX_SUFFIX_SCAN_FILES || matches.len() > 1 {
+                return Ok(());
+            }
+        } else if path.is_file() {
+            *scanned += 1;
+            let relative = path.strip_prefix(repo_root).unwrap_or(&path);
+            let relative = normalize_display_path(&relative.to_string_lossy())
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            if relative.ends_with(suffix) {
+                matches.push(path);
+                if matches.len() > 1 {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_ignored_suffix_scan_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            IGNORED_SUFFIX_SCAN_DIRS
+                .iter()
+                .any(|ignored| name.eq_ignore_ascii_case(ignored))
+        })
 }
 
 #[cfg(test)]
@@ -215,6 +327,42 @@ mod tests {
         let error = parse_code_link(&project, "Source/Game/Missing.cpp:1").unwrap_err();
 
         assert!(error.starts_with("File does not exist:"));
+    }
+
+    #[test]
+    fn resolves_unique_suffix_link_when_rendered_path_was_truncated() {
+        let root = create_temp_project();
+        let file = root
+            .join("src")
+            .join("core")
+            .join("wz_render_core")
+            .join("02 中文目录")
+            .join("part")
+            .join("wzFigureNavigatorWidget.cpp");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "int main() {}\n").unwrap();
+
+        let project = test_project(root.to_string_lossy().to_string());
+        let payload = parse_code_link(&project, "part/wzFigureNavigatorWidget.cpp:240").unwrap();
+
+        assert_eq!(payload.line, 240);
+        assert!(payload.path.ends_with("part\\wzFigureNavigatorWidget.cpp"));
+    }
+
+    #[test]
+    fn reports_ambiguous_suffix_link() {
+        let root = create_temp_project();
+        let first = root.join("src").join("a").join("part").join("Widget.cpp");
+        let second = root.join("src").join("b").join("part").join("Widget.cpp");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, "int a;\n").unwrap();
+        fs::write(&second, "int b;\n").unwrap();
+
+        let project = test_project(root.to_string_lossy().to_string());
+        let error = parse_code_link(&project, "part/Widget.cpp:10").unwrap_err();
+
+        assert!(error.contains("Code link path is ambiguous"));
     }
 
     fn create_temp_project() -> std::path::PathBuf {

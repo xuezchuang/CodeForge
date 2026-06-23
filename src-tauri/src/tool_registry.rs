@@ -188,8 +188,8 @@ async fn execute_tool_inner(
         CALCULATOR_ADD_TOOL_NAME => add(arguments),
         LIST_DIR_TOOL_NAME | WORKSPACE_LIST_DIR_TOOL_NAME => workspace_tools::list_dir(context.workspace_root, arguments),
         READ_FILE_TOOL_NAME | WORKSPACE_READ_FILE_TOOL_NAME => workspace_tools::read_file(context.workspace_root, arguments),
-        SEARCH_FILE_TOOL_NAME | WORKSPACE_SEARCH_FILE_TOOL_NAME => workspace_tools::search_file(context.workspace_root, arguments),
-        SEARCH_CONTENT_TOOL_NAME | WORKSPACE_SEARCH_CONTENT_TOOL_NAME | WORKSPACE_SEARCH_CONTENT_ALIAS_TOOL_NAME => workspace_tools::search_content(context.workspace_root, arguments),
+        SEARCH_FILE_TOOL_NAME | WORKSPACE_SEARCH_FILE_TOOL_NAME => execute_search_file(context, arguments).await,
+        SEARCH_CONTENT_TOOL_NAME | WORKSPACE_SEARCH_CONTENT_TOOL_NAME | WORKSPACE_SEARCH_CONTENT_ALIAS_TOOL_NAME => execute_search_content(context, arguments).await,
         EDIT_FILE_TOOL_NAME | WORKSPACE_EDIT_FILE_TOOL_NAME => workspace_tools::edit_file(context.workspace_root, arguments),
         WRITE_FILE_TOOL_NAME | WORKSPACE_WRITE_FILE_TOOL_NAME => workspace_tools::write_file(context.workspace_root, arguments),
         SHELL_COMMAND_TOOL_NAME | WORKSPACE_SHELL_COMMAND_TOOL_NAME => workspace_tools::shell_command(
@@ -211,6 +211,132 @@ async fn execute_tool_inner(
         GOAL_CLEAR_TOOL_NAME => goal_clear(context),
         _ => Err(format!("Unknown tool: {name}")),
     }
+}
+
+async fn execute_search_file(
+    context: &ToolExecutionContext<'_>,
+    arguments: &Value,
+) -> Result<Value, String> {
+    if bridge_endpoint_available(context.vs_bridge_endpoint) {
+        match vs_bridge_client::call_vs_search_file(
+            context.vs_bridge_endpoint,
+            context.workspace_root,
+            arguments,
+        )
+        .await
+        {
+            Ok(output) if bridge_output_ok(&output) => return Ok(output),
+            Ok(output) => {
+                let mut fallback = workspace_tools::search_file(context.workspace_root, arguments)?;
+                annotate_search_source(&mut fallback, "workspace_fallback");
+                annotate_bridge_fallback(&mut fallback, bridge_failure_summary(&output));
+                return Ok(fallback);
+            }
+            Err(error) => {
+                let mut fallback = workspace_tools::search_file(context.workspace_root, arguments)?;
+                annotate_search_source(&mut fallback, "workspace_fallback");
+                annotate_bridge_fallback(
+                    &mut fallback,
+                    json!({
+                        "ok": false,
+                        "status": "client_error",
+                        "message": error,
+                        "source": "vsix",
+                    }),
+                );
+                return Ok(fallback);
+            }
+        }
+    }
+
+    let mut output = workspace_tools::search_file(context.workspace_root, arguments)?;
+    annotate_search_source(&mut output, "workspace");
+    Ok(output)
+}
+
+async fn execute_search_content(
+    context: &ToolExecutionContext<'_>,
+    arguments: &Value,
+) -> Result<Value, String> {
+    if bridge_endpoint_available(context.vs_bridge_endpoint) {
+        match vs_bridge_client::call_vs_search_content(
+            context.vs_bridge_endpoint,
+            context.workspace_root,
+            arguments,
+        )
+        .await
+        {
+            Ok(output) if bridge_output_ok(&output) => return Ok(output),
+            Ok(output) => {
+                let mut fallback =
+                    workspace_tools::search_content(context.workspace_root, arguments)?;
+                annotate_search_source(&mut fallback, "workspace_fallback");
+                annotate_bridge_fallback(&mut fallback, bridge_failure_summary(&output));
+                return Ok(fallback);
+            }
+            Err(error) => {
+                let mut fallback =
+                    workspace_tools::search_content(context.workspace_root, arguments)?;
+                annotate_search_source(&mut fallback, "workspace_fallback");
+                annotate_bridge_fallback(
+                    &mut fallback,
+                    json!({
+                        "ok": false,
+                        "status": "client_error",
+                        "message": error,
+                        "source": "vsix",
+                    }),
+                );
+                return Ok(fallback);
+            }
+        }
+    }
+
+    let mut output = workspace_tools::search_content(context.workspace_root, arguments)?;
+    annotate_search_source(&mut output, "workspace");
+    Ok(output)
+}
+
+fn bridge_endpoint_available(endpoint: Option<&str>) -> bool {
+    endpoint
+        .map(str::trim)
+        .is_some_and(|endpoint| !endpoint.is_empty())
+}
+
+fn bridge_output_ok(output: &Value) -> bool {
+    output.get("ok").and_then(Value::as_bool) == Some(true)
+}
+
+fn annotate_search_source(output: &mut Value, source: &str) {
+    if let Some(object) = output.as_object_mut() {
+        object.insert("source".to_string(), json!(source));
+    }
+}
+
+fn annotate_bridge_fallback(output: &mut Value, bridge_summary: Value) {
+    if let Some(object) = output.as_object_mut() {
+        object.insert("vsFallback".to_string(), json!(true));
+        object.insert("vsBridge".to_string(), bridge_summary);
+    }
+}
+
+fn bridge_failure_summary(output: &Value) -> Value {
+    let mut summary = serde_json::Map::new();
+    for key in [
+        "ok",
+        "status",
+        "message",
+        "source",
+        "endpoint",
+        "route",
+        "httpStatus",
+    ] {
+        if let Some(value) = output.get(key) {
+            summary.insert(key.to_string(), value.clone());
+        }
+    }
+
+    Value::Object(summary)
 }
 
 /// calculator.add is a deliberately trivial demo tool kept to
@@ -288,7 +414,7 @@ fn search_file_definition() -> Value {
         "type": "function",
         "function": {
             "name": SEARCH_FILE_TOOL_NAME,
-            "description": "Codex-style fuzzy search for file and directory paths inside the workspace. Use this to locate filenames or paths, not to search file contents.",
+            "description": "Search for file paths. When Visual Studio Bridge is connected, searches the active Visual Studio solution first and falls back to workspace fuzzy search. Use this to locate filenames or paths, not to search file contents.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -317,7 +443,7 @@ fn search_content_definition() -> Value {
         "type": "function",
         "function": {
             "name": SEARCH_CONTENT_TOOL_NAME,
-            "description": "Search text content inside workspace files with bounded traversal. Returns structured matches with file, line, column, text, before, and after. Narrow root or file_glob for large repositories.",
+            "description": "Search text content. When Visual Studio Bridge is connected, searches active Visual Studio solution files first and falls back to workspace content search. Returns structured matches with file, line, column, text, before, and after. Narrow root or file_glob for large repositories.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -821,6 +947,9 @@ mod cli_runtime_tests {
     use super::*;
     use crate::tool_interface::ToolOutputStatus;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn workspace() -> std::path::PathBuf {
         let path =
@@ -838,6 +967,26 @@ mod cli_runtime_tests {
             cli_mode: true,
             goal: None,
         }
+    }
+
+    fn stub_bridge(response_body: &'static str) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+
+        (endpoint, handle)
     }
 
     #[test]
@@ -879,6 +1028,106 @@ mod cli_runtime_tests {
         assert_eq!(output["file"], json!("sample.txt"));
         assert_eq!(output["line"], json!(2));
         assert_eq!(output["lines"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn search_file_without_vs_bridge_uses_workspace_source() {
+        let root = workspace();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("sample.cpp"), "int main() {}\n").unwrap();
+        let result = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context(root.to_str().unwrap(), false),
+            SEARCH_FILE_TOOL_NAME,
+            &json!({ "pattern": "sample.cpp", "max_results": 10 }),
+        ));
+        assert_eq!(result.status, ToolOutputStatus::Ok);
+        let output = result.output.unwrap();
+        assert_eq!(output["source"], json!("workspace"));
+        assert_eq!(output["engine"], json!("codex-file-search"));
+        assert_eq!(output["paths"][0], json!("src/sample.cpp"));
+    }
+
+    #[test]
+    fn search_content_without_vs_bridge_uses_workspace_source() {
+        let root = workspace();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("sample.cpp"), "int target = 1;\n").unwrap();
+        let result = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context(root.to_str().unwrap(), false),
+            SEARCH_CONTENT_TOOL_NAME,
+            &json!({ "query": "target", "file_glob": "*.cpp", "max_results": 10 }),
+        ));
+        assert_eq!(result.status, ToolOutputStatus::Ok);
+        let output = result.output.unwrap();
+        assert_eq!(output["source"], json!("workspace"));
+        assert_eq!(output["matches"][0]["file"], json!("src/sample.cpp"));
+    }
+
+    #[test]
+    fn search_file_prefers_vs_bridge_when_connected() {
+        let root = workspace();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("sample.cpp"), "int main() {}\n").unwrap();
+        let (endpoint, handle) = stub_bridge(
+            r#"{"ok":true,"source":"vsix","engine":"stub-vsix-file-search","matches":[],"paths":[],"count":0}"#,
+        );
+        let root_text = root.to_string_lossy().to_string();
+        let mut context = ToolExecutionContext {
+            workspace_root: &root_text,
+            vs_bridge_endpoint: Some(&endpoint),
+            allow_shell: false,
+            assume_yes: true,
+            cli_mode: true,
+            goal: None,
+        };
+
+        let result = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context,
+            SEARCH_FILE_TOOL_NAME,
+            &json!({ "pattern": "sample.cpp", "max_results": 10 }),
+        ));
+        let request = handle.join().unwrap();
+        assert_eq!(result.status, ToolOutputStatus::Ok);
+        let output = result.output.unwrap();
+        assert_eq!(output["source"], json!("vsix"));
+        assert_eq!(output["engine"], json!("stub-vsix-file-search"));
+        assert!(request.starts_with("POST /searchFiles "));
+        assert!(request.contains("\"pattern\":\"sample.cpp\""));
+        assert!(request.contains("\"workspaceRoot\""));
+    }
+
+    #[test]
+    fn search_content_prefers_vs_bridge_when_connected() {
+        let root = workspace();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("sample.cpp"), "int target = 1;\n").unwrap();
+        let (endpoint, handle) = stub_bridge(
+            r#"{"ok":true,"source":"vsix","engine":"stub-vsix-content-search","matches":[],"count":0}"#,
+        );
+        let root_text = root.to_string_lossy().to_string();
+        let mut context = ToolExecutionContext {
+            workspace_root: &root_text,
+            vs_bridge_endpoint: Some(&endpoint),
+            allow_shell: false,
+            assume_yes: true,
+            cli_mode: true,
+            goal: None,
+        };
+
+        let result = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context,
+            SEARCH_CONTENT_TOOL_NAME,
+            &json!({ "query": "target", "file_glob": "*.cpp", "max_results": 10 }),
+        ));
+        let request = handle.join().unwrap();
+        assert_eq!(result.status, ToolOutputStatus::Ok);
+        let output = result.output.unwrap();
+        assert_eq!(output["source"], json!("vsix"));
+        assert_eq!(output["engine"], json!("stub-vsix-content-search"));
+        assert!(request.starts_with("POST /searchContent "));
+        assert!(request.contains("\"query\":\"target\""));
+        assert!(request.contains("\"fileGlob\":\"*.cpp\""));
+        assert!(request.contains("\"workspaceRoot\""));
     }
 
     #[test]

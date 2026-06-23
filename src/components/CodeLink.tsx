@@ -21,8 +21,8 @@ function CodeLink({
 }: CodeLinkProps) {
   const handleClick = async () => {
     try {
-      await openCodeLink(projectId, rawLink, taskId)
-      onResult?.('Opened in Visual Studio.')
+      const result = await openCodeLink(projectId, rawLink, taskId)
+      onResult?.(`${result.message}.`)
     } catch (caught) {
       onError?.(caught instanceof Error ? caught.message : String(caught))
     } finally {

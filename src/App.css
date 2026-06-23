@@ -1385,6 +1385,7 @@ button:focus-visible {
 }
 
 .message-content {
+  width: 100%;
   color: #20242c;
   font-size: 14px;
   line-height: 1.55;
@@ -1450,11 +1451,14 @@ button:focus-visible {
 .running-thinking-line {
   display: inline-flex;
   align-items: baseline;
-  gap: 1px;
+  gap: 0;
+  letter-spacing: 0;
 }
 
-.running-thinking-line > span:first-child {
-  animation: thinking-word-pulse 1.2s infinite ease-in-out;
+.thinking-character {
+  color: #98a2b3;
+  opacity: 0.58;
+  animation: thinking-character-sweep 1.18s infinite linear;
 }
 
 .running-thinking-steps {
@@ -1465,19 +1469,6 @@ button:focus-visible {
 
 .running-thinking-steps .thinking-item {
   color: inherit;
-}
-
-.thinking-dots span {
-  color: #98a2b3;
-  animation: thinking-dot-pulse 1.2s infinite ease-in-out;
-}
-
-.thinking-dots span:nth-child(2) {
-  animation-delay: 0.16s;
-}
-
-.thinking-dots span:nth-child(3) {
-  animation-delay: 0.32s;
 }
 
 .markdown-heading {
@@ -1563,6 +1554,8 @@ button:focus-visible {
 }
 
 .message-thinking {
+  width: 100%;
+  box-sizing: border-box;
   margin: 0 0 14px;
   border-bottom: 1px solid #d7dde7;
 }
@@ -2183,25 +2176,20 @@ button.thinking-item:focus-visible {
   }
 }
 
-@keyframes thinking-dot-pulse {
+@keyframes thinking-character-sweep {
   0%,
-  80%,
+  36%,
   100% {
-    opacity: 0.28;
-  }
-  40% {
-    opacity: 1;
-  }
-}
-
-@keyframes thinking-word-pulse {
-  0%,
-  100% {
-    opacity: 0.52;
+    color: #98a2b3;
+    opacity: 0.58;
+    text-shadow: none;
   }
 
-  45% {
+  8%,
+  28% {
+    color: #f1f4f5;
     opacity: 1;
+    text-shadow: 0 0 8px rgb(120 190 255 / 32%);
   }
 }
 
@@ -3478,7 +3466,7 @@ pre {
   color: #f1f4f5;
 }
 
-.app-root.codex-style .thinking-dots span {
+.app-root.codex-style .thinking-character {
   color: #edf2f4;
 }
 

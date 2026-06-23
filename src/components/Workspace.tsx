@@ -572,7 +572,13 @@ function completeSessionRun(
   if (!task) {
     return state
   }
-  const failed = hasFailedTrace(traces)
+  const mergedTraces = mergeTraceEvents(task.traceEvents, traces)
+  const failed = hasFailedTrace(mergedTraces)
+  const completedAssistantMessage = {
+    ...assistantMessage,
+    traceEvents: mergedTraces,
+    status: failed ? 'failed' : assistantMessage.status,
+  }
   return {
     ...state,
     currentWorkspaceTaskId: sessionTaskId,
@@ -581,8 +587,12 @@ function completeSessionRun(
       ...state.tasksById,
       [sessionTaskId]: {
         ...task,
-        messages: replaceMessageById(task.messages, pendingAssistantMessageId, assistantMessage),
-        traceEvents: traces,
+        messages: replaceMessageById(
+          task.messages,
+          pendingAssistantMessageId,
+          completedAssistantMessage,
+        ),
+        traceEvents: mergedTraces,
         status: failed ? 'failed' : 'completed',
       },
     },
@@ -732,6 +742,16 @@ function upsertTraceEvent(
   return [...events, traceEvent]
 }
 
+function mergeTraceEvents(
+  existingEvents: ToolTraceEvent[],
+  incomingEvents: ToolTraceEvent[],
+): ToolTraceEvent[] {
+  return incomingEvents.reduce(
+    (events, event) => upsertTraceEvent(events, event),
+    existingEvents,
+  )
+}
+
 function createConversationMessages(messages: ChatMessage[]): AgentConversationMessage[] {
   return messages
     .filter(
@@ -820,7 +840,7 @@ function createRunningAssistantContent(
   traces: ToolTraceEvent[],
   _attachmentCount = 0,
 ): string {
-  const latestTrace = traces.at(-1)
+  const latestTrace = latestDescribableTrace(traces)
   if (!latestTrace) {
     return 'Thinking...\n\n'
   }
@@ -828,9 +848,22 @@ function createRunningAssistantContent(
   return detail ? `Thinking...\n\n${detail}` : 'Thinking...\n\n'
 }
 
+function latestDescribableTrace(traces: ToolTraceEvent[]): ToolTraceEvent | undefined {
+  for (let index = traces.length - 1; index >= 0; index -= 1) {
+    const trace = traces[index]
+    if (describeRunningTrace(trace).trim().length > 0) {
+      return trace
+    }
+  }
+  return undefined
+}
+
 function describeRunningTrace(event: ToolTraceEvent): string {
   const detail = runningTraceDetail(event)
 
+  if (event.type === 'user_message') {
+    return ''
+  }
   if (event.status === 'failed' || event.type === 'error') {
     return appendRunningDetail('Step failed', detail)
   }

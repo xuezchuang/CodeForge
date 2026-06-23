@@ -18,6 +18,7 @@ use crate::vs_registry::{AppSettings, ProviderConfig, ProviderCredential, Provid
 
 pub const TOOL_CALL_TEST_PROMPT: &str = "请必须调用 calculator.add 工具计算 1+1，然后告诉我结果。";
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 32;
+const EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT: usize = 1;
 const MODEL_REQUEST_TIMEOUT_SECONDS: u64 = 360;
 const STREAMING_TRACE_INTERVAL_MS: u64 = 750;
 
@@ -508,9 +509,16 @@ async fn run_openai_tool_agent_loop(
     require_tool_call: bool,
     on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) -> Result<(), String> {
+    let mut empty_tool_call_response_retries = 0usize;
+    let mut next_tool_choice: Option<Value> = None;
+
     for round_index in 0..=max_tool_rounds {
-        let request =
-            build_chat_completion_request(selected, messages.clone(), Some(tools.clone()));
+        let request = build_chat_completion_request_with_tool_choice(
+            selected,
+            messages.clone(),
+            Some(tools.clone()),
+            next_tool_choice.take(),
+        );
         let request_title = format!("llm_request:{}", round_index + 1);
         push_trace(
             traces,
@@ -599,6 +607,7 @@ async fn run_openai_tool_agent_loop(
                 return Ok(());
             }
         };
+        let finish_reason = response_finish_reason(&completion.response_body);
 
         if !tool_calls.is_empty() {
             push_assistant_model_message_trace(
@@ -611,6 +620,51 @@ async fn run_openai_tool_agent_loop(
         }
 
         if tool_calls.is_empty() {
+            if finish_reason.as_deref() == Some("tool_calls") {
+                let can_retry = empty_tool_call_response_retries
+                    < EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT
+                    && round_index < max_tool_rounds;
+                let retry_tool_choice = can_retry
+                    .then(|| empty_tool_call_retry_tool_choice(&completion.response_body, &tools));
+
+                push_empty_tool_call_response_trace(
+                    task_id,
+                    traces,
+                    step_index,
+                    &completion,
+                    can_retry,
+                    retry_tool_choice.as_ref(),
+                    on_trace,
+                );
+
+                if can_retry {
+                    empty_tool_call_response_retries += 1;
+                    next_tool_choice = retry_tool_choice;
+                    messages.push(json!({
+                        "role": "system",
+                        "content": "Your previous response ended with finish_reason=tool_calls but did not include any tool_calls. The next request will require a tool call. Choose the most relevant available tool and provide valid JSON arguments. Do not return an empty assistant message.",
+                    }));
+                    continue;
+                }
+
+                let mut final_messages = messages.clone();
+                final_messages.push(json!({
+                    "role": "system",
+                    "content": "Tool calling is unavailable for this response because the previous model response ended with finish_reason=tool_calls but did not include any tool_calls. Answer the user's question now in natural language without calling tools. If the workspace was not inspected, say that explicitly instead of inventing code details.",
+                }));
+                request_final_answer_without_tools(
+                    task_id,
+                    selected,
+                    final_messages,
+                    traces,
+                    step_index,
+                    round_index + 2,
+                    on_trace,
+                )
+                .await?;
+                return Ok(());
+            }
+
             push_final_response_trace(
                 task_id,
                 traces,
@@ -900,6 +954,196 @@ fn push_assistant_model_message_trace(
         on_trace,
     );
     *step_index += 1;
+}
+
+async fn request_final_answer_without_tools(
+    task_id: &str,
+    selected: &SelectedModel,
+    messages: Vec<Value>,
+    traces: &mut Vec<ToolTraceEvent>,
+    step_index: &mut u32,
+    request_index: usize,
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
+) -> Result<(), String> {
+    let final_request = build_chat_completion_request(selected, messages, None);
+    let final_request_title = format!("llm_request:{request_index}:no_tools_final");
+    push_trace(
+        traces,
+        trace(
+            task_id,
+            *step_index,
+            TraceEventType::LlmRequest,
+            None,
+            &final_request_title,
+            Some(redact_trace_value(&final_request)),
+            None,
+            Some(request_summary(&final_request)),
+            TraceStatus::Success,
+            0,
+        ),
+        on_trace,
+    );
+    *step_index += 1;
+
+    let final_completion = match send_chat_completion(
+        selected,
+        &final_request,
+        Some(StreamingTraceSink {
+            task_id,
+            step_index: *step_index,
+            on_trace: &mut *on_trace,
+        }),
+    )
+    .await
+    {
+        Ok(completion) => completion,
+        Err(error) => {
+            push_trace(
+                traces,
+                error_trace(
+                    task_id,
+                    *step_index,
+                    &format!("{final_request_title} failed"),
+                    Some(redact_trace_value(&final_request)),
+                    &error,
+                ),
+                on_trace,
+            );
+            *step_index += 1;
+            return Ok(());
+        }
+    };
+
+    let final_response_title = format!("llm_response:{request_index}:no_tools_final");
+    push_trace(
+        traces,
+        trace(
+            task_id,
+            *step_index,
+            TraceEventType::LlmResponse,
+            None,
+            &final_response_title,
+            Some(json!({
+                "request": redact_trace_value(&final_completion.request_body),
+            })),
+            Some(final_completion.response_body.clone()),
+            Some(response_summary(&final_completion.response_body)),
+            TraceStatus::Success,
+            final_completion.duration_ms,
+        ),
+        on_trace,
+    );
+    *step_index += 1;
+
+    push_final_response_trace(
+        task_id,
+        traces,
+        step_index,
+        &final_completion,
+        false,
+        on_trace,
+    );
+    Ok(())
+}
+
+fn push_empty_tool_call_response_trace(
+    task_id: &str,
+    traces: &mut Vec<ToolTraceEvent>,
+    step_index: &mut u32,
+    completion: &ChatCompletionResult,
+    retrying: bool,
+    retry_tool_choice: Option<&Value>,
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
+) {
+    let summary = if retrying {
+        "Model ended with finish_reason=tool_calls but returned no tool_calls; retrying once."
+    } else {
+        "Model ended with finish_reason=tool_calls but returned no tool_calls; requesting a final answer without tools."
+    };
+
+    push_trace(
+        traces,
+        trace(
+            task_id,
+            *step_index,
+            TraceEventType::SystemEvent,
+            None,
+            "empty_tool_call_response",
+            Some(json!({
+                "request": redact_trace_value(&completion.request_body),
+            })),
+            Some(json!({
+                "response": completion.response_body.clone(),
+                "message": "",
+                "warning": "empty_tool_call_response",
+                "retrying": retrying,
+                "retryToolChoice": retry_tool_choice.cloned(),
+                "tokenUsage": serde_json::to_value(&completion.token_usage).unwrap_or_default(),
+            })),
+            Some(summary.to_string()),
+            TraceStatus::Warning,
+            completion.duration_ms,
+        ),
+        on_trace,
+    );
+    *step_index += 1;
+}
+
+fn empty_tool_call_retry_tool_choice(response_body: &Value, tools: &[Value]) -> Value {
+    let available_names = tool_definition_names(tools);
+    let intent = response_intent_text(response_body);
+    if available_names.iter().any(|name| name == "search_file") && intent_indicates_search(&intent)
+    {
+        return json!({
+            "type": "function",
+            "function": { "name": "search_file" },
+        });
+    }
+    json!("required")
+}
+
+fn tool_definition_names(tools: &[Value]) -> Vec<String> {
+    tools
+        .iter()
+        .filter_map(|tool| tool.get("function")?.get("name")?.as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+fn response_intent_text(response_body: &Value) -> String {
+    parse_openai_response(response_body)
+        .ok()
+        .and_then(|parsed| parsed.choices.into_iter().next())
+        .map(|choice| {
+            [
+                choice.message.reasoning_content.unwrap_or_default(),
+                choice.message.content.unwrap_or_default(),
+            ]
+            .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn intent_indicates_search(intent: &str) -> bool {
+    let intent = intent.to_ascii_lowercase();
+    [
+        "search",
+        "find",
+        "locate",
+        "relevant file",
+        "related file",
+        "workspace",
+        "repository",
+        "repo",
+        "codebase",
+        "查找",
+        "搜索",
+        "相关文件",
+        "代码",
+        "仓库",
+    ]
+    .iter()
+    .any(|needle| intent.contains(needle))
 }
 
 fn push_final_response_trace(
@@ -1491,6 +1735,15 @@ fn build_chat_completion_request(
     messages: Vec<Value>,
     tools: Option<Vec<Value>>,
 ) -> Value {
+    build_chat_completion_request_with_tool_choice(selected, messages, tools, None)
+}
+
+fn build_chat_completion_request_with_tool_choice(
+    selected: &SelectedModel,
+    messages: Vec<Value>,
+    tools: Option<Vec<Value>>,
+    tool_choice: Option<Value>,
+) -> Value {
     let uses_streaming = true;
     let mut request_body = json!({
         "model": selected.model_id,
@@ -1529,7 +1782,7 @@ fn build_chat_completion_request(
 
     if let Some(tools) = tools {
         request_body["tools"] = json!(tools);
-        request_body["tool_choice"] = json!("auto");
+        request_body["tool_choice"] = tool_choice.unwrap_or_else(|| json!("auto"));
     }
 
     if uses_streaming {
@@ -2275,6 +2528,13 @@ fn parse_tool_calls(response_body: &Value) -> Result<Vec<OpenAiToolCall>, String
         .unwrap_or_default())
 }
 
+fn response_finish_reason(response_body: &Value) -> Option<String> {
+    parse_openai_response(response_body)
+        .ok()
+        .and_then(|parsed| parsed.choices.into_iter().next())
+        .and_then(|choice| choice.finish_reason)
+}
+
 fn build_assistant_tool_call_message(response_body: &Value) -> Result<Value, String> {
     let parsed = parse_openai_response(response_body)?;
     let choice = parsed
@@ -2738,6 +2998,146 @@ mod tests {
     }
 
     #[test]
+    fn run_agent_openai_loop_retries_empty_tool_call_finish() {
+        let (base_url, server_thread) = start_mock_openai_server(vec![
+            empty_tool_call_finish_response(),
+            final_message_response("Recovered answer."),
+        ]);
+        let project = test_project();
+        let settings = test_settings(&base_url);
+        let input = AgentRunInput {
+            project_id: project.id.clone(),
+            session_id: None,
+            user_prompt: "请查一下项目".to_string(),
+            messages: None,
+            provider_id: Some("provider".to_string()),
+            credential_id: Some("default".to_string()),
+            model_id: Some("test-model".to_string()),
+            reasoning_effort: None,
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
+            goal: None,
+            goal_slot: None,
+        };
+
+        let run =
+            tauri::async_runtime::block_on(run_agent(&project, &settings, input, |_event| {}))
+                .unwrap();
+        let requests = server_thread.join().unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]["tool_choice"],
+            json!({
+                "type": "function",
+                "function": { "name": "search_file" },
+            })
+        );
+        assert!(requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"].as_str() == Some("system")
+                    && message["content"].as_str().is_some_and(|content| {
+                        content.contains("finish_reason=tool_calls")
+                            && content.contains("require a tool call")
+                    })
+            }));
+        assert!(run.traces.iter().any(|event| {
+            event.title == "empty_tool_call_response"
+                && matches!(&event.event_type, TraceEventType::SystemEvent)
+                && matches!(&event.status, TraceStatus::Warning)
+                && event
+                    .output_summary
+                    .as_deref()
+                    .is_some_and(|summary| summary.contains("retrying once"))
+        }));
+        assert!(run.traces.iter().any(|event| {
+            event.title == "final_response"
+                && matches!(&event.status, TraceStatus::Success)
+                && event.output_summary.as_deref() == Some("Recovered answer.")
+        }));
+        assert!(!run.traces.iter().any(|event| {
+            event.title == "final_response"
+                && event.output_summary.as_deref() == Some("Final response was empty")
+        }));
+    }
+
+    #[test]
+    fn run_agent_openai_loop_falls_back_to_no_tool_final_answer_after_empty_tool_call_retry() {
+        let (base_url, server_thread) = start_mock_openai_server(vec![
+            empty_tool_call_finish_response(),
+            empty_tool_call_finish_response(),
+            final_message_response("Answered without tools."),
+        ]);
+        let project = test_project();
+        let settings = test_settings(&base_url);
+        let input = AgentRunInput {
+            project_id: project.id.clone(),
+            session_id: None,
+            user_prompt: "请查一下项目".to_string(),
+            messages: None,
+            provider_id: Some("provider".to_string()),
+            credential_id: Some("default".to_string()),
+            model_id: Some("test-model".to_string()),
+            reasoning_effort: None,
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
+            goal: None,
+            goal_slot: None,
+        };
+
+        let run =
+            tauri::async_runtime::block_on(run_agent(&project, &settings, input, |_event| {}))
+                .unwrap();
+        let requests = server_thread.join().unwrap();
+
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1]["tool_choice"],
+            json!({
+                "type": "function",
+                "function": { "name": "search_file" },
+            })
+        );
+        assert!(requests[2].get("tools").is_none());
+        assert!(requests[2].get("tool_choice").is_none());
+        assert!(requests[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"].as_str() == Some("system")
+                    && message["content"].as_str().is_some_and(|content| {
+                        content.contains("Tool calling is unavailable")
+                            && content.contains("without calling tools")
+                    })
+            }));
+        let empty_tool_call_warnings = run
+            .traces
+            .iter()
+            .filter(|event| {
+                event.title == "empty_tool_call_response"
+                    && matches!(&event.event_type, TraceEventType::SystemEvent)
+                    && matches!(&event.status, TraceStatus::Warning)
+            })
+            .count();
+        assert_eq!(empty_tool_call_warnings, 2);
+        assert!(run.traces.iter().any(|event| {
+            event.title == "llm_request:3:no_tools_final"
+                && matches!(&event.event_type, TraceEventType::LlmRequest)
+        }));
+        assert!(run.traces.iter().any(|event| {
+            event.title == "final_response"
+                && matches!(&event.status, TraceStatus::Success)
+                && event.output_summary.as_deref() == Some("Answered without tools.")
+        }));
+    }
+
+    #[test]
     fn run_agent_emits_trace_events_while_running() {
         let (base_url, server_thread) =
             start_mock_openai_server(vec![final_message_response("Done.")]);
@@ -2890,6 +3290,19 @@ mod tests {
                             "arguments": arguments
                         }
                     }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+    }
+
+    fn empty_tool_call_finish_response() -> Value {
+        json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "I should inspect the workspace first."
                 },
                 "finish_reason": "tool_calls"
             }]

@@ -13,6 +13,7 @@ use crate::vs_registry::{
     AppSettings, ProviderModel, SettingsInput, VSInstance, VSRegisterPayload,
     MINIMAX_OPENAI_BASE_URL,
 };
+use crate::window_activation;
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -358,7 +359,15 @@ pub async fn open_code_link(
         return Err(error);
     }
 
-    let message = "Opened in Visual Studio".to_string();
+    let message = match project.vs_process_id {
+        Some(process_id) => match window_activation::bring_process_to_front(process_id) {
+            Ok(()) => "Opened in Visual Studio and brought it to front".to_string(),
+            Err(error) => {
+                format!("Opened in Visual Studio; foreground activation failed: {error}")
+            }
+        },
+        None => "Opened in Visual Studio".to_string(),
+    };
     let trace_event = record_open_code_link_trace(
         &state,
         task_id.as_deref(),

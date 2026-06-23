@@ -2825,14 +2825,21 @@ pre {
 }
 
 .code-link {
-  min-height: 28px;
-  padding: 0 8px;
+  min-height: 22px;
+  padding: 0 6px;
   color: #075985;
   background: #e0f2fe;
   border-color: #bae6fd;
   font-family: ui-monospace, Consolas, monospace;
   font-size: 12px;
+  line-height: 1.15;
+  gap: 5px;
   vertical-align: middle;
+}
+
+.code-link svg {
+  width: 12px;
+  height: 12px;
 }
 
 .code-link:hover {

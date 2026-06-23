@@ -21,6 +21,8 @@ import {
 interface ComposerProps {
   providers: ProviderConfig[]
   busy: boolean
+  sendBlocked?: boolean
+  sendBlockTitle?: string
   value: string
   onChange: (value: string) => void
   onSend: (
@@ -44,6 +46,8 @@ type ReasoningChoice = {
 function Composer({
   providers,
   busy,
+  sendBlocked = false,
+  sendBlockTitle = 'Send unavailable',
   value,
   onChange,
   onSend,
@@ -144,7 +148,10 @@ function Composer({
   }, [selectedModel, triggerReasoningLabel])
 
   const canSend =
-    (value.trim().length > 0 || attachments.length > 0) && !busy && selectedModel !== null
+    (value.trim().length > 0 || attachments.length > 0) &&
+    !busy &&
+    !sendBlocked &&
+    selectedModel !== null
 
   const send = () => {
     if (!canSend) {
@@ -377,9 +384,14 @@ function Composer({
               className="composer-send-button"
               onClick={send}
               disabled={!canSend}
-              aria-label={busy ? 'Running' : 'Send'}
+              aria-label={
+                busy ? 'Running'
+                : sendBlocked ? 'Send unavailable'
+                : 'Send'
+              }
               title={
                 busy ? 'Running'
+                : sendBlocked ? sendBlockTitle
                 : selectedModel ? 'Send'
                 : 'Enable a provider in Settings'
               }

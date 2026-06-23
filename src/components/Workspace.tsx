@@ -52,6 +52,9 @@ function Workspace({
   const [headerDivided, setHeaderDivided] = useState(false)
   const [selectedTrace, setSelectedTrace] = useState<SelectedTrace | null>(null)
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null)
+  const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set())
+  const runningSessionIdsRef = useRef<Set<string>>(new Set())
+  const currentWorkspaceTaskIdRef = useRef<string | null>(state.currentWorkspaceTaskId)
   const activeProject = useMemo(
     () =>
       state.projects.find((project) => project.id === state.activeProjectId) ??
@@ -63,6 +66,10 @@ function Workspace({
     state.currentWorkspaceTaskId ?
       state.tasksById[state.currentWorkspaceTaskId] ?? null
     : null
+  const currentTaskIsRunning = Boolean(
+    currentTask && runningSessionIds.has(currentTask.id),
+  )
+  const hasOtherRunningSession = runningSessionIds.size > 0 && !currentTaskIsRunning
   const selectedTraceEvents = selectedTrace?.events ?? []
   const currentTaskPersistenceKey =
     currentTask && currentTask.messagesLoaded !== false && currentTask.status !== 'running' ?
@@ -82,6 +89,21 @@ function Workspace({
           .join('|'),
       ].join('::')
     : ''
+
+  useEffect(() => {
+    currentWorkspaceTaskIdRef.current = state.currentWorkspaceTaskId
+  }, [state.currentWorkspaceTaskId])
+
+  const setSessionRunning = useCallback((sessionTaskId: string, running: boolean) => {
+    const next = new Set(runningSessionIdsRef.current)
+    if (running) {
+      next.add(sessionTaskId)
+    } else {
+      next.delete(sessionTaskId)
+    }
+    runningSessionIdsRef.current = next
+    setRunningSessionIds(next)
+  }, [])
 
   useEffect(() => {
     if (!currentTask || currentTask.messagesLoaded !== false) {
@@ -300,7 +322,19 @@ function Workspace({
         }
     let unlisten: UnlistenFn | null = null
 
-    setBusy(true)
+    if (
+      runningSessionIdsRef.current.size > 0 &&
+      !runningSessionIdsRef.current.has(sessionTaskId)
+    ) {
+      showWorkspaceToast(
+        'notice',
+        'Another chat is still running. Wait for it to finish before sending.',
+      )
+      return
+    }
+
+    currentWorkspaceTaskIdRef.current = sessionTaskId
+    setSessionRunning(sessionTaskId, true)
     setSelectedTrace(null)
     setState((current) => addOrReplaceSessionTask(current, activeProject.id, pendingTask))
 
@@ -310,13 +344,15 @@ function Workspace({
         if (!isToolTraceEvent(traceEvent)) {
           return
         }
-        setSelectedTrace((current) => ({
-          taskId: traceEvent.taskId,
-          events:
-            current?.taskId === traceEvent.taskId ?
-              upsertTraceEvent(current.events, traceEvent)
-            : [traceEvent],
-        }))
+        if (currentWorkspaceTaskIdRef.current === sessionTaskId) {
+          setSelectedTrace((current) => ({
+            taskId: traceEvent.taskId,
+            events:
+              current?.taskId === traceEvent.taskId ?
+                upsertTraceEvent(current.events, traceEvent)
+              : [traceEvent],
+          }))
+        }
         setState((current) =>
           appendTraceEventToSession(
             current,
@@ -342,7 +378,9 @@ function Workspace({
         run.traces,
         pendingAssistantMessage.id,
       )
-      setSelectedTrace({ taskId: run.taskId, events: run.traces })
+      if (currentWorkspaceTaskIdRef.current === sessionTaskId) {
+        setSelectedTrace({ taskId: run.taskId, events: run.traces })
+      }
 
       setState((current) =>
         completeSessionRun(
@@ -358,7 +396,6 @@ function Workspace({
       setState((current) =>
         failSessionRun(
           current,
-          activeProject.id,
           sessionTaskId,
           pendingAssistantMessage.id,
           message,
@@ -367,7 +404,7 @@ function Workspace({
       showWorkspaceToast('error', message)
     } finally {
       unlisten?.()
-      setBusy(false)
+      setSessionRunning(sessionTaskId, false)
     }
   }
 
@@ -565,7 +602,7 @@ function Workspace({
       <Toast toast={workspaceToast} onDismiss={() => setWorkspaceToast(null)} />
       <WorkspaceHeader
         project={activeProject}
-        busy={busy}
+        busy={busy || currentTaskIsRunning}
         divided={headerDivided}
         onOpenVisualStudio={launchVs}
         onRefreshBridge={refreshBridge}
@@ -593,7 +630,9 @@ function Workspace({
             />
             <Composer
               providers={state.providers}
-              busy={busy || currentTask?.messagesLoaded === false}
+              busy={busy || currentTaskIsRunning || currentTask?.messagesLoaded === false}
+              sendBlocked={hasOtherRunningSession}
+              sendBlockTitle="Wait for the running chat to finish"
               value={composerDraft}
               onChange={setComposerDraft}
               onSend={runTask}
@@ -692,7 +731,6 @@ function completeSessionRun(
   }
   return {
     ...state,
-    currentWorkspaceTaskId: sessionTaskId,
     traceDrawerOpen: state.traceDrawerOpen,
     tasksById: {
       ...state.tasksById,
@@ -799,7 +837,6 @@ function appendTraceEventToSession(
 
 function failSessionRun(
   state: AppState,
-  projectId: string,
   sessionTaskId: string,
   pendingAssistantMessageId: string,
   error: string,
@@ -813,12 +850,11 @@ function failSessionRun(
   }
 
   if (!task) {
-    return appendMessagesToSession(state, projectId, sessionTaskId, [failedMessage], 'failed')
+    return state
   }
 
   return {
     ...state,
-    currentWorkspaceTaskId: sessionTaskId,
     tasksById: {
       ...state.tasksById,
       [sessionTaskId]: {

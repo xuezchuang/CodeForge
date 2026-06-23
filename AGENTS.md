@@ -43,77 +43,29 @@ src\types\trace.ts
 src\api\tauriApi.ts
 ```
 
-## CLI Coding Reference
+## CLI And TUI Deferred
 
-For CLI implementation work in this repository, use `D:\code\CodeForge` as the local reference checkout for Codex CLI style and structure, especially:
+CLI and terminal UI work are paused. Do not implement, refactor, test, or build CLI/TUI surfaces unless the user explicitly revives that work.
 
-```text
-D:\code\CodeForge\AGENTS.md
-D:\code\CodeForge\codex-rs\cli\
-D:\code\CodeForge\codex-rs\cli\src\main.rs
-D:\code\CodeForge\codex-rs\cli\tests\
-```
-
-Reference that code for command organization, argument parsing shape, human-vs-JSON output separation, exit/error behavior, and focused CLI tests. Do not add a direct dependency on the reference checkout, vendor copied files, or change `D:\code\CodeForge` unless the user explicitly asks.
-
-Current local CLI entry points are:
+Treat these local entry points as dormant implementation surfaces:
 
 ```text
+src-tui\
 src-tauri\src\bin\codeforge.rs
 src-tauri\src\cli.rs
-src-tauri\src\agent_runner.rs
 src-tauri\src\codex_cli_runner.rs
-src-tauri\src\tool_registry.rs
 build-codeforge-cli.bat
 ```
 
-Keep CLI changes aligned with this repository's Rust/Tauri ownership model. The CLI may share desktop state and agent orchestration, but it must not bypass trace creation, provider selection rules, credential masking, workspace boundaries, or the agent safety policy above. If a CLI feature needs build, test, shell, or IDE automation, implement it as an explicit safe tool with fixed command templates, workspace confinement, trace output, and user confirmation instead of exposing generic shell execution.
+Do not use `D:\code\CodeForge`, `codex\codex-rs\cli\`, `codex\codex-rs\tui\`, terminal rendering, composer behavior, slash-command popups, status/footer behavior, or broad app-server integration as current implementation targets. Existing CLI/TUI code may remain in the repository, but it should not drive current architecture or product decisions.
 
-## CodeForge CLI Direction
+Codex remains useful only as a selective reference for tool-interface shape, approval flow ideas, trace/event presentation ideas, and small implementation details that directly serve the desktop agent host. Do not wholesale adopt Codex core, Codex sandboxing, OpenAI account/auth flows, cloud config, plugin loading, broad MCP/runtime machinery, CLI machinery, or interactive TUI machinery unless the user explicitly asks for a specific piece and the ownership boundary is clear.
 
-CodeForge CLI is a first-class product surface, not just a helper launcher.
+## Current Tool Layer Direction
 
-The first CLI milestone is to make the CodeForge command-line experience closely match the useful parts of the Codex CLI interaction model while still running CodeForge's own Rust/Tauri backend, provider settings, workspace state, trace system, Visual Studio bridge, and CodeForge-owned tools.
+Focus current implementation on the Windows Tauri desktop app, trace UI, model/tool loop, CodeForge-owned tool registry, Visual Studio bridge, code-link resolution, and semantic C++ / Visual Studio workflows.
 
-### CodeForge TUI Ownership
-
-The terminal UI under `src-tui` is CodeForge TUI. It is CodeForge-owned code, even when it was copied from or adapted from Codex sources.
-
-Use Codex as a reference implementation for terminal interaction details, event shapes, rendering behavior, and useful UI patterns. Do not describe the product architecture as "running Codex TUI", and do not treat CodeForge as a thin wrapper around Codex.
-
-The intended CLI/TUI architecture is:
-
-```text
-codeforge.exe
--> CodeForge TUI
--> CodeForge-owned backend adapter / app-server-like event source
--> CodeForge provider, config, tool, trace, workspace, and Visual Studio integrations
-```
-
-Codex backend integration should be incremental. Prefer vertical slices that make one CodeForge behavior work end-to-end over importing large Codex subsystems. Do not wholesale adopt Codex core, Codex sandboxing, OpenAI account/auth flows, cloud config, plugin loading, or broad MCP/runtime machinery unless the user explicitly asks for a specific piece and the ownership boundary is clear.
-
-Use the in-repository Codex checkout as the primary reference for CLI/TUI behavior:
-
-```text
-codex\codex-rs\cli\
-codex\codex-rs\tui\
-codex\codex-rs\app-server-protocol\
-```
-
-The goal is not to embed the whole Codex core runtime as CodeForge's architecture. CodeForge should selectively copy, adapt, or reimplement the parts it needs, then rename and own those pieces as CodeForge code where appropriate.
-
-Prioritize the CLI surface first:
-
-- CodeForge interactive terminal UI with Codex-inspired behavior.
-- Composer/input behavior.
-- Slash command popup and command routing.
-- `/goal` style goal management.
-- Status/footer behavior where useful.
-- Human-readable output vs JSON output separation.
-- Clear command parsing and error behavior.
-- Traceable agent/tool activity.
-
-Then build the CodeForge tool layer interface:
+Build the CodeForge tool layer interface for the Desktop / Agent Host:
 
 - Tool schema definitions.
 - Tool invocation request/response types.
@@ -144,7 +96,7 @@ goal/clear
 
 Do not expose arbitrary shell execution as a generic tool. Do not adopt Codex sandboxing as the first answer to tool execution. If build or test support is needed, implement explicit CodeForge tools such as `build_solution` or `run_tests` with fixed command templates, workspace confinement, user confirmation, and trace output.
 
-Copying or adapting Codex CLI/TUI/tool-interface code is allowed when it directly serves the CodeForge CLI goal.
+Copying or adapting Codex tool-interface code is allowed only when it directly serves the Desktop / Agent Host tool layer.
 
 Rules:
 
@@ -158,8 +110,6 @@ Rules:
 CodeForge owns:
 
 ```text
-CLI command routing
-terminal rendering integration
 project/workspace state
 provider and credential selection
 trace creation and storage
@@ -171,9 +121,7 @@ goal state used by CodeForge
 Codex is a reference for:
 
 ```text
-CLI/TUI interaction design
-slash command behavior
-goal command behavior
+tool-interface shape
 tool call interface shape
 approval flow ideas
 trace/event presentation ideas
@@ -256,16 +204,15 @@ The VSIX should remain a semantic bridge. Model orchestration, task planning, pa
 
 ## Verification
 
-After any code change in this repository, run both compile checks before reporting completion:
+After any non-documentation code change in this repository, run the desktop Release compile check before reporting completion:
 
 ```text
-build-codeforge-cli.bat
 build-release.bat
 ```
 
-Run `build-codeforge-cli.bat` first for the CLI binary, then `build-release.bat` for the desktop Release binary. `build-release-installer.bat` is installer-only and should not be executed unless installer output is explicitly required.
+Do not run `build-codeforge-cli.bat` unless the user explicitly revives CLI work or asks for a CLI build. `build-release-installer.bat` is installer-only and should not be executed unless installer output is explicitly required.
 
-These are the required verification checks for code edits. If either build fails, inspect the concrete error, fix the cause when it is in scope, and rerun the failed build. If either build cannot be run, report the blocker explicitly.
+This is the required verification check for code edits. If the build fails, inspect the concrete error, fix the cause when it is in scope, and rerun the failed build. If the build cannot be run, report the blocker explicitly.
 
 For documentation-only edits, use the smallest safe check that proves the change, such as direct file review or `git diff --check`.
 

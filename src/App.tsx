@@ -206,6 +206,7 @@ function App() {
           onNavigate={navigate}
           onOpenProject={openWorkspace}
           onOpenHistoryTask={openHistoryTask}
+          onNotice={(message) => showToast('notice', message)}
           onNewChat={(projectId) => {
             setAppState((current) => ({
               ...current,

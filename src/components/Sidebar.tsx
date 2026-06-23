@@ -1,13 +1,13 @@
 import {
-  ChevronDown,
   ChevronRight,
-  Edit3,
-  Folder,
   FolderKanban,
   Settings as SettingsIcon,
   UserRound,
 } from 'lucide-react'
 import { useState } from 'react'
+import closedFolderIcon from '../assets/icons/codex-folder-closed.png'
+import openFolderIcon from '../assets/icons/codex-folder-open.png'
+import newChatIcon from '../assets/icons/codex-new-chat.png'
 import type { View } from '../state/appState'
 import type { ProjectSession } from '../types/project'
 import type { AgentTask } from '../types/task'
@@ -25,6 +25,7 @@ interface SidebarProps {
   onOpenProject: (projectId: string) => void
   onOpenHistoryTask: (task: AgentTask) => void
   onNewChat: (projectId: string) => void
+  onNotice: (message: string) => void
 }
 
 function Sidebar({
@@ -39,11 +40,12 @@ function Sidebar({
   onOpenProject,
   onOpenHistoryTask,
   onNewChat,
+  onNotice,
 }: SidebarProps) {
-  const [collapsedProjectIds, setCollapsedProjectIds] = useState<Set<string>>(() => new Set())
+  const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(() => new Set())
 
   function toggleProjectHistory(projectId: string) {
-    setCollapsedProjectIds((current) => {
+    setExpandedProjectIds((current) => {
       const next = new Set(current)
       if (next.has(projectId)) {
         next.delete(projectId)
@@ -52,6 +54,25 @@ function Sidebar({
       }
       return next
     })
+  }
+
+  function openProjectCollapsed(projectId: string) {
+    setExpandedProjectIds((current) => {
+      if (!current.has(projectId)) {
+        return current
+      }
+      const next = new Set(current)
+      next.delete(projectId)
+      return next
+    })
+    onOpenProject(projectId)
+  }
+
+  function openProjectAndToggleHistory(project: ProjectSession, hasHistory: boolean) {
+    onOpenProject(project.id)
+    if (hasHistory) {
+      toggleProjectHistory(project.id)
+    }
   }
 
   return (
@@ -90,8 +111,8 @@ function Sidebar({
               .filter((task): task is AgentTask => Boolean(task))
               .reverse()
             const active = view === 'workspace' && project.id === activeProjectId
-            const collapsed = collapsedProjectIds.has(project.id)
             const hasHistory = projectTasks.length > 0
+            const expanded = hasHistory && expandedProjectIds.has(project.id)
 
             return (
               <div className="sidebar-project-group" key={project.id}>
@@ -103,24 +124,36 @@ function Sidebar({
                         'sidebar-project-button active'
                       : 'sidebar-project-button'
                     }
-                    onClick={() => onOpenProject(project.id)}
+                    onClick={() => openProjectCollapsed(project.id)}
                     title={project.name}
+                    aria-expanded={hasHistory ? expanded : undefined}
                   >
-                    <Folder size={15} aria-hidden="true" />
+                    <img
+                      className={
+                        expanded ?
+                          'sidebar-folder-icon open'
+                        : 'sidebar-folder-icon'
+                      }
+                      src={expanded ? openFolderIcon : closedFolderIcon}
+                      alt=""
+                      draggable={false}
+                    />
                     <span>{project.name}</span>
                   </button>
                   <button
                     type="button"
                     className="sidebar-project-toggle"
-                    onClick={() => toggleProjectHistory(project.id)}
-                    title={`${collapsed ? 'Show' : 'Hide'} chats in ${project.name}`}
-                    aria-label={`${collapsed ? 'Show' : 'Hide'} chats in ${project.name}`}
-                    aria-expanded={!collapsed}
+                    onClick={() => openProjectAndToggleHistory(project, hasHistory)}
+                    title={`${expanded ? 'Hide' : 'Show'} chats in ${project.name}`}
+                    aria-label={`${expanded ? 'Hide' : 'Show'} chats in ${project.name}`}
+                    aria-expanded={expanded}
                     disabled={!hasHistory}
                   >
-                    {collapsed ?
-                      <ChevronRight size={14} aria-hidden="true" />
-                    : <ChevronDown size={14} aria-hidden="true" />}
+                    <ChevronRight
+                      className={expanded ? 'expanded' : undefined}
+                      size={14}
+                      aria-hidden="true"
+                    />
                   </button>
                   <button
                     type="button"
@@ -129,10 +162,15 @@ function Sidebar({
                     title={`Start new chat in ${project.name}`}
                     aria-label={`Start new chat in ${project.name}`}
                   >
-                    <Edit3 size={14} aria-hidden="true" />
+                    <img
+                      className="sidebar-new-chat-icon"
+                      src={newChatIcon}
+                      alt=""
+                      draggable={false}
+                    />
                   </button>
                 </div>
-                {hasHistory && !collapsed ? (
+                {expanded ? (
                   <WorkspaceHistoryList
                     key={`${project.id}:${historyDays}`}
                     tasks={projectTasks}
@@ -140,6 +178,7 @@ function Sidebar({
                     historyDays={historyDays}
                     showHeader={false}
                     onSelectTask={onOpenHistoryTask}
+                    onNotice={onNotice}
                   />
                 ) : null}
               </div>

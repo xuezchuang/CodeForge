@@ -34,4 +34,7 @@ export interface AgentTask {
   messages: ChatMessage[]
   traceEvents: ToolTraceEvent[]
   status: AgentTaskStatus
+  messagesLoaded?: boolean
+  createdAt?: string
+  updatedAt?: string
 }

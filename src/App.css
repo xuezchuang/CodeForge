@@ -472,7 +472,9 @@ select {
   padding: 9px 10px;
   color: #111827;
   background: #ffffff;
-  font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  font-family: var(--font-sans);
 }
 
 textarea {
@@ -1436,7 +1438,9 @@ button:focus-visible {
 .markdown-list,
 .markdown-heading,
 .markdown-code-section,
-.markdown-code-block {
+.markdown-code-block,
+.markdown-table-wrap,
+.markdown-divider {
   margin: 0 0 10px;
 }
 
@@ -1444,7 +1448,9 @@ button:focus-visible {
 .markdown-list:last-child,
 .markdown-heading:last-child,
 .markdown-code-section:last-child,
-.markdown-code-block:last-child {
+.markdown-code-block:last-child,
+.markdown-table-wrap:last-child,
+.markdown-divider:last-child {
   margin-bottom: 0;
 }
 
@@ -1486,6 +1492,36 @@ button:focus-visible {
   margin-top: 4px;
 }
 
+.markdown-divider {
+  border: 0;
+  border-top: 1px solid #d7dde7;
+}
+
+.markdown-table-wrap {
+  overflow-x: auto;
+}
+
+.markdown-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.markdown-table th,
+.markdown-table td {
+  border: 1px solid #d7dde7;
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-table th {
+  background: #f7f9fc;
+  color: #344054;
+  font-weight: 700;
+}
+
 .markdown-inline-code {
   border: 1px solid #d7dde7;
   border-radius: 4px;
@@ -1505,6 +1541,10 @@ button:focus-visible {
   color: #18202a;
   font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
   white-space: pre;
+}
+
+.markdown-code-line {
+  padding: 7px 10px;
 }
 
 .markdown-code-language {
@@ -2047,25 +2087,38 @@ button.thinking-item:focus-visible {
 
 .composer-model-trigger {
   width: auto;
-  max-width: 170px;
+  max-width: min(260px, 44vw);
   min-height: 30px;
   border: 1px solid #d8dde7;
   border-radius: 8px;
-  padding: 5px 26px 5px 9px;
+  padding: 5px 8px 5px 9px;
   color: #344054;
   background: #ffffff;
   font-size: 13px;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 5px;
   cursor: pointer;
 }
 
-.composer-model-trigger span {
+.composer-model-trigger-label {
+  min-width: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.composer-model-trigger-model {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.composer-model-trigger-reasoning {
+  flex: 0 0 auto;
+  color: #667085;
+  font-size: 12px;
 }
 
 .composer-model-trigger svg {
@@ -2077,9 +2130,10 @@ button.thinking-item:focus-visible {
   right: 0;
   bottom: calc(100% + 8px);
   z-index: 12;
-  width: auto;
+  width: min(250px, calc(100vw - 48px));
   max-width: min(560px, calc(100vw - 48px));
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   align-items: stretch;
   gap: 0;
   border: 1px solid #d8dde7;
@@ -2089,9 +2143,13 @@ button.thinking-item:focus-visible {
   box-shadow: 0 14px 32px rgb(15 23 42 / 16%);
 }
 
+.composer-model-menu.with-reasoning {
+  width: min(410px, calc(100vw - 48px));
+  grid-template-columns: minmax(190px, 1fr) minmax(126px, 0.68fr);
+}
+
 .composer-picker-column {
-  min-width: 180px;
-  max-width: 260px;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -2117,7 +2175,7 @@ button.thinking-item:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-height: 280px;
+  max-height: min(292px, calc(100vh - 170px));
   overflow-y: auto;
 }
 
@@ -2126,7 +2184,7 @@ button.thinking-item:focus-visible {
   min-height: 32px;
   border: 0;
   border-radius: 7px;
-  padding: 0 8px;
+  padding: 6px 8px;
   background: transparent;
   color: #20242c;
   display: flex;
@@ -2135,11 +2193,23 @@ button.thinking-item:focus-visible {
   gap: 8px;
   text-align: left;
   cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.25;
 }
 
 .composer-model-option:hover,
 .composer-model-option.selected {
   background: #f1f5f9;
+}
+
+.composer-model-option span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.composer-model-option svg {
+  flex: 0 0 auto;
 }
 
 .composer-send-button {
@@ -3169,6 +3239,7 @@ pre {
 .app-root.codex-style {
   background: #111a1d;
   color: #e7ecef;
+  font-family: var(--font-sans);
 }
 
 .app-root.codex-style .sidebar {
@@ -3470,6 +3541,20 @@ pre {
   color: #edf2f4;
 }
 
+.app-root.codex-style .markdown-divider {
+  border-top-color: #30383a;
+}
+
+.app-root.codex-style .markdown-table th,
+.app-root.codex-style .markdown-table td {
+  border-color: #30383a;
+}
+
+.app-root.codex-style .markdown-table th {
+  background: #171b1c;
+  color: #f1f4f5;
+}
+
 .app-root.codex-style .markdown-inline-code {
   border-color: #343b3d;
   background: #202526;
@@ -3762,35 +3847,77 @@ pre {
 
 .app-root.codex-style .composer-model-trigger {
   width: auto;
-  max-width: 190px;
-  padding: 0 6px;
+  max-width: min(260px, 40vw);
+  padding: 0 5px 0 7px;
   color: #f1f1f1;
   box-shadow: none;
 }
 
+.app-root.codex-style .composer-model-trigger-label {
+  gap: 4px;
+}
+
+.app-root.codex-style .composer-model-trigger-model {
+  color: #f4f4f4;
+}
+
+.app-root.codex-style .composer-model-trigger-reasoning {
+  color: #aaa;
+}
+
 .app-root.codex-style .composer-model-menu {
   bottom: calc(100% + 10px);
-  border-color: #383838;
-  border-radius: 10px;
-  background: #2b2b2b;
-  box-shadow: 0 18px 40px rgb(0 0 0 / 42%);
+  border-color: #3d3d3d;
+  border-radius: 11px;
+  background: #2d2d2d;
+  box-shadow: 0 18px 42px rgb(0 0 0 / 44%);
+  overflow: hidden;
 }
 
 .app-root.codex-style .composer-picker-column + .composer-picker-column {
-  border-left-color: #383838;
+  border-left-color: #3b3b3b;
 }
 
 .app-root.codex-style .composer-picker-header {
-  color: #9aa3ad;
+  padding: 5px 8px 6px;
+  color: #9ea7ad;
+  font-size: 10px;
+  letter-spacing: 0.07em;
+}
+
+.app-root.codex-style .composer-picker-list {
+  scrollbar-color: #696969 transparent;
+  scrollbar-width: thin;
+}
+
+.app-root.codex-style .composer-picker-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.app-root.codex-style .composer-picker-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.app-root.codex-style .composer-picker-list::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #696969;
 }
 
 .app-root.codex-style .composer-model-option {
+  min-height: 29px;
+  border-radius: 7px;
+  padding: 5px 8px;
   color: #f1f1f1;
+  font-size: 13px;
 }
 
 .app-root.codex-style .composer-model-option:hover,
 .app-root.codex-style .composer-model-option.selected {
-  background: #444;
+  background: #484848;
+}
+
+.app-root.codex-style .composer-model-option svg {
+  color: #d8d8d8;
 }
 
 .app-root.codex-style .composer-icon-button:hover,

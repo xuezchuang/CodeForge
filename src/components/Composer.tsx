@@ -129,18 +129,19 @@ function Composer({
     return () => document.removeEventListener('pointerdown', closeOnOutsideClick)
   }, [pickerOpen])
 
-  const triggerLabel = useMemo(() => {
+  const triggerReasoningLabel = useMemo(() => {
+    return reasoningChoices.find((choice) => choice.value === selectedReasoning)?.label ?? ''
+  }, [reasoningChoices, selectedReasoning])
+
+  const triggerTitle = useMemo(() => {
     if (!selectedModel) {
       return 'No enabled model'
     }
-    const reasoningLabel = reasoningChoices.find(
-      (choice) => choice.value === selectedReasoning,
-    )?.label
-    if (!reasoningLabel) {
+    if (!triggerReasoningLabel) {
       return selectedModel.modelName
     }
-    return `${selectedModel.modelName} ${reasoningLabel}`
-  }, [selectedModel, reasoningChoices, selectedReasoning])
+    return `${selectedModel.modelName} ${triggerReasoningLabel}`
+  }, [selectedModel, triggerReasoningLabel])
 
   const canSend =
     (value.trim().length > 0 || attachments.length > 0) && !busy && selectedModel !== null
@@ -279,14 +280,27 @@ function Composer({
                 aria-expanded={pickerOpen}
                 onClick={() => setPickerOpen((open) => !open)}
                 disabled={selectableModels.length === 0}
-                title={selectedModel?.label ?? 'Enable a provider in Settings'}
+                title={selectedModel ? triggerTitle : 'Enable a provider in Settings'}
               >
-                <span>{triggerLabel}</span>
+                <span className="composer-model-trigger-label">
+                  <span className="composer-model-trigger-model">
+                    {selectedModel?.modelName ?? 'No enabled model'}
+                  </span>
+                  {triggerReasoningLabel ? (
+                    <span className="composer-model-trigger-reasoning">
+                      {triggerReasoningLabel}
+                    </span>
+                  ) : null}
+                </span>
                 <ChevronDown size={14} aria-hidden="true" />
               </button>
               {pickerOpen ? (
                 <div
-                  className="composer-model-menu"
+                  className={
+                    reasoningChoices.length > 0 ?
+                      'composer-model-menu with-reasoning'
+                    : 'composer-model-menu'
+                  }
                   role="dialog"
                   aria-label="Model and reasoning"
                 >

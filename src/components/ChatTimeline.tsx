@@ -5,6 +5,7 @@ import type { AgentTask, ChatMessage as ChatMessageModel } from '../types/task'
 interface ChatTimelineProps {
   task: AgentTask | null
   projectId: string
+  loading?: boolean
   onCodeLinkResult: (message: string) => void
   onCodeLinkError: (message: string) => void
   onTraceChanged: (taskId: string) => void
@@ -16,6 +17,7 @@ interface ChatTimelineProps {
 function ChatTimeline({
   task,
   projectId,
+  loading = false,
   onCodeLinkResult,
   onCodeLinkError,
   onTraceChanged,
@@ -42,27 +44,31 @@ function ChatTimeline({
     timeline.scrollTop = timeline.scrollHeight
   }, [task?.status, traceActivityKey])
 
-  if (!task) {
+  if (!task || loading) {
     return (
       <div className="chat-empty">
         <div className="chat-empty-content">
-          <h3>What do you want SnowAgent to change?</h3>
-          <p>
-            Ask it to inspect code, explain files, open links in Visual Studio,
-            or prepare edits.
-          </p>
-          <div className="suggestion-chips" aria-label="Suggested prompts">
-            {suggestions.map((suggestion) => (
-              <button
-                key={suggestion}
-                type="button"
-                className="suggestion-chip"
-                onClick={() => onSuggestionSelect(suggestion)}
-              >
-                {suggestion}
-              </button>
-            ))}
-          </div>
+          <h3>{loading ? 'Loading conversation...' : 'What do you want SnowAgent to change?'}</h3>
+          {!loading ? (
+            <>
+              <p>
+                Ask it to inspect code, explain files, open links in Visual Studio,
+                or prepare edits.
+              </p>
+              <div className="suggestion-chips" aria-label="Suggested prompts">
+                {suggestions.map((suggestion) => (
+                  <button
+                    key={suggestion}
+                    type="button"
+                    className="suggestion-chip"
+                    onClick={() => onSuggestionSelect(suggestion)}
+                  >
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : null}
         </div>
       </div>
     )

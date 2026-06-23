@@ -77,7 +77,7 @@ function formatHistoryTitle(prompt: string): string {
 }
 
 function formatHistoryTime(task: AgentTask): string {
-  const createdAt = task.messages[0]?.createdAt
+  const createdAt = task.updatedAt ?? task.createdAt ?? task.messages[0]?.createdAt
   if (!createdAt) {
     return ''
   }
@@ -101,7 +101,7 @@ function formatHistoryTime(task: AgentTask): string {
 }
 
 function isWithinRecentDays(task: AgentTask, days: number): boolean {
-  const createdAt = task.messages[0]?.createdAt
+  const createdAt = task.updatedAt ?? task.createdAt ?? task.messages[0]?.createdAt
   if (!createdAt) {
     return false
   }

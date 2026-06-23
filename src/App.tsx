@@ -5,7 +5,7 @@ import {
   importWorkspaceHistory,
   listProjects,
   loadWorkspaceHistory,
-  saveWorkspaceHistory,
+  saveWorkspaceSelection,
 } from './api/tauriApi'
 import Profile from './components/Profile'
 import ProjectList from './components/ProjectList'
@@ -17,7 +17,6 @@ import Workspace from './components/Workspace'
 import {
   ensureWorkspaceProject,
   clearLegacyWorkspaceHistoryState,
-  createWorkspaceHistorySnapshot,
   hasWorkspaceHistory,
   initialAppState,
   latestTaskIdForProject,
@@ -125,8 +124,10 @@ function App() {
       return undefined
     }
     const timeoutId = window.setTimeout(() => {
-      const snapshot = createWorkspaceHistorySnapshot(appState)
-      void saveWorkspaceHistory(snapshot).catch((caught) => {
+      void saveWorkspaceSelection(
+        appState.activeProjectId,
+        appState.currentWorkspaceTaskId,
+      ).catch((caught) => {
         showToast('error', toMessage(caught))
       })
     }, 250)
@@ -136,8 +137,6 @@ function App() {
   }, [
     appState.activeProjectId,
     appState.currentWorkspaceTaskId,
-    appState.taskIdsByProjectId,
-    appState.tasksById,
     historyLoaded,
     showToast,
   ])

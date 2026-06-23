@@ -8,6 +8,7 @@ use crate::project_registry::ProjectSession;
 use crate::tool_trace::ToolTraceEvent;
 
 const MAX_SUFFIX_SCAN_FILES: usize = 50_000;
+const MAX_SUFFIX_SCAN_MATCHES: usize = 64;
 const IGNORED_SUFFIX_SCAN_DIRS: &[&str] = &[
     ".git",
     ".vs",
@@ -50,15 +51,27 @@ pub fn parse_code_link(
     project: &ProjectSession,
     raw_link: &str,
 ) -> Result<OpenFilePayload, String> {
-    let cleaned = raw_link
+    parse_code_link_with_context(project, raw_link, &[])
+}
+
+pub fn parse_code_link_with_context(
+    project: &ProjectSession,
+    raw_link: &str,
+    context_links: &[String],
+) -> Result<OpenFilePayload, String> {
+    let cleaned = clean_raw_link(raw_link);
+    let (path_part, line, column) = split_code_link(cleaned)?;
+    let path = resolve_path(&project.repo_root, path_part, context_links)?;
+
+    Ok(OpenFilePayload { path, line, column })
+}
+
+fn clean_raw_link(raw_link: &str) -> &str {
+    raw_link
         .trim()
         .trim_matches('`')
         .trim_matches('"')
-        .trim_matches('\'');
-    let (path_part, line, column) = split_code_link(cleaned)?;
-    let path = resolve_path(&project.repo_root, path_part)?;
-
-    Ok(OpenFilePayload { path, line, column })
+        .trim_matches('\'')
 }
 
 pub async fn call_vs_open_file(endpoint: &str, payload: &OpenFilePayload) -> Result<(), String> {
@@ -119,16 +132,35 @@ fn split_code_link(raw_link: &str) -> Result<(&str, u32, Option<u32>), String> {
 fn split_numeric_suffix(value: &str) -> Option<(&str, u32)> {
     let index = value.rfind(':')?;
     let suffix = &value[index + 1..];
-    if suffix.is_empty() || !suffix.chars().all(|character| character.is_ascii_digit()) {
-        return None;
-    }
-    suffix
+    let start_line = if let Some((start_line, end_line)) = suffix.split_once('-') {
+        if start_line.is_empty()
+            || end_line.is_empty()
+            || !start_line
+                .chars()
+                .all(|character| character.is_ascii_digit())
+            || !end_line.chars().all(|character| character.is_ascii_digit())
+        {
+            return None;
+        }
+        start_line
+    } else {
+        if suffix.is_empty() || !suffix.chars().all(|character| character.is_ascii_digit()) {
+            return None;
+        }
+        suffix
+    };
+
+    start_line
         .parse::<u32>()
         .ok()
         .map(|number| (&value[..index], number))
 }
 
-fn resolve_path(repo_root: &str, path_part: &str) -> Result<String, String> {
+fn resolve_path(
+    repo_root: &str,
+    path_part: &str,
+    context_links: &[String],
+) -> Result<String, String> {
     let normalized = path_part.trim().replace('/', "\\");
     let path = Path::new(&normalized);
     let repo_root_path = Path::new(repo_root);
@@ -140,7 +172,9 @@ fn resolve_path(repo_root: &str, path_part: &str) -> Result<String, String> {
 
     if !candidate.exists() {
         if !path.is_absolute() {
-            if let Some(suffix_match) = resolve_by_unique_suffix(repo_root_path, path_part)? {
+            if let Some(suffix_match) =
+                resolve_by_unique_suffix(repo_root_path, path_part, context_links)?
+            {
                 return Ok(suffix_match);
             }
         }
@@ -160,7 +194,11 @@ fn resolve_path(repo_root: &str, path_part: &str) -> Result<String, String> {
     Ok(normalize_display_path(&canonical.to_string_lossy()))
 }
 
-fn resolve_by_unique_suffix(repo_root: &Path, path_part: &str) -> Result<Option<String>, String> {
+fn resolve_by_unique_suffix(
+    repo_root: &Path,
+    path_part: &str,
+    context_links: &[String],
+) -> Result<Option<String>, String> {
     let repo_root = match repo_root.canonicalize() {
         Ok(path) => path,
         Err(_) => return Ok(None),
@@ -169,7 +207,7 @@ fn resolve_by_unique_suffix(repo_root: &Path, path_part: &str) -> Result<Option<
         .replace('\\', "/")
         .trim_matches('/')
         .to_ascii_lowercase();
-    if suffix.is_empty() || !suffix.contains('/') {
+    if suffix.is_empty() {
         return Ok(None);
     }
 
@@ -188,12 +226,124 @@ fn resolve_by_unique_suffix(repo_root: &Path, path_part: &str) -> Result<Option<
             })?;
             Ok(Some(normalize_display_path(&canonical.to_string_lossy())))
         }
-        _ => Err(format!(
-            "Code link path is ambiguous: {} matched {} files; include more path segments",
-            normalize_display_path(path_part),
-            matches.len()
-        )),
+        _ => {
+            if let Some(selected) =
+                select_suffix_match_by_context(&repo_root, &matches, context_links)
+            {
+                let canonical = selected.canonicalize().map_err(|error| {
+                    format!(
+                        "Code link path canonicalization failed {}: {error}",
+                        selected.display()
+                    )
+                })?;
+                return Ok(Some(normalize_display_path(&canonical.to_string_lossy())));
+            }
+            Err(format!(
+                "Code link path is ambiguous: {} matched {} files; include more path segments",
+                normalize_display_path(path_part),
+                matches.len()
+            ))
+        }
     }
+}
+
+fn select_suffix_match_by_context(
+    repo_root: &Path,
+    matches: &[PathBuf],
+    context_links: &[String],
+) -> Option<PathBuf> {
+    let context_paths = context_links
+        .iter()
+        .filter_map(|raw_link| context_link_path(repo_root, raw_link))
+        .collect::<Vec<_>>();
+    if context_paths.is_empty() {
+        return None;
+    }
+
+    let mut best_match = None;
+    let mut best_score = 0usize;
+    let mut tied = false;
+    for candidate in matches {
+        let score = context_paths
+            .iter()
+            .map(|context_path| common_path_prefix_score(repo_root, candidate, context_path))
+            .max()
+            .unwrap_or(0);
+        if score > best_score {
+            best_score = score;
+            best_match = Some(candidate.clone());
+            tied = false;
+        } else if score == best_score && score > 0 {
+            tied = true;
+        }
+    }
+
+    if best_score > 0 && !tied {
+        best_match
+    } else {
+        None
+    }
+}
+
+fn context_link_path(repo_root: &Path, raw_link: &str) -> Option<PathBuf> {
+    let cleaned = clean_raw_link(raw_link);
+    let (path_part, _, _) = split_code_link(cleaned).ok()?;
+    let has_path_segments = path_part.contains('\\') || path_part.contains('/');
+    let normalized = path_part.trim().replace('/', "\\");
+    let path = Path::new(&normalized);
+    if !has_path_segments && !path.is_absolute() {
+        return None;
+    }
+
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    if candidate.exists() {
+        return candidate.canonicalize().ok();
+    }
+
+    resolve_context_path_by_unique_suffix(repo_root, path_part)
+}
+
+fn resolve_context_path_by_unique_suffix(repo_root: &Path, path_part: &str) -> Option<PathBuf> {
+    let suffix = normalize_display_path(path_part)
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase();
+    if suffix.is_empty() {
+        return None;
+    }
+
+    let mut matches = Vec::new();
+    let mut scanned = 0usize;
+    find_suffix_matches(repo_root, repo_root, &suffix, &mut matches, &mut scanned).ok()?;
+    if matches.len() == 1 {
+        matches[0].canonicalize().ok()
+    } else {
+        None
+    }
+}
+
+fn common_path_prefix_score(repo_root: &Path, left: &Path, right: &Path) -> usize {
+    let left_parts = relative_path_parts(repo_root, left);
+    let right_parts = relative_path_parts(repo_root, right);
+    left_parts
+        .iter()
+        .zip(right_parts.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn relative_path_parts(repo_root: &Path, path: &Path) -> Vec<String> {
+    let relative = path.strip_prefix(repo_root).unwrap_or(path);
+    normalize_display_path(&relative.to_string_lossy())
+        .replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_ascii_lowercase())
+        .collect()
 }
 
 fn find_suffix_matches(
@@ -203,7 +353,7 @@ fn find_suffix_matches(
     matches: &mut Vec<PathBuf>,
     scanned: &mut usize,
 ) -> Result<(), String> {
-    if *scanned >= MAX_SUFFIX_SCAN_FILES || matches.len() > 1 {
+    if *scanned >= MAX_SUFFIX_SCAN_FILES || matches.len() >= MAX_SUFFIX_SCAN_MATCHES {
         return Ok(());
     }
 
@@ -221,7 +371,7 @@ fn find_suffix_matches(
                 continue;
             }
             find_suffix_matches(repo_root, &path, suffix, matches, scanned)?;
-            if *scanned >= MAX_SUFFIX_SCAN_FILES || matches.len() > 1 {
+            if *scanned >= MAX_SUFFIX_SCAN_FILES || matches.len() >= MAX_SUFFIX_SCAN_MATCHES {
                 return Ok(());
             }
         } else if path.is_file() {
@@ -232,7 +382,7 @@ fn find_suffix_matches(
                 .to_ascii_lowercase();
             if relative.ends_with(suffix) {
                 matches.push(path);
-                if matches.len() > 1 {
+                if matches.len() >= MAX_SUFFIX_SCAN_MATCHES {
                     return Ok(());
                 }
             }
@@ -347,6 +497,73 @@ mod tests {
 
         assert_eq!(payload.line, 240);
         assert!(payload.path.ends_with("part\\wzFigureNavigatorWidget.cpp"));
+    }
+
+    #[test]
+    fn resolves_unique_bare_filename_link() {
+        let root = create_temp_project();
+        let file = root.join("src").join("core").join("wzFigureBrep.cpp");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "int main() {}\n").unwrap();
+
+        let project = test_project(root.to_string_lossy().to_string());
+        let payload = parse_code_link(&project, "wzFigureBrep.cpp:77").unwrap();
+
+        assert_eq!(payload.line, 77);
+        assert!(payload.path.ends_with("src\\core\\wzFigureBrep.cpp"));
+    }
+
+    #[test]
+    fn parses_line_range_link_at_start_line() {
+        let root = create_temp_project();
+        let file = root.join("src").join("core").join("wzFigure.cpp");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "int main() {}\n").unwrap();
+
+        let project = test_project(root.to_string_lossy().to_string());
+        let payload = parse_code_link(&project, "wzFigure.cpp:6-9").unwrap();
+
+        assert_eq!(payload.line, 6);
+        assert_eq!(payload.column, None);
+        assert!(payload.path.ends_with("src\\core\\wzFigure.cpp"));
+    }
+
+    #[test]
+    fn resolves_ambiguous_bare_filename_link_from_message_context() {
+        let root = create_temp_project();
+        let first = root
+            .join("src")
+            .join("core")
+            .join("wz_3D")
+            .join("00 Interface")
+            .join("wzFigureBrep.cpp");
+        let second = root
+            .join("src")
+            .join("core")
+            .join("wz_render_core")
+            .join("00 Interface")
+            .join("wzFigureBrep.cpp");
+        let context = root
+            .join("src")
+            .join("core")
+            .join("wz_render_core")
+            .join("00 Interface")
+            .join("wzFigure.h");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, "int a;\n").unwrap();
+        fs::write(&second, "int b;\n").unwrap();
+        fs::write(&context, "int context;\n").unwrap();
+
+        let project = test_project(root.to_string_lossy().to_string());
+        let context_links = vec!["src/core/wz_render_core/00 Interface/wzFigure.h:59".to_string()];
+        let payload =
+            parse_code_link_with_context(&project, "wzFigureBrep.cpp:77", &context_links).unwrap();
+
+        assert_eq!(payload.line, 77);
+        assert!(payload
+            .path
+            .ends_with("src\\core\\wz_render_core\\00 Interface\\wzFigureBrep.cpp"));
     }
 
     #[test]

@@ -2459,6 +2459,8 @@ fn build_codex_cli_prompt(
     );
     prompt.push_str("Do not run package managers, installers, deploy commands, or broad build/test scripts unless the user explicitly asks for that exact command. If verification would require one of those commands, report the command instead.\n");
     prompt.push_str("Keep trace-relevant behavior explicit in your final response: summarize file changes, validation, and any skipped verification.\n\n");
+    prompt.push_str(code_navigation_response_guidance());
+    prompt.push_str("\n");
     prompt.push_str(&format!("Workspace name: {}\n", project.name));
     prompt.push_str(&format!("Workspace path: {}\n\n", project.repo_root));
     prompt.push_str("Conversation:\n");
@@ -2487,15 +2489,23 @@ fn build_codex_cli_prompt(
 fn system_prompt(project: &ProjectSession, cli_mode: bool) -> String {
     if cli_mode {
         return format!(
-            "You are CodeForge CLI, a command-line coding assistant for the active workspace. Workspace name: \"{}\". Workspace path: {}. Do not identify yourself as a desktop app in CLI mode. Do not infer a specific project name from unrelated prior context; use only the current workspace and the user's request. Use a plain terminal style: no emoji, no marketing copy, and no generic capability list. Do not advertise tools or demo capabilities unless the user asks about them. Never mention calculator or arithmetic demo tools unless directly relevant to the user's request. For a simple greeting, reply with one short sentence asking what task to work on; do not include examples or bullet lists. Internal SnowAgent class or path names may remain unchanged. Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Do not claim rg or text search is precise semantic analysis. Do not execute arbitrary shell commands. Answer concisely and use clickable file:line references when relevant.",
-            project.name, project.repo_root
+            "You are CodeForge CLI, a command-line coding assistant for the active workspace. Workspace name: \"{}\". Workspace path: {}. Do not identify yourself as a desktop app in CLI mode. Do not infer a specific project name from unrelated prior context; use only the current workspace and the user's request. Use a plain terminal style: no emoji, no marketing copy, and no generic capability list. Do not advertise tools or demo capabilities unless the user asks about them. Never mention calculator or arithmetic demo tools unless directly relevant to the user's request. For a simple greeting, reply with one short sentence asking what task to work on; do not include examples or bullet lists. Internal SnowAgent class or path names may remain unchanged. Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Do not claim rg or text search is precise semantic analysis. Do not execute arbitrary shell commands. Answer concisely and use clickable file:line references when relevant. {}",
+            project.name,
+            project.repo_root,
+            code_navigation_response_guidance()
         );
     }
 
     format!(
-        "You are CodeForge Desktop, a coding assistant for the project \"{}\". Repo root: {}. Internal SnowAgent class or path names may remain unchanged. Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Do not claim rg or text search is precise semantic analysis. Do not execute arbitrary shell commands. Answer concisely and use clickable file:line references when relevant.",
-        project.name, project.repo_root
+        "You are CodeForge Desktop, a coding assistant for the project \"{}\". Repo root: {}. Internal SnowAgent class or path names may remain unchanged. Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Do not claim rg or text search is precise semantic analysis. Do not execute arbitrary shell commands. Answer concisely and use clickable file:line references when relevant. {}",
+        project.name,
+        project.repo_root,
+        code_navigation_response_guidance()
     )
+}
+
+fn code_navigation_response_guidance() -> &'static str {
+    "For code-location answers, do not paste C/C++ source code blocks unless the user explicitly asks for source text. Prefer concise Markdown tables with a short description column and a location column. Use compact visible labels but unique link targets, for example [Foo.cpp:123](src/module/Foo.cpp:123). Link targets are local workspace file paths, not URLs: preserve the exact workspace-relative path returned by tools, keep literal spaces in directory names, and do not URL-encode or percent-encode them. For example write [wzShaderProgram.cpp:163](src/core/wz_render_core/09 shader/wzShaderProgram.cpp:163), not [wzShaderProgram.cpp:163](src/core/wz_render_core/09%20shader/wzShaderProgram.cpp:163). The UI displays the short label while opening the unique target in Visual Studio."
 }
 
 fn build_tool_call_test_messages(project: &ProjectSession) -> Vec<Value> {

@@ -3,7 +3,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::agent_runner::{self, AgentRunInput};
 use crate::app_state::{current_settings, lock_error, AppState};
 use crate::code_link::{self, OpenCodeLinkResult, OpenFilePayload};
-use crate::history_store::WorkspaceHistoryState;
+use crate::history_store::{AgentTaskRecord, WorkspaceHistoryState};
 use crate::process_manager;
 use crate::project_registry::{ProjectInput, ProjectSession};
 use crate::tool_registry;
@@ -148,12 +148,53 @@ pub fn load_workspace_history(state: State<'_, AppState>) -> Result<WorkspaceHis
 }
 
 #[tauri::command]
+pub fn load_workspace_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<AgentTaskRecord, String> {
+    let history = state.history.lock().map_err(|_| lock_error())?;
+    history.load_workspace_session(&session_id)
+}
+
+#[tauri::command]
 pub fn save_workspace_history(
     state: State<'_, AppState>,
     history_state: WorkspaceHistoryState,
 ) -> Result<(), String> {
     let mut history = state.history.lock().map_err(|_| lock_error())?;
     history.save_workspace_history(&history_state, false)
+}
+
+#[tauri::command]
+pub fn save_workspace_session(
+    state: State<'_, AppState>,
+    task: AgentTaskRecord,
+    position: i64,
+) -> Result<(), String> {
+    let mut history = state.history.lock().map_err(|_| lock_error())?;
+    history.save_workspace_session(&task, position)
+}
+
+#[tauri::command]
+pub fn save_workspace_selection(
+    state: State<'_, AppState>,
+    active_project_id: Option<String>,
+    current_workspace_task_id: Option<String>,
+) -> Result<(), String> {
+    let history = state.history.lock().map_err(|_| lock_error())?;
+    history.save_workspace_selection(
+        active_project_id.as_deref(),
+        current_workspace_task_id.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub fn delete_workspace_sessions(
+    state: State<'_, AppState>,
+    session_ids: Vec<String>,
+) -> Result<(), String> {
+    let mut history = state.history.lock().map_err(|_| lock_error())?;
+    history.delete_workspace_sessions(&session_ids)
 }
 
 #[tauri::command]
@@ -297,12 +338,15 @@ pub async fn open_code_link(
     project_id: String,
     raw_link: String,
     task_id: Option<String>,
+    context_links: Option<Vec<String>>,
 ) -> Result<OpenCodeLinkResult, String> {
     let project = {
         let projects = state.projects.lock().map_err(|_| lock_error())?;
         projects.get(&project_id)?
     };
-    let payload = match code_link::parse_code_link(&project, &raw_link) {
+    let context_links = context_links.unwrap_or_default();
+    let payload = match code_link::parse_code_link_with_context(&project, &raw_link, &context_links)
+    {
         Ok(payload) => payload,
         Err(error) => {
             record_open_code_link_trace(

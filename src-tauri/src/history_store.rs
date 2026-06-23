@@ -26,6 +26,12 @@ pub struct AgentTaskRecord {
     pub messages: Vec<ChatMessageRecord>,
     pub trace_events: Vec<ToolTraceEvent>,
     pub status: String,
+    #[serde(default = "default_messages_loaded")]
+    pub messages_loaded: bool,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,7 +98,7 @@ impl HistoryStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, prompt, status
+                "SELECT id, project_id, prompt, status, created_at, updated_at
                  FROM conversation_sessions
                  ORDER BY project_id ASC, position ASC, updated_at ASC, id ASC",
             )
@@ -104,26 +110,15 @@ impl HistoryStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(sql_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sql_error)?;
 
-        for (id, project_id, prompt, status) in sessions {
-            let messages = self.load_messages(&id)?;
-            let trace_events = messages
-                .iter()
-                .rev()
-                .find_map(|message| {
-                    message
-                        .trace_events
-                        .as_ref()
-                        .filter(|events| !events.is_empty())
-                        .cloned()
-                })
-                .unwrap_or_default();
-
+        for (id, project_id, prompt, status, created_at, updated_at) in sessions {
             task_ids_by_project_id
                 .entry(project_id.clone())
                 .or_default()
@@ -134,9 +129,12 @@ impl HistoryStore {
                     id,
                     project_id,
                     prompt,
-                    messages,
-                    trace_events,
+                    messages: Vec::new(),
+                    trace_events: Vec::new(),
                     status,
+                    messages_loaded: false,
+                    created_at,
+                    updated_at,
                 },
             );
         }
@@ -146,6 +144,54 @@ impl HistoryStore {
             current_workspace_task_id,
             tasks_by_id,
             task_ids_by_project_id,
+        })
+    }
+
+    pub fn load_workspace_session(&self, session_id: &str) -> Result<AgentTaskRecord, String> {
+        let (id, project_id, prompt, status, created_at, updated_at) = self
+            .conn
+            .query_row(
+                "SELECT id, project_id, prompt, status, created_at, updated_at
+                 FROM conversation_sessions
+                 WHERE id = ?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_error)?
+            .ok_or_else(|| format!("Conversation session not found: {session_id}"))?;
+        let messages = self.load_messages(&id)?;
+        let trace_events = messages
+            .iter()
+            .rev()
+            .find_map(|message| {
+                message
+                    .trace_events
+                    .as_ref()
+                    .filter(|events| !events.is_empty())
+                    .cloned()
+            })
+            .unwrap_or_default();
+
+        Ok(AgentTaskRecord {
+            id,
+            project_id,
+            prompt,
+            messages,
+            trace_events,
+            status,
+            messages_loaded: true,
+            created_at,
+            updated_at,
         })
     }
 
@@ -163,7 +209,9 @@ impl HistoryStore {
         let positions = session_positions(&state.task_ids_by_project_id);
         for task in state.tasks_by_id.values() {
             self.upsert_session(task, positions.get(&task.id).copied().unwrap_or(0))?;
-            self.replace_messages(&task.id, &task.messages)?;
+            if task.messages_loaded {
+                self.replace_messages(&task.id, &task.messages)?;
+            }
             if persist_embedded_traces {
                 for event in &task.trace_events {
                     self.insert_trace_event(&task.id, event)?;
@@ -178,6 +226,58 @@ impl HistoryStore {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn save_workspace_session(
+        &mut self,
+        task: &AgentTaskRecord,
+        position: i64,
+    ) -> Result<(), String> {
+        self.upsert_session(task, position)?;
+        if task.messages_loaded {
+            self.replace_messages(&task.id, &task.messages)?;
+        }
+        Ok(())
+    }
+
+    pub fn save_workspace_selection(
+        &self,
+        active_project_id: Option<&str>,
+        current_workspace_task_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.set_meta_value("active_project_id", active_project_id)?;
+        self.set_meta_value("current_workspace_task_id", current_workspace_task_id)?;
+        Ok(())
+    }
+
+    pub fn delete_workspace_sessions(&mut self, session_ids: &[String]) -> Result<(), String> {
+        for session_id in session_ids {
+            self.conn
+                .execute(
+                    "DELETE FROM trace_events WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(sql_error)?;
+            self.conn
+                .execute(
+                    "DELETE FROM agent_runs WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(sql_error)?;
+            self.conn
+                .execute(
+                    "DELETE FROM conversation_messages WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(sql_error)?;
+            self.conn
+                .execute(
+                    "DELETE FROM conversation_sessions WHERE id = ?1",
+                    params![session_id],
+                )
+                .map_err(sql_error)?;
+        }
         Ok(())
     }
 
@@ -383,16 +483,22 @@ impl HistoryStore {
 
     fn upsert_session(&self, task: &AgentTaskRecord, position: i64) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
-        let created_at = task
-            .messages
-            .first()
-            .map(|message| message.created_at.as_str())
-            .unwrap_or(now.as_str());
-        let updated_at = task
-            .messages
-            .last()
-            .map(|message| message.created_at.as_str())
-            .unwrap_or(now.as_str());
+        let created_at = if !task.created_at.is_empty() {
+            task.created_at.as_str()
+        } else {
+            task.messages
+                .first()
+                .map(|message| message.created_at.as_str())
+                .unwrap_or(now.as_str())
+        };
+        let updated_at = if !task.updated_at.is_empty() {
+            task.updated_at.as_str()
+        } else {
+            task.messages
+                .last()
+                .map(|message| message.created_at.as_str())
+                .unwrap_or(now.as_str())
+        };
         self.conn
             .execute(
                 "INSERT INTO conversation_sessions (
@@ -482,9 +588,17 @@ impl HistoryStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(sql_error)?;
 
+        let mut traces_by_task_id: HashMap<String, Vec<ToolTraceEvent>> = HashMap::new();
         rows.into_iter()
             .map(|row| {
-                let trace_events = self.list_trace_events(&row.task_id)?;
+                let trace_events =
+                    if let Some(trace_events) = traces_by_task_id.get(&row.task_id) {
+                        trace_events.clone()
+                    } else {
+                        let trace_events = self.list_trace_events(&row.task_id)?;
+                        traces_by_task_id.insert(row.task_id.clone(), trace_events.clone());
+                        trace_events
+                    };
                 Ok(ChatMessageRecord {
                     id: row.id,
                     task_id: row.task_id,
@@ -618,6 +732,10 @@ fn session_positions(
     positions
 }
 
+fn default_messages_loaded() -> bool {
+    true
+}
+
 fn enum_text<T: Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_value(value)
         .map_err(json_error)?
@@ -712,6 +830,9 @@ mod tests {
                 ],
                 trace_events: vec![trace.clone()],
                 status: "completed".to_string(),
+                messages_loaded: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:02Z".to_string(),
             },
         );
         let state = WorkspaceHistoryState {
@@ -727,6 +848,14 @@ mod tests {
         store.save_workspace_history(&state, true).unwrap();
         let loaded = store.load_workspace_history().unwrap();
         let loaded_task = loaded.tasks_by_id.get("session-1").unwrap();
+        assert!(!loaded_task.messages_loaded);
+        assert_eq!(loaded_task.messages.len(), 0);
+        assert_eq!(loaded_task.trace_events.len(), 0);
+        assert_eq!(loaded_task.created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(loaded_task.updated_at, "2026-01-01T00:00:02Z");
+
+        let loaded_task = store.load_workspace_session("session-1").unwrap();
+        assert!(loaded_task.messages_loaded);
         assert_eq!(loaded_task.messages.len(), 2);
         assert_eq!(loaded_task.trace_events.len(), 1);
         assert_eq!(

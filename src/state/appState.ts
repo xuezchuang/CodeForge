@@ -434,9 +434,17 @@ function readTasksById(value: unknown): Record<string, AgentTask> {
   )
 }
 
+export function normalizeAgentTask(task: AgentTask): AgentTask {
+  return restorePersistedTask(task)
+}
+
 function restorePersistedTask(task: AgentTask): AgentTask {
+  const normalizedTask = {
+    ...task,
+    messagesLoaded: task.messagesLoaded ?? true,
+  }
   if (task.status !== 'running' && task.status !== 'failed') {
-    return task
+    return normalizedTask
   }
 
   const messages = task.messages.map((message) =>
@@ -444,11 +452,11 @@ function restorePersistedTask(task: AgentTask): AgentTask {
   )
   const messagesChanged = messages.some((message, index) => message !== task.messages[index])
   if (task.status === 'failed' && !messagesChanged) {
-    return task
+    return normalizedTask
   }
 
   return {
-    ...task,
+    ...normalizedTask,
     status: 'failed',
     messages: messagesChanged ? messages : task.messages,
   }

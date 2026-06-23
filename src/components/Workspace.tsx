@@ -2,12 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
+  deleteWorkspaceSessions,
   listTools,
   listTraces,
+  loadWorkspaceSession,
   openVisualStudio,
   runAgent,
+  saveWorkspaceSession,
   type ToolDefinitionSummary,
 } from '../api/tauriApi'
+import { normalizeAgentTask } from '../state/appState'
 import type { AppState } from '../state/appState'
 import type { AgentTask, ChatMessage, MessageAttachment } from '../types/task'
 import type { AgentConversationMessage, ToolTraceEvent } from '../types/trace'
@@ -47,17 +51,107 @@ function Workspace({
   const [workspaceToast, setWorkspaceToast] = useState<ToastState | null>(null)
   const [headerDivided, setHeaderDivided] = useState(false)
   const [selectedTrace, setSelectedTrace] = useState<SelectedTrace | null>(null)
+  const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null)
   const activeProject = useMemo(
     () =>
       state.projects.find((project) => project.id === state.activeProjectId) ??
       null,
     [state.activeProjectId, state.projects],
   )
+  const activeProjectId = activeProject?.id ?? null
   const currentTask =
     state.currentWorkspaceTaskId ?
       state.tasksById[state.currentWorkspaceTaskId] ?? null
     : null
   const selectedTraceEvents = selectedTrace?.events ?? []
+  const currentTaskPersistenceKey =
+    currentTask && currentTask.messagesLoaded !== false && currentTask.status !== 'running' ?
+      [
+        currentTask.id,
+        currentTask.status,
+        currentTask.messages.length,
+        currentTask.updatedAt ?? '',
+        currentTask.messages
+          .map((message) => [
+            message.id,
+            message.taskId,
+            message.status ?? '',
+            message.createdAt,
+            message.content.length,
+          ].join(':'))
+          .join('|'),
+      ].join('::')
+    : ''
+
+  useEffect(() => {
+    if (!currentTask || currentTask.messagesLoaded !== false) {
+      return undefined
+    }
+
+    let cancelled = false
+    setLoadingSessionId(currentTask.id)
+    loadWorkspaceSession(currentTask.id)
+      .then((loadedTask) => {
+        if (cancelled) {
+          return
+        }
+        const normalizedTask = normalizeAgentTask(loadedTask)
+        setState((current) => {
+          if (!current.tasksById[normalizedTask.id]) {
+            return current
+          }
+          return {
+            ...current,
+            tasksById: {
+              ...current.tasksById,
+              [normalizedTask.id]: normalizedTask,
+            },
+          }
+        })
+      })
+      .catch((caught) => {
+        if (!cancelled) {
+          onGlobalError(caught instanceof Error ? caught.message : String(caught))
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoadingSessionId(null)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [currentTask, onGlobalError, setState])
+
+  useEffect(() => {
+    if (!activeProjectId || !currentTask || currentTask.messagesLoaded === false) {
+      return undefined
+    }
+    if (currentTask.status === 'running') {
+      return undefined
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      const position = Math.max(
+        0,
+        (state.taskIdsByProjectId[activeProjectId] ?? []).indexOf(currentTask.id),
+      )
+      void saveWorkspaceSession(currentTask, position).catch((caught) => {
+        onGlobalError(caught instanceof Error ? caught.message : String(caught))
+      })
+    }, 250)
+
+    return () => {
+      window.clearTimeout(timeoutId)
+    }
+  }, [
+    activeProjectId,
+    currentTaskPersistenceKey,
+    onGlobalError,
+    state.taskIdsByProjectId,
+  ])
 
   const updateHeaderDivider = useCallback(() => {
     const workspace = workspaceRef.current
@@ -190,6 +284,8 @@ function Workspace({
           messages: [...currentTask.messages, userMessage, pendingAssistantMessage],
           traceEvents: [],
           status: 'running',
+          messagesLoaded: true,
+          updatedAt: pendingAssistantMessage.createdAt,
         }
       : {
           id: sessionTaskId,
@@ -198,6 +294,9 @@ function Workspace({
           messages: [userMessage, pendingAssistantMessage],
           traceEvents: [],
           status: 'running',
+          messagesLoaded: true,
+          createdAt: userMessage.createdAt,
+          updatedAt: pendingAssistantMessage.createdAt,
         }
     let unlisten: UnlistenFn | null = null
 
@@ -422,8 +521,8 @@ function Workspace({
     if (!activeProject) {
       return
     }
+    const taskIds = state.taskIdsByProjectId[activeProject.id] ?? []
     setState((current) => {
-      const taskIds = current.taskIdsByProjectId[activeProject.id] ?? []
       const tasksById = { ...current.tasksById }
       taskIds.forEach((taskId) => {
         delete tasksById[taskId]
@@ -439,6 +538,12 @@ function Workspace({
         },
       }
     })
+    if (taskIds.length > 0) {
+      void deleteWorkspaceSessions(taskIds).catch((caught) => {
+        showWorkspaceToast('error', caught instanceof Error ? caught.message : String(caught))
+      })
+    }
+    setSelectedTrace(null)
     setComposerDraft('')
     showWorkspaceToast('notice', 'Workspace cleared.')
   }
@@ -474,6 +579,7 @@ function Workspace({
             <ChatTimeline
               task={currentTask}
               projectId={activeProject.id}
+              loading={currentTask?.messagesLoaded === false || loadingSessionId === currentTask?.id}
               onCodeLinkResult={(message) => showWorkspaceToast('notice', message)}
               onCodeLinkError={(message) =>
                 showWorkspaceToast('error', normalizeCodeLinkError(message))
@@ -487,7 +593,7 @@ function Workspace({
             />
             <Composer
               providers={state.providers}
-              busy={busy}
+              busy={busy || currentTask?.messagesLoaded === false}
               value={composerDraft}
               onChange={setComposerDraft}
               onSend={runTask}
@@ -526,7 +632,7 @@ function addOrReplaceSessionTask(
     currentWorkspaceTaskId: task.id,
     tasksById: {
       ...state.tasksById,
-      [task.id]: task,
+      [task.id]: withTaskPersistenceMetadata(task),
     },
     taskIdsByProjectId: {
       ...state.taskIdsByProjectId,
@@ -552,12 +658,17 @@ function appendMessagesToSession(
       messages: [],
       traceEvents: [],
       status,
+      messagesLoaded: true,
+      createdAt: messages[0]?.createdAt,
+      updatedAt: messages.at(-1)?.createdAt,
     }
 
   return addOrReplaceSessionTask(state, projectId, {
     ...task,
     messages: [...task.messages, ...messages],
     status,
+    messagesLoaded: true,
+    updatedAt: messages.at(-1)?.createdAt ?? task.updatedAt,
   })
 }
 
@@ -594,6 +705,8 @@ function completeSessionRun(
         ),
         traceEvents: mergedTraces,
         status: failed ? 'failed' : 'completed',
+        messagesLoaded: true,
+        updatedAt: completedAssistantMessage.createdAt,
       },
     },
   }
@@ -712,8 +825,19 @@ function failSessionRun(
         ...task,
         messages: replaceMessageById(task.messages, pendingAssistantMessageId, failedMessage),
         status: 'failed',
+        messagesLoaded: true,
+        updatedAt: failedMessage.createdAt,
       },
     },
+  }
+}
+
+function withTaskPersistenceMetadata(task: AgentTask): AgentTask {
+  return {
+    ...task,
+    messagesLoaded: task.messagesLoaded ?? true,
+    createdAt: task.createdAt ?? task.messages[0]?.createdAt,
+    updatedAt: task.updatedAt ?? task.messages.at(-1)?.createdAt,
   }
 }
 

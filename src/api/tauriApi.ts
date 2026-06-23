@@ -19,6 +19,7 @@ import type {
   VSRegisterPayload,
 } from '../types/vs'
 import type { ProviderModel } from '../types/provider'
+import type { AgentTask } from '../types/task'
 
 export interface ToolDefinitionSummary {
   name: string
@@ -95,10 +96,32 @@ export function loadWorkspaceHistory(): Promise<WorkspaceHistoryState> {
   return call<WorkspaceHistoryState>('load_workspace_history')
 }
 
+export function loadWorkspaceSession(sessionId: string): Promise<AgentTask> {
+  return call<AgentTask>('load_workspace_session', { sessionId })
+}
+
 export function saveWorkspaceHistory(
   historyState: WorkspaceHistoryState,
 ): Promise<void> {
   return call<void>('save_workspace_history', { historyState })
+}
+
+export function saveWorkspaceSession(task: AgentTask, position: number): Promise<void> {
+  return call<void>('save_workspace_session', { task, position })
+}
+
+export function saveWorkspaceSelection(
+  activeProjectId: string | null,
+  currentWorkspaceTaskId: string | null,
+): Promise<void> {
+  return call<void>('save_workspace_selection', {
+    activeProjectId,
+    currentWorkspaceTaskId,
+  })
+}
+
+export function deleteWorkspaceSessions(sessionIds: string[]): Promise<void> {
+  return call<void>('delete_workspace_sessions', { sessionIds })
 }
 
 export function importWorkspaceHistory(
@@ -130,11 +153,13 @@ export function openCodeLink(
   projectId: string,
   rawLink: string,
   taskId: string | null,
+  contextLinks?: string[],
 ): Promise<OpenCodeLinkResult> {
   return call<OpenCodeLinkResult>('open_code_link', {
     projectId,
     rawLink,
     taskId,
+    contextLinks,
   })
 }
 

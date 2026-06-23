@@ -17,7 +17,7 @@ import {
   X,
 } from 'lucide-react'
 import CodeLink from './CodeLink'
-import { containsCodeLink, renderTextWithCodeLinks } from './codeLinkText'
+import { containsCodeLink, extractCodeLinksFromText, renderTextWithCodeLinks } from './codeLinkText'
 import { sanitizeModelMessage } from './traceViewModel'
 import type { ChatMessage as ChatMessageModel } from '../types/task'
 import type { ToolTraceEvent } from '../types/trace'
@@ -172,6 +172,7 @@ function ChatMessage({
                   projectId={projectId}
                   taskId={message.taskId}
                   rawLink={link.rawLink}
+                  resolutionContext={message.codeLinks?.map((item) => item.rawLink)}
                   onResult={onCodeLinkResult}
                   onError={onCodeLinkError}
                   onTraceChanged={() => onTraceChanged(message.taskId)}
@@ -355,6 +356,17 @@ interface MarkdownCodeBlockProps {
   language: string
 }
 
+interface MarkdownCodeLineData {
+  code: string
+  language: string
+}
+
+interface MarkdownTableData {
+  headers: string[]
+  rows: string[][]
+  nextLineIndex: number
+}
+
 const THINKING_PREFIX = 'Thinking...\n\n'
 const THINKING_RUNNING_TEXT = 'Thinking...'
 
@@ -433,10 +445,12 @@ function MarkdownMessage({
   onCodeLinkError,
   onTraceChanged,
 }: MarkdownMessageProps) {
+  const codeLinkContext = extractCodeLinksFromText(text)
   const blocks = renderMarkdownBlocks(
     text,
     projectId,
     taskId,
+    codeLinkContext,
     onCodeLinkResult,
     onCodeLinkError,
     onTraceChanged,
@@ -449,6 +463,7 @@ function renderMarkdownBlocks(
   text: string,
   projectId: string,
   taskId: string | null,
+  codeLinkContext: string[],
   onCodeLinkResult: (message: string) => void,
   onCodeLinkError: (message: string) => void,
   onTraceChanged: () => void,
@@ -467,6 +482,7 @@ function renderMarkdownBlocks(
       keyPrefix,
       projectId,
       taskId,
+      codeLinkContext,
       onCodeLinkResult,
       onCodeLinkError,
       onTraceChanged,
@@ -513,7 +529,8 @@ function renderMarkdownBlocks(
     flushList()
   }
 
-  for (const [lineIndex, line] of lines.entries()) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex]
     const fenceMatch = line.match(/^```([\w#+.-]*)\s*$/)
     if (fenceMatch) {
       if (codeLines) {
@@ -541,6 +558,39 @@ function renderMarkdownBlocks(
 
     if (line.trim().length === 0) {
       flushTextBlocks()
+      continue
+    }
+
+    const codeLine = parseMarkdownCodeLine(line)
+    if (codeLine) {
+      flushTextBlocks()
+      blocks.push(
+        <MarkdownCodeLine
+          key={`code-line-${blocks.length}`}
+          code={codeLine.code}
+          language={codeLine.language}
+        />,
+      )
+      continue
+    }
+
+    if (isMarkdownHorizontalRule(line)) {
+      flushTextBlocks()
+      blocks.push(<hr key={`hr-${blocks.length}`} className="markdown-divider" />)
+      continue
+    }
+
+    const table = parseMarkdownTable(lines, lineIndex)
+    if (table) {
+      flushTextBlocks()
+      blocks.push(
+        <MarkdownTable
+          key={`table-${blocks.length}`}
+          table={table}
+          renderInline={(value, keyPrefix) => renderInline(value, keyPrefix)}
+        />,
+      )
+      lineIndex = table.nextLineIndex - 1
       continue
     }
 
@@ -587,10 +637,230 @@ function renderMarkdownBlocks(
   return blocks.length > 0 ? blocks : [text]
 }
 
+function parseMarkdownCodeLine(line: string): MarkdownCodeLineData | null {
+  const trimmed = line.trim()
+  const languageTokenPrefix = trimmed.match(/^`([A-Za-z][\w#+.-]*)`\s+(.+)$/)
+  if (
+    languageTokenPrefix &&
+    isCodeLanguage(languageTokenPrefix[1]) &&
+    looksLikeCodeLine(languageTokenPrefix[2])
+  ) {
+    return {
+      language: normalizeCodeLanguage(languageTokenPrefix[1]),
+      code: languageTokenPrefix[2].trim(),
+    }
+  }
+
+  const singleTick = trimmed.match(/^`([A-Za-z][\w#+.-]*)\s+(.+)`$/)
+  if (singleTick && isCodeLanguage(singleTick[1])) {
+    return {
+      language: normalizeCodeLanguage(singleTick[1]),
+      code: singleTick[2].trim(),
+    }
+  }
+
+  const tripleTick = trimmed.match(/^```([A-Za-z][\w#+.-]*)\s+(.+)```$/)
+  if (tripleTick && isCodeLanguage(tripleTick[1])) {
+    return {
+      language: normalizeCodeLanguage(tripleTick[1]),
+      code: tripleTick[2].trim(),
+    }
+  }
+
+  return null
+}
+
+function looksLikeCodeLine(value: string): boolean {
+  return /[;{}()[\]=]|->|::|\/\/|#include/.test(value)
+}
+
+function isCodeLanguage(value: string): boolean {
+  return [
+    'c',
+    'cc',
+    'cpp',
+    'cxx',
+    'c++',
+    'h',
+    'hpp',
+    'cs',
+    'ts',
+    'tsx',
+    'js',
+    'jsx',
+    'rs',
+    'rust',
+    'json',
+    'xml',
+    'toml',
+    'ini',
+    'bat',
+    'cmd',
+    'powershell',
+    'ps1',
+  ].includes(value.toLowerCase())
+}
+
+function normalizeCodeLanguage(value: string): string {
+  return value.toLowerCase() === 'c++' ? 'cpp' : value
+}
+
+function MarkdownCodeLine({ code, language }: MarkdownCodeLineData) {
+  if (shouldSuppressSourceCodeBlock(language)) {
+    return null
+  }
+  return (
+    <pre className="markdown-code-block markdown-code-line" data-language={language}>
+      <code>{code}</code>
+    </pre>
+  )
+}
+
+function isMarkdownHorizontalRule(line: string): boolean {
+  return /^(\s*)(-{3,}|\*{3,}|_{3,})\s*$/.test(line)
+}
+
+function parseMarkdownTable(lines: string[], startIndex: number): MarkdownTableData | null {
+  if (startIndex + 1 >= lines.length) {
+    return null
+  }
+  const headers = parseMarkdownTableRow(lines[startIndex])
+  const separatorCellCount = parseMarkdownTableSeparator(lines[startIndex + 1])
+  if (!headers || separatorCellCount !== headers.length) {
+    return null
+  }
+
+  const rows: string[][] = []
+  let nextLineIndex = startIndex + 2
+  while (nextLineIndex < lines.length) {
+    const row = parseMarkdownTableRow(lines[nextLineIndex])
+    if (!row) {
+      break
+    }
+    rows.push(normalizeMarkdownTableRow(row, headers.length))
+    nextLineIndex += 1
+  }
+
+  return {
+    headers,
+    rows,
+    nextLineIndex,
+  }
+}
+
+function parseMarkdownTableSeparator(line: string): number | null {
+  const cells = parseMarkdownTableRow(line)
+  if (!cells) {
+    return null
+  }
+  if (cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()))) {
+    return cells.length
+  }
+  return null
+}
+
+function parseMarkdownTableRow(line: string): string[] | null {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('|') || !trimmed.endsWith('|')) {
+    return null
+  }
+  const cells = splitMarkdownTableCells(trimmed)
+  if (cells.length < 2) {
+    return null
+  }
+  return cells.map((cell) => cell.trim())
+}
+
+function splitMarkdownTableCells(line: string): string[] {
+  const cells: string[] = []
+  const content = line.slice(1, -1)
+  let current = ''
+  let inCode = false
+  let escaping = false
+
+  for (const character of content) {
+    if (escaping) {
+      current += character
+      escaping = false
+      continue
+    }
+    if (character === '\\') {
+      escaping = true
+      continue
+    }
+    if (character === '`') {
+      inCode = !inCode
+      current += character
+      continue
+    }
+    if (character === '|' && !inCode) {
+      cells.push(current)
+      current = ''
+      continue
+    }
+    current += character
+  }
+
+  if (escaping) {
+    current += '\\'
+  }
+  cells.push(current)
+  return cells
+}
+
+function normalizeMarkdownTableRow(row: string[], expectedLength: number): string[] {
+  if (row.length === expectedLength) {
+    return row
+  }
+  if (row.length > expectedLength) {
+    return row.slice(0, expectedLength)
+  }
+  return [...row, ...Array.from({ length: expectedLength - row.length }, () => '')]
+}
+
+function MarkdownTable({
+  table,
+  renderInline,
+}: {
+  table: MarkdownTableData
+  renderInline: (value: string, keyPrefix: string) => ReactNode[]
+}) {
+  return (
+    <div className="markdown-table-wrap">
+      <table className="markdown-table">
+        <thead>
+          <tr>
+            {table.headers.map((header, index) => (
+              <th key={`${index}-${header}`}>
+                {renderInline(header, `table-h-${index}`)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {table.rows.map((row, rowIndex) => (
+            <tr key={`${rowIndex}-${row.join('|')}`}>
+              {row.map((cell, cellIndex) => (
+                <td key={`${cellIndex}-${cell}`}>
+                  {renderInline(cell, `table-${rowIndex}-${cellIndex}`)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 function MarkdownCodeBlock({ code, language }: MarkdownCodeBlockProps) {
   const [open, setOpen] = useState(false)
   const lineCount = code.length === 0 ? 0 : code.split('\n').length
   const label = language ? language.toUpperCase() : 'CODE'
+
+  if (shouldSuppressSourceCodeBlock(language)) {
+    return null
+  }
 
   return (
     <section className={open ? 'markdown-code-section open' : 'markdown-code-section'}>
@@ -637,6 +907,7 @@ function renderInlineMarkdown(
   keyPrefix: string,
   projectId: string,
   taskId: string | null,
+  codeLinkContext: string[],
   onCodeLinkResult: (message: string) => void,
   onCodeLinkError: (message: string) => void,
   onTraceChanged: () => void,
@@ -656,6 +927,7 @@ function renderInlineMarkdown(
             onCodeLinkResult,
             onCodeLinkError,
             onTraceChanged,
+            codeLinkContext,
           ).map((node, nodeIndex) => (
             <span key={`${keyPrefix}-code-link-${index}-${nodeIndex}`}>{node}</span>
           )),
@@ -680,6 +952,7 @@ function renderInlineMarkdown(
             onCodeLinkResult,
             onCodeLinkError,
             onTraceChanged,
+            codeLinkContext,
           )}
         </strong>,
       )
@@ -694,6 +967,7 @@ function renderInlineMarkdown(
         onCodeLinkResult,
         onCodeLinkError,
         onTraceChanged,
+        codeLinkContext,
       ).map((node, nodeIndex) => (
         <span key={`${keyPrefix}-${index}-${nodeIndex}`}>{node}</span>
       )),
@@ -907,6 +1181,12 @@ function isClickableToolTrace(event: ToolTraceEvent): boolean {
   return Boolean(
     event.toolName &&
       (event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'error'),
+  )
+}
+
+function shouldSuppressSourceCodeBlock(language: string): boolean {
+  return ['c', 'cc', 'cpp', 'cxx', 'c++', 'h', 'hh', 'hpp'].includes(
+    language.trim().toLowerCase(),
   )
 }
 

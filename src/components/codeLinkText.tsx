@@ -2,7 +2,9 @@ import type { ReactNode } from 'react'
 import CodeLink from './CodeLink'
 
 const codeLinkPattern =
-  /((?:[A-Za-z]:[\\/](?:[^<>:"|?*\r\n]+[\\/])*[^<>:"|?*\r\n]+\.(?:c|cc|cpp|cxx|h|hh|hpp|cs|ts|tsx|rs|ini|uplugin|uproject))|(?:[^\s<>:"|?*\r\n\\/]+[\\/](?:[^\s<>:"|?*\r\n\\/][^<>:"|?*\r\n\\/]*[\\/])*[^\s<>:"|?*\r\n\\/][^<>:"|?*\r\n\\/]*\.(?:c|cc|cpp|cxx|h|hh|hpp|cs|ts|tsx|rs|ini|uplugin|uproject))):\d+(?::\d+)?/gi
+  /((?:[A-Za-z]:[\\/](?:[^<>:"|?*\r\n]+[\\/])*[^<>:"|?*\r\n]+\.(?:c|cc|cpp|cxx|h|hh|hpp|cs|ts|tsx|rs|ini|uplugin|uproject))|(?:[^\s<>:"|?*\r\n\\/]+[\\/](?:[^\s<>:"|?*\r\n\\/][^<>:"|?*\r\n\\/]*[\\/])*[^\s<>:"|?*\r\n\\/][^<>:"|?*\r\n\\/]*\.(?:c|cc|cpp|cxx|h|hh|hpp|cs|ts|tsx|rs|ini|uplugin|uproject))):\d+(?:-\d+)?(?::\d+)?/gi
+const bareCodeLinkPattern =
+  /(^|[^\w/\\.-])([^\s<>:"|?*`()[\],;\\/]+\.(?:c|cc|cpp|cxx|h|hh|hpp|cs|ts|tsx|rs|ini|uplugin|uproject):\d+(?:-\d+)?(?::\d+)?)(?=$|[^\w/\\.-])/gi
 const markdownLinkLikePattern = /\[([^\]\r\n]+)\](?:\(([^)\r\n]+)\))?/g
 
 export function renderTextWithCodeLinks(
@@ -12,6 +14,7 @@ export function renderTextWithCodeLinks(
   onResult?: (message: string) => void,
   onError?: (message: string) => void,
   onTraceChanged?: () => void,
+  resolutionContext?: string[],
 ): ReactNode[] {
   const nodes: ReactNode[] = []
   let lastIndex = 0
@@ -29,6 +32,8 @@ export function renderTextWithCodeLinks(
         projectId={projectId}
         taskId={taskId}
         rawLink={rawLink}
+        displayText={match.displayText}
+        resolutionContext={resolutionContext}
         onResult={onResult}
         onError={onError}
         onTraceChanged={onTraceChanged}
@@ -54,6 +59,7 @@ export function containsCodeLink(text: string): boolean {
 
 interface CodeLinkMatch {
   rawLink: string
+  displayText?: string
   start: number
   end: number
 }
@@ -63,13 +69,16 @@ function collectCodeLinkMatches(text: string): CodeLinkMatch[] {
 
   markdownLinkLikePattern.lastIndex = 0
   for (const match of text.matchAll(markdownLinkLikePattern)) {
-    const rawLink = firstCodeLinkInText(match[1]) ?? codeLinkFromMarkdownTarget(match[2])
+    const targetLink = codeLinkFromMarkdownTarget(match[2])
+    const labelLink = firstCodeLinkInText(match[1])
+    const rawLink = targetLink ?? labelLink
     if (!rawLink) {
       continue
     }
     const start = match.index ?? 0
     matches.push({
       rawLink,
+      displayText: match[1],
       start,
       end: start + match[0].length,
     })
@@ -86,6 +95,17 @@ function collectCodeLinkMatches(text: string): CodeLinkMatch[] {
     matches.push({ rawLink, start, end })
   }
 
+  bareCodeLinkPattern.lastIndex = 0
+  for (const match of text.matchAll(bareCodeLinkPattern)) {
+    const rawLink = match[2]
+    const start = (match.index ?? 0) + match[1].length
+    const end = start + rawLink.length
+    if (matches.some((existing) => rangesOverlap(start, end, existing.start, existing.end))) {
+      continue
+    }
+    matches.push({ rawLink, start, end })
+  }
+
   return matches.sort((left, right) => left.start - right.start)
 }
 
@@ -94,7 +114,14 @@ function firstCodeLinkInText(text: string | undefined): string | null {
     return null
   }
   codeLinkPattern.lastIndex = 0
-  return codeLinkPattern.exec(text)?.[0] ?? null
+  const direct = codeLinkPattern.exec(text)?.[0]
+  if (direct) {
+    return direct
+  }
+
+  bareCodeLinkPattern.lastIndex = 0
+  const bare = bareCodeLinkPattern.exec(text)
+  return bare?.[2] ?? null
 }
 
 function codeLinkFromMarkdownTarget(target: string | undefined): string | null {

@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use codeforge_core::office_tools;
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
 };
@@ -12,15 +13,21 @@ use crate::agent::stream::StreamingChatCompletionAccumulator;
 use crate::codex_cli_runner::{self, CODEX_CLI_PROVIDER_TYPE, CODEX_CLI_TOOL_NAME};
 use crate::goal_state::GoalState;
 use crate::project_registry::ProjectSession;
-use crate::tool_registry::{self, ToolExecutionContext, CALCULATOR_ADD_TOOL_NAME};
+use crate::tool_interface::ToolOutput;
+use crate::tool_registry::{
+    self, ToolExecutionContext, CALCULATOR_ADD_TOOL_NAME, PRESENTATION_READ_PPTX_TOOL_NAME,
+};
 use crate::tool_trace::{self, MockAgentRun, ToolTraceEvent, TraceEventType, TraceStatus};
-use crate::vs_registry::{AppSettings, ProviderConfig, ProviderCredential, ProviderModel};
+use crate::vs_registry::{
+    infer_model_supports_vision, AppSettings, ProviderConfig, ProviderCredential, ProviderModel,
+};
 
 pub const TOOL_CALL_TEST_PROMPT: &str = "请必须调用 calculator.add 工具计算 1+1，然后告诉我结果。";
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 32;
 const EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT: usize = 1;
 const MODEL_REQUEST_TIMEOUT_SECONDS: u64 = 360;
 const STREAMING_TRACE_INTERVAL_MS: u64 = 750;
+const PPTX_IMAGE_ANALYSIS_BATCH_SIZE: usize = 16;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -814,6 +821,8 @@ async fn run_openai_tool_agent_loop(
             }
         }
 
+        let mut post_tool_messages = Vec::new();
+
         for tool_call in tool_calls {
             let arguments = match parse_tool_arguments(&tool_call.function.arguments) {
                 Ok(arguments) => arguments,
@@ -899,7 +908,21 @@ async fn run_openai_tool_agent_loop(
             *step_index += 1;
 
             messages.push(build_tool_result_message(&tool_call, &tool_result));
+            append_pptx_image_followup(
+                selected,
+                tool_context.workspace_root,
+                task_id,
+                traces,
+                step_index,
+                on_trace,
+                &tool_call.function.name,
+                &result,
+                &mut post_tool_messages,
+            )
+            .await;
         }
+
+        messages.extend(post_tool_messages);
     }
 
     Ok(())
@@ -918,6 +941,409 @@ fn openai_tool_definitions(
     } else {
         tool_registry::tool_definitions()
     }
+}
+
+async fn append_pptx_image_followup(
+    selected: &SelectedModel,
+    workspace_root: &str,
+    task_id: &str,
+    traces: &mut Vec<ToolTraceEvent>,
+    step_index: &mut u32,
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
+    tool_name: &str,
+    result: &ToolOutput,
+    post_tool_messages: &mut Vec<Value>,
+) {
+    if tool_name != PRESENTATION_READ_PPTX_TOOL_NAME || !result.is_ok() {
+        return;
+    }
+    let Some(output) = result.output.as_ref() else {
+        return;
+    };
+    let image_count = pptx_output_image_count(output);
+    if image_count == 0 {
+        return;
+    }
+
+    if !selected_model_supports_vision(selected) {
+        let message = format!(
+            "The selected model is configured as text-only or has no known vision support. The previous presentation/read_pptx result found {image_count} embedded PPT image(s), but their visual contents were not sent or understood. Do not infer image contents; say explicitly that PPT images were not interpreted."
+        );
+        post_tool_messages.push(json!({
+            "role": "user",
+            "content": message,
+        }));
+        push_trace(
+            traces,
+            trace(
+                task_id,
+                *step_index,
+                TraceEventType::ToolResult,
+                Some(PRESENTATION_READ_PPTX_TOOL_NAME),
+                "pptx_images_not_forwarded",
+                Some(json!({
+                    "model": selected.model_id,
+                    "imageCount": image_count,
+                    "supportsVision": false,
+                })),
+                Some(json!({
+                    "forwarded": false,
+                    "reason": "selected model does not support images",
+                })),
+                Some(format!(
+                    "Skipped {image_count} PPT image(s): model has no vision support"
+                )),
+                TraceStatus::Warning,
+                0,
+            ),
+            on_trace,
+        );
+        *step_index += 1;
+        return;
+    }
+
+    match office_tools::pptx_model_image_attachments(workspace_root, output) {
+        Ok(payload) => {
+            let available = pptx_payload_attachment_count(&payload);
+            let skipped = pptx_payload_skipped_count(&payload);
+            if available == 0 {
+                post_tool_messages.push(json!({
+                    "role": "user",
+                    "content": format!(
+                        "The previous presentation/read_pptx result found {image_count} embedded PPT image(s), but none could be analyzed because they were unsupported, missing, or too large. Do not infer image contents."
+                    ),
+                }));
+                push_trace(
+                    traces,
+                    trace(
+                        task_id,
+                        *step_index,
+                        TraceEventType::ToolResult,
+                        Some(PRESENTATION_READ_PPTX_TOOL_NAME),
+                        "pptx_images_not_analyzed",
+                        Some(json!({
+                            "model": selected.model_id,
+                            "imageCount": image_count,
+                            "supportsVision": true,
+                        })),
+                        Some(redact_trace_value(&payload)),
+                        Some(format!("Analyzed 0 PPT image(s), skipped {skipped}")),
+                        TraceStatus::Warning,
+                        0,
+                    ),
+                    on_trace,
+                );
+                *step_index += 1;
+                return;
+            }
+
+            match analyze_pptx_images(selected, &payload, task_id, traces, step_index, on_trace)
+                .await
+            {
+                Ok(analyses) => {
+                    post_tool_messages.push(build_pptx_image_analysis_followup_message(
+                        image_count,
+                        skipped,
+                        &analyses,
+                    ));
+                    push_trace(
+                        traces,
+                        trace(
+                            task_id,
+                            *step_index,
+                            TraceEventType::ToolResult,
+                            Some(PRESENTATION_READ_PPTX_TOOL_NAME),
+                            "pptx_image_analyses_ready",
+                            Some(json!({
+                                "model": selected.model_id,
+                                "imageCount": image_count,
+                                "analyzedImageCount": available,
+                                "skippedImageCount": skipped,
+                            })),
+                            Some(json!({
+                                "analysisBatchCount": analyses.len(),
+                                "imageAnalyses": analyses,
+                            })),
+                            Some(format!(
+                                "Prepared PPT image analyses for {available} image(s), skipped {skipped}"
+                            )),
+                            TraceStatus::Success,
+                            0,
+                        ),
+                        on_trace,
+                    );
+                    *step_index += 1;
+                }
+                Err(error) => {
+                    post_tool_messages.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "The previous presentation/read_pptx result found {image_count} embedded PPT image(s), but CodeForge failed to analyze them with the selected vision model: {error}. Do not infer image contents."
+                        ),
+                    }));
+                    push_trace(
+                        traces,
+                        error_trace(
+                            task_id,
+                            *step_index,
+                            "pptx image analysis failed",
+                            Some(json!({
+                                "model": selected.model_id,
+                                "imageCount": image_count,
+                            })),
+                            &error,
+                        ),
+                        on_trace,
+                    );
+                    *step_index += 1;
+                }
+            }
+        }
+        Err(error) => {
+            post_tool_messages.push(json!({
+                "role": "user",
+                "content": format!(
+                    "The previous presentation/read_pptx result found {image_count} embedded PPT image(s), but CodeForge failed to prepare them for the model: {error}. Do not infer image contents."
+                ),
+            }));
+            push_trace(
+                traces,
+                error_trace(
+                    task_id,
+                    *step_index,
+                    "pptx image forwarding failed",
+                    Some(json!({
+                        "model": selected.model_id,
+                        "imageCount": image_count,
+                    })),
+                    &error,
+                ),
+                on_trace,
+            );
+            *step_index += 1;
+        }
+    }
+}
+
+async fn analyze_pptx_images(
+    selected: &SelectedModel,
+    payload: &Value,
+    task_id: &str,
+    traces: &mut Vec<ToolTraceEvent>,
+    step_index: &mut u32,
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
+) -> Result<Vec<Value>, String> {
+    let attachments = payload
+        .get("attachments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total_images = attachments.len();
+    let mut analyses = Vec::new();
+
+    for (batch_index, batch) in attachments
+        .chunks(PPTX_IMAGE_ANALYSIS_BATCH_SIZE)
+        .enumerate()
+    {
+        let batch_number = batch_index + 1;
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": "You are analyzing embedded images extracted from a PowerPoint file. Return concise, structured JSON. Do not invent details that are not visible."
+            }),
+            build_pptx_image_analysis_request_message(batch, batch_number, total_images),
+        ];
+        let request = build_chat_completion_request(selected, messages, None);
+        push_trace(
+            traces,
+            trace(
+                task_id,
+                *step_index,
+                TraceEventType::LlmRequest,
+                None,
+                &format!("pptx_image_analysis_request:{batch_number}"),
+                Some(redact_trace_value(&request)),
+                None,
+                Some(format!(
+                    "Analyzing PPT image batch {batch_number} ({} image(s))",
+                    batch.len()
+                )),
+                TraceStatus::Success,
+                0,
+            ),
+            on_trace,
+        );
+        *step_index += 1;
+
+        let completion = send_chat_completion(selected, &request, None).await?;
+        let message = extract_message_from_response(&completion.response_body)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let metadata = batch
+            .iter()
+            .map(pptx_image_attachment_metadata)
+            .collect::<Vec<_>>();
+        let analysis = json!({
+            "batchIndex": batch_number,
+            "imageCount": batch.len(),
+            "images": metadata,
+            "analysis": message.clone(),
+            "durationMs": completion.duration_ms,
+            "inputTokens": completion.token_usage.input_tokens,
+            "outputTokens": completion.token_usage.output_tokens,
+            "totalTokens": completion.token_usage.total_tokens,
+        });
+
+        push_trace(
+            traces,
+            trace(
+                task_id,
+                *step_index,
+                TraceEventType::LlmResponse,
+                None,
+                &format!("pptx_image_analysis_response:{batch_number}"),
+                Some(json!({
+                    "model": selected.model_id,
+                    "imageCount": batch.len(),
+                })),
+                Some(json!({
+                    "response": completion.response_body.clone(),
+                    "analysis": message,
+                    "tokenUsage": completion.token_usage.clone(),
+                })),
+                Some(format!(
+                    "Analyzed PPT image batch {batch_number}: {} chars",
+                    analysis
+                        .get("analysis")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0)
+                )),
+                TraceStatus::Success,
+                completion.duration_ms,
+            ),
+            on_trace,
+        );
+        *step_index += 1;
+
+        analyses.push(analysis);
+    }
+
+    Ok(analyses)
+}
+
+fn selected_model_supports_vision(selected: &SelectedModel) -> bool {
+    if let Some(model) = selected.model.as_ref() {
+        return model
+            .supports_vision
+            .unwrap_or_else(|| infer_model_supports_vision(&model.id, &model.name));
+    }
+    infer_model_supports_vision(&selected.model_id, &selected.model_id)
+}
+
+fn pptx_output_image_count(output: &Value) -> usize {
+    output
+        .get("slides")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|slide| {
+            slide
+                .get("images")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn pptx_payload_attachment_count(payload: &Value) -> usize {
+    payload
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn pptx_payload_skipped_count(payload: &Value) -> usize {
+    payload
+        .get("skipped")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn build_pptx_image_analysis_request_message(
+    attachments: &[Value],
+    batch_number: usize,
+    total_images: usize,
+) -> Value {
+    let image_metadata = attachments
+        .iter()
+        .map(pptx_image_attachment_metadata)
+        .collect::<Vec<_>>();
+    let mut text = format!(
+        "Analyze this PowerPoint image batch {batch_number}. Total extracted PPT images: {total_images}. Return JSON only with an `images` array. For each image, include: imageIndex, slideIndex, target, description, visibleText, diagramMeaning, relevance (high|medium|low|decorative), and needsRecheck (boolean). Image metadata:\n{}\n",
+        serde_json::to_string_pretty(&image_metadata).unwrap_or_else(|_| "[]".to_string())
+    );
+    text.push_str(
+        "If an image is a logo/background/decorative asset, mark relevance as decorative and keep the description short. Do not OCR as a separate process; just report visible text if the vision model can read it.",
+    );
+
+    let mut content = vec![json!({
+        "type": "text",
+        "text": text,
+    })];
+    for attachment in attachments {
+        if let Some(data_url) = attachment.get("dataUrl").and_then(Value::as_str) {
+            content.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": data_url,
+                },
+            }));
+        }
+    }
+
+    json!({
+        "role": "user",
+        "content": content,
+    })
+}
+
+fn build_pptx_image_analysis_followup_message(
+    original_image_count: usize,
+    skipped: usize,
+    analyses: &[Value],
+) -> Value {
+    let analyzed = analyses
+        .iter()
+        .map(|analysis| {
+            analysis
+                .get("imageCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize
+        })
+        .sum::<usize>();
+    let text = format!(
+        "PPT embedded image understanding is complete. Use these image analyses together with the previous presentation/read_pptx slide text and notes. Original embedded images: {original_image_count}; analyzed: {analyzed}; skipped: {skipped}. If a later answer needs more precision for a specific image, ask to recheck that slideIndex/target instead of guessing.\n\nimageAnalyses:\n{}",
+        serde_json::to_string_pretty(analyses).unwrap_or_else(|_| "[]".to_string())
+    );
+
+    json!({
+        "role": "user",
+        "content": text,
+    })
+}
+
+fn pptx_image_attachment_metadata(attachment: &Value) -> Value {
+    json!({
+        "name": attachment.get("name").and_then(Value::as_str),
+        "mimeType": attachment.get("mimeType").and_then(Value::as_str),
+        "slideIndex": attachment.get("slideIndex").and_then(Value::as_u64),
+        "target": attachment.get("target").and_then(Value::as_str),
+    })
 }
 
 fn push_assistant_model_message_trace(
@@ -2497,7 +2923,7 @@ fn system_prompt(project: &ProjectSession, cli_mode: bool) -> String {
     }
 
     format!(
-        "You are CodeForge Desktop, a coding assistant for the project \"{}\". Repo root: {}. Internal SnowAgent class or path names may remain unchanged. Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Do not claim rg or text search is precise semantic analysis. Do not execute arbitrary shell commands. Answer concisely and use clickable file:line references when relevant. {}",
+        "You are CodeForge Desktop, a coding assistant for the project \"{}\". Repo root: {}. Internal SnowAgent class or path names may remain unchanged. Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Use document/read_docx for .docx files and presentation/read_pptx for .pptx files; do not use text read_file for Office packages. Do not claim rg or text search is precise semantic analysis. Do not execute arbitrary shell commands. Answer concisely and use clickable file:line references when relevant. {}",
         project.name,
         project.repo_root,
         code_navigation_response_guidance()
@@ -2505,7 +2931,7 @@ fn system_prompt(project: &ProjectSession, cli_mode: bool) -> String {
 }
 
 fn code_navigation_response_guidance() -> &'static str {
-    "For code-location answers, do not paste C/C++ source code blocks unless the user explicitly asks for source text. Prefer concise Markdown tables with a short description column and a location column. Use compact visible labels but unique link targets, for example [Foo.cpp:123](src/module/Foo.cpp:123). Link targets are local workspace file paths, not URLs: preserve the exact workspace-relative path returned by tools, keep literal spaces in directory names, and do not URL-encode or percent-encode them. For example write [wzShaderProgram.cpp:163](src/core/wz_render_core/09 shader/wzShaderProgram.cpp:163), not [wzShaderProgram.cpp:163](src/core/wz_render_core/09%20shader/wzShaderProgram.cpp:163). The UI displays the short label while opening the unique target in Visual Studio."
+    "For code-location answers, do not paste C/C++ source code blocks unless the user explicitly asks for source text. Prefer concise Markdown tables with a short description column and a location column. Use compact visible labels but unique link targets, for example [Foo.cpp:123](src/module/Foo.cpp:123). Link targets are local workspace file paths, not URLs: preserve the exact workspace-relative path returned by tools, keep literal spaces in directory names, and do not URL-encode or percent-encode them. For example write [wzShaderProgram.cpp:163](src/core/wz_render_core/09 shader/wzShaderProgram.cpp:163), not [wzShaderProgram.cpp:163](src/core/wz_render_core/09%20shader/wzShaderProgram.cpp:163). Use single-backtick inline code only for short identifiers, paths, or commands; use fenced code blocks for long snippets, pseudocode, loops, or code with comments. The UI displays the short label while opening the unique target in Visual Studio."
 }
 
 fn build_tool_call_test_messages(project: &ProjectSession) -> Vec<Value> {
@@ -3277,6 +3703,58 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn pptx_image_analysis_request_message_uses_image_url_parts() {
+        let attachments = vec![json!({
+            "name": "slide-1-image1.png",
+            "mimeType": "image/png",
+            "dataUrl": "data:image/png;base64,AAAA",
+            "slideIndex": 1,
+            "target": "ppt/media/image1.png",
+        })];
+        let message = build_pptx_image_analysis_request_message(&attachments, 1, 1);
+
+        assert_eq!(message["role"], json!("user"));
+        assert_eq!(message["content"][0]["type"], json!("text"));
+        assert_eq!(message["content"][1]["type"], json!("image_url"));
+        assert_eq!(
+            message["content"][1]["image_url"]["url"],
+            json!("data:image/png;base64,AAAA")
+        );
+    }
+
+    #[test]
+    fn pptx_image_analysis_followup_message_uses_text_analysis() {
+        let message = build_pptx_image_analysis_followup_message(
+            2,
+            1,
+            &[json!({
+                "batchIndex": 1,
+                "imageCount": 1,
+                "images": [{"slideIndex": 1, "target": "ppt/media/image1.png"}],
+                "analysis": "{\"images\":[{\"description\":\"chart\"}]}",
+            })],
+        );
+
+        assert_eq!(message["role"], json!("user"));
+        let content = message["content"].as_str().unwrap();
+        assert!(content.contains("PPT embedded image understanding is complete"));
+        assert!(content.contains("imageAnalyses"));
+        assert!(!content.contains("data:image/"));
+    }
+
+    #[test]
+    fn selected_model_supports_vision_uses_explicit_flag() {
+        let mut selected = test_selected_model("openai-compatible");
+        selected.model_id = "text-only-model".to_string();
+        selected.model = Some(selected.provider.models[0].clone());
+        selected.model.as_mut().unwrap().supports_vision = Some(false);
+        assert!(!selected_model_supports_vision(&selected));
+
+        selected.model.as_mut().unwrap().supports_vision = Some(true);
+        assert!(selected_model_supports_vision(&selected));
+    }
+
     fn tool_call_response() -> Value {
         tool_call_response_with_name(CALCULATOR_ADD_TOOL_NAME)
     }
@@ -3369,6 +3847,7 @@ mod tests {
                     credential_id: String::new(),
                     reasoning_mode: String::new(),
                     default_reasoning: String::new(),
+                    supports_vision: Some(true),
                     owned_by: None,
                     created: None,
                 }],

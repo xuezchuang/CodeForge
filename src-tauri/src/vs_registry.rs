@@ -120,6 +120,8 @@ pub struct ProviderModel {
     #[serde(default = "default_model_default_reasoning")]
     pub default_reasoning: String,
     #[serde(default)]
+    pub supports_vision: Option<bool>,
+    #[serde(default)]
     pub owned_by: Option<String>,
     #[serde(default)]
     pub created: Option<i64>,
@@ -599,6 +601,10 @@ struct ModelCatalogEntry {
     #[serde(default)]
     display_name: String,
     #[serde(default)]
+    supports_vision: Option<bool>,
+    #[serde(default, alias = "inputModalities")]
+    input_modalities: Vec<String>,
+    #[serde(default)]
     default_reasoning_level: Option<String>,
     #[serde(default)]
     supported_reasoning_levels: Vec<serde_json::Value>,
@@ -645,16 +651,30 @@ fn read_model_catalog(config_path: &Path, catalog_path: Option<String>) -> Vec<P
             );
             Some(ProviderModel {
                 id: id.to_string(),
-                name,
+                name: name.clone(),
                 enabled: true,
                 credential_id: String::new(),
                 reasoning_mode,
                 default_reasoning,
+                supports_vision: Some(catalog_model_supports_vision(&model, id, &name)),
                 owned_by: None,
                 created: None,
             })
         })
         .collect()
+}
+
+fn catalog_model_supports_vision(
+    model: &ModelCatalogEntry,
+    model_id: &str,
+    model_name: &str,
+) -> bool {
+    model.supports_vision == Some(true)
+        || model
+            .input_modalities
+            .iter()
+            .any(|modality| modality.trim().eq_ignore_ascii_case("image"))
+        || infer_model_supports_vision(model_id, model_name)
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,6 +699,8 @@ struct CodeBuddyModelConfig {
     temperature: Option<f64>,
     #[serde(default)]
     supports_tool_call: Option<bool>,
+    #[serde(default)]
+    supports_vision: Option<bool>,
 }
 
 struct CodeBuddyProviderGroup {
@@ -731,6 +753,9 @@ fn import_codebuddy_models(path: &Path) -> Option<Vec<ProviderConfig>> {
                     &normalize_model_reasoning_mode("", &model.id, &model.id),
                     "",
                 ),
+                supports_vision: model
+                    .supports_vision
+                    .or_else(|| Some(infer_model_supports_vision(&model.id, &model.id))),
                 owned_by: Some(model.vendor.trim().to_string()).filter(|value| !value.is_empty()),
                 created: None,
             });
@@ -925,6 +950,29 @@ fn infer_model_reasoning_mode(model_id: &str, model_name: &str) -> &'static str 
     }
 }
 
+pub fn infer_model_supports_vision(model_id: &str, model_name: &str) -> bool {
+    let text = format!("{model_id} {model_name}").to_ascii_lowercase();
+    let positive_markers = [
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "o3",
+        "o4",
+        "gemini",
+        "claude-3",
+        "claude-4",
+        "qwen-vl",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "glm-4v",
+        "glm-5v",
+        "vision",
+        "-vl",
+        "_vl",
+    ];
+    positive_markers.iter().any(|marker| text.contains(marker))
+}
+
 fn default_providers() -> Vec<ProviderConfig> {
     vec![
         codex_cli_provider(),
@@ -1058,6 +1106,7 @@ fn provider_model(id: &str, name: &str) -> ProviderModel {
             &normalize_model_reasoning_mode("", id, name),
             "",
         ),
+        supports_vision: Some(infer_model_supports_vision(id, name)),
         owned_by: None,
         created: None,
     }
@@ -1136,6 +1185,9 @@ fn normalize_config_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderCon
                         ),
                         &model.default_reasoning,
                     ),
+                    supports_vision: model
+                        .supports_vision
+                        .or_else(|| Some(infer_model_supports_vision(&model.id, &model.name))),
                     owned_by: model.owned_by,
                     created: model.created,
                 })
@@ -1236,6 +1288,9 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                                 ),
                                 &model.default_reasoning,
                             ),
+                            supports_vision: model.supports_vision.or_else(|| {
+                                Some(infer_model_supports_vision(&model.id, &model.name))
+                            }),
                             owned_by: model.owned_by,
                             created: model.created,
                         })
@@ -1276,6 +1331,9 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                         ),
                         &model.default_reasoning,
                     ),
+                    supports_vision: model
+                        .supports_vision
+                        .or_else(|| Some(infer_model_supports_vision(&model.id, &model.name))),
                     owned_by: model.owned_by,
                     created: model.created,
                 })
@@ -1560,6 +1618,26 @@ requires_openai_auth = false
         assert_eq!(provider.default_model, "model-a");
         assert_eq!(provider.credentials[0].api_key, "test-token");
         assert!(provider.models.iter().any(|model| model.id == "model-a"));
+    }
+
+    #[test]
+    fn model_catalog_uses_input_modalities_for_vision_support() {
+        let root = create_temp_settings_dir();
+        let config_path = root.join("config.toml");
+        let catalog_path = root.join("models.json");
+        fs::write(
+            &catalog_path,
+            r#"{"models":[{"slug":"MiniMax-M3","display_name":"MiniMax-M3","input_modalities":["text","image"]}]}"#,
+        )
+        .unwrap();
+
+        let models = read_model_catalog(&config_path, Some(catalog_path.to_string_lossy().into()));
+        let model = models
+            .iter()
+            .find(|model| model.id == "MiniMax-M3")
+            .expect("MiniMax-M3 should be loaded from catalog");
+
+        assert_eq!(model.supports_vision, Some(true));
     }
 
     #[test]

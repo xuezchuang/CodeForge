@@ -5,14 +5,17 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 ignore = "0.4.23"
 nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "4253de9faabb4e5c6d81d946a5e35a90f87347ee" }
+quick-xml = "0.39"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 pretty_assertions = "1"

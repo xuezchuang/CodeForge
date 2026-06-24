@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use codeforge_core::office_tools;
 use serde_json::{json, Value};
 
 use crate::goal_state::GoalState;
@@ -26,6 +27,8 @@ pub const WORKSPACE_SHELL_COMMAND_TOOL_NAME: &str = "workspace/shell_command";
 pub const APPLY_PATCH_RAW_TOOL_NAME: &str = "apply_patch_raw";
 pub const GET_FILE_CONTEXT_TOOL_NAME: &str = "get_file_context";
 pub const WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME: &str = "workspace/get_file_context";
+pub const DOCUMENT_READ_DOCX_TOOL_NAME: &str = "document/read_docx";
+pub const PRESENTATION_READ_PPTX_TOOL_NAME: &str = "presentation/read_pptx";
 pub const VS_CURRENT_SOLUTION_TOOL_NAME: &str = "vs.current_solution";
 pub const VS_CURRENT_DOCUMENT_TOOL_NAME: &str = "vs.current_document";
 pub const VS_CURRENT_SELECTION_TOOL_NAME: &str = "vs.current_selection";
@@ -78,6 +81,8 @@ pub fn tool_definitions() -> Vec<Value> {
     tools.extend([
         list_dir_definition(),
         get_file_context_definition(),
+        document_read_docx_definition(),
+        presentation_read_pptx_definition(),
         vs_current_solution_definition(),
         vs_current_document_definition(),
         vs_current_selection_definition(),
@@ -200,6 +205,8 @@ async fn execute_tool_inner(
         ).await,
         APPLY_PATCH_RAW_TOOL_NAME => Err("rejected: apply_patch_raw is reserved for compatible Codex/OpenAI adapters and is not implemented in the CLI runtime".to_string()),
         GET_FILE_CONTEXT_TOOL_NAME | WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME => workspace_tools::get_file_context(context.workspace_root, arguments),
+        DOCUMENT_READ_DOCX_TOOL_NAME => office_tools::read_docx(context.workspace_root, arguments),
+        PRESENTATION_READ_PPTX_TOOL_NAME => office_tools::read_pptx(context.workspace_root, arguments),
         VS_CURRENT_SOLUTION_TOOL_NAME => vs_bridge_client::call_vs_current_solution(context.vs_bridge_endpoint).await,
         VS_CURRENT_DOCUMENT_TOOL_NAME => vs_bridge_client::call_vs_current_document(context.vs_bridge_endpoint).await,
         VS_CURRENT_SELECTION_TOOL_NAME => vs_bridge_client::call_vs_current_selection(context.vs_bridge_endpoint).await,
@@ -590,6 +597,58 @@ fn get_file_context_definition() -> Value {
     })
 }
 
+fn document_read_docx_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": DOCUMENT_READ_DOCX_TOOL_NAME,
+            "description": "Read a .docx Word document inside the workspace. Extracts paragraphs, headings, tables, comments, headers, footers, footnotes, endnotes, images, and plain text. Read-only; does not preserve exact visual layout.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative .docx file path."
+                    },
+                    "max_items": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5000,
+                        "description": "Maximum extracted paragraphs/tables/comments/slides per category. Defaults to 1200."
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    })
+}
+
+fn presentation_read_pptx_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": PRESENTATION_READ_PPTX_TOOL_NAME,
+            "description": "Read a .pptx PowerPoint deck inside the workspace. Extracts slide order, titles, text boxes, speaker notes, and image relationship targets. Read-only; does not preserve exact visual layout.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative .pptx file path."
+                    },
+                    "max_items": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5000,
+                        "description": "Maximum extracted slides/text items per category. Defaults to 1200."
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    })
+}
+
 fn vs_current_solution_definition() -> Value {
     json!({
         "type": "function",
@@ -901,6 +960,8 @@ mod tests {
         assert!(names.contains(&WORKSPACE_SEARCH_CONTENT_TOOL_NAME.to_string()));
         assert!(names.contains(&GET_FILE_CONTEXT_TOOL_NAME.to_string()));
         assert!(names.contains(&WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME.to_string()));
+        assert!(names.contains(&DOCUMENT_READ_DOCX_TOOL_NAME.to_string()));
+        assert!(names.contains(&PRESENTATION_READ_PPTX_TOOL_NAME.to_string()));
         assert!(names.contains(&WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_CURRENT_SOLUTION_TOOL_NAME.to_string()));

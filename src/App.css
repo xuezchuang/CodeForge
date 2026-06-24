@@ -1635,6 +1635,15 @@ button:focus-visible {
   background: #f4f7fb;
   color: #1d344f;
   font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.markdown-inline-code-long {
+  padding: 1px 3px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .markdown-code-block {

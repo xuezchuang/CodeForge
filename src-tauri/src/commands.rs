@@ -10,8 +10,8 @@ use crate::tool_registry;
 use crate::tool_trace::{self, MockAgentRun, ToolTraceEvent, TraceEventType, TraceStatus};
 use crate::vs_bridge_service;
 use crate::vs_registry::{
-    AppSettings, ProviderModel, SettingsInput, VSInstance, VSRegisterPayload,
-    MINIMAX_OPENAI_BASE_URL,
+    infer_model_supports_vision, AppSettings, ProviderModel, SettingsInput, VSInstance,
+    VSRegisterPayload, MINIMAX_OPENAI_BASE_URL,
 };
 use crate::window_activation;
 
@@ -547,14 +547,17 @@ pub async fn fetch_minimax_models(api_key: String) -> Result<Vec<ProviderModel>,
         .data
         .into_iter()
         .map(|model| {
-            let reasoning_mode = model_reasoning_mode(&model.id);
+            let model_id = model.id;
+            let reasoning_mode = model_reasoning_mode(&model_id);
+            let supports_vision = infer_model_supports_vision(&model_id, &model_id);
             ProviderModel {
-                name: model.id.clone(),
-                id: model.id,
+                name: model_id.clone(),
+                id: model_id,
                 enabled: false,
                 credential_id: String::new(),
                 reasoning_mode: reasoning_mode.to_string(),
                 default_reasoning: model_default_reasoning(reasoning_mode).to_string(),
+                supports_vision: Some(supports_vision),
                 owned_by: model.owned_by,
                 created: model.created,
             }
@@ -601,14 +604,17 @@ pub async fn fetch_openai_compatible_models(
         .data
         .into_iter()
         .map(|model| {
-            let reasoning_mode = model_reasoning_mode(&model.id);
+            let model_id = model.id;
+            let reasoning_mode = model_reasoning_mode(&model_id);
+            let supports_vision = infer_model_supports_vision(&model_id, &model_id);
             ProviderModel {
-                name: model.id.clone(),
-                id: model.id,
+                name: model_id.clone(),
+                id: model_id,
                 enabled: false,
                 credential_id: String::new(),
                 reasoning_mode: reasoning_mode.to_string(),
                 default_reasoning: model_default_reasoning(reasoning_mode).to_string(),
+                supports_vision: Some(supports_vision),
                 owned_by: model.owned_by,
                 created: model.created,
             }

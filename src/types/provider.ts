@@ -45,6 +45,7 @@ export interface ProviderModel {
   credentialId?: string
   reasoningMode?: ModelReasoningMode
   defaultReasoning?: ModelDefaultReasoning
+  supportsVision?: boolean | null
   ownedBy?: string | null
   created?: number | null
 }

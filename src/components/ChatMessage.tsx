@@ -934,8 +934,11 @@ function renderInlineMarkdown(
         )
         return
       }
+      const inlineCodeClassName = isLongInlineCode(codeText)
+        ? 'markdown-inline-code markdown-inline-code-long'
+        : 'markdown-inline-code'
       nodes.push(
-        <code key={`${keyPrefix}-code-${index}`} className="markdown-inline-code">
+        <code key={`${keyPrefix}-code-${index}`} className={inlineCodeClassName}>
           {codeText}
         </code>,
       )
@@ -975,6 +978,10 @@ function renderInlineMarkdown(
   })
 
   return nodes
+}
+
+function isLongInlineCode(codeText: string): boolean {
+  return codeText.length > 72
 }
 
 interface ThinkingSummary {

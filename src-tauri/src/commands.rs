@@ -513,6 +513,8 @@ struct ModelListItem {
     created: Option<i64>,
     #[serde(alias = "owned_by")]
     owned_by: Option<String>,
+    #[serde(default, alias = "supports_developer_role")]
+    supports_developer_role: Option<bool>,
 }
 
 #[tauri::command]
@@ -558,6 +560,7 @@ pub async fn fetch_minimax_models(api_key: String) -> Result<Vec<ProviderModel>,
                 reasoning_mode: reasoning_mode.to_string(),
                 default_reasoning: model_default_reasoning(reasoning_mode).to_string(),
                 supports_vision: Some(supports_vision),
+                supports_developer_role: model.supports_developer_role,
                 owned_by: model.owned_by,
                 created: model.created,
             }
@@ -615,6 +618,7 @@ pub async fn fetch_openai_compatible_models(
                 reasoning_mode: reasoning_mode.to_string(),
                 default_reasoning: model_default_reasoning(reasoning_mode).to_string(),
                 supports_vision: Some(supports_vision),
+                supports_developer_role: model.supports_developer_role,
                 owned_by: model.owned_by,
                 created: model.created,
             }

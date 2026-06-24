@@ -56,6 +56,19 @@ pub struct ToolTraceEvent {
 pub struct MockAgentRun {
     pub task_id: String,
     pub traces: Vec<ToolTraceEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compaction: Option<ContextCompactionResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCompactionResult {
+    pub summary: String,
+    pub original_message_count: usize,
+    pub retained_message_count: usize,
+    pub dropped_message_count: usize,
+    pub estimated_original_tokens: usize,
+    pub estimated_compacted_tokens: usize,
 }
 
 #[derive(Default)]
@@ -163,7 +176,11 @@ pub fn create_mock_agent_run(project: &ProjectSession, user_prompt: &str) -> Moc
         ),
     ];
 
-    MockAgentRun { task_id, traces }
+    MockAgentRun {
+        task_id,
+        traces,
+        context_compaction: None,
+    }
 }
 
 #[derive(Clone, Debug)]

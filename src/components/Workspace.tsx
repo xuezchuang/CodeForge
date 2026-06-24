@@ -9,12 +9,17 @@ import {
   openVisualStudio,
   runAgent,
   saveWorkspaceSession,
+  updateSettings,
   type ToolDefinitionSummary,
 } from '../api/tauriApi'
-import { normalizeAgentTask } from '../state/appState'
+import { normalizeAgentTask, normalizeSettings } from '../state/appState'
 import type { AppState } from '../state/appState'
 import type { AgentTask, ChatMessage, MessageAttachment } from '../types/task'
-import type { AgentConversationMessage, ToolTraceEvent } from '../types/trace'
+import type {
+  AgentConversationMessage,
+  ContextCompactionResult,
+  ToolTraceEvent,
+} from '../types/trace'
 import ChatTimeline from './ChatTimeline'
 import Composer from './Composer'
 import Toast, { type ToastState } from './Toast'
@@ -34,6 +39,13 @@ interface WorkspaceProps {
 interface SelectedTrace {
   taskId: string
   events: ToolTraceEvent[]
+}
+
+interface ComposerModelSelection {
+  providerId: string
+  credentialId: string | null
+  modelId: string
+  reasoningEffort: string | null
 }
 
 const traceEventName = 'agent_trace_event'
@@ -267,6 +279,88 @@ function Workspace({
     }, 3000)
   }
 
+  const persistComposerModelSelection = useCallback(
+    async (selection: ComposerModelSelection) => {
+      const settings = state.settings
+      if (!settings) {
+        return
+      }
+
+      let changed = false
+      const nextProviders = state.providers.map((provider) => {
+        const isSelectedProvider = provider.id === selection.providerId
+        let nextProvider = provider
+        if (provider.isDefault !== isSelectedProvider) {
+          nextProvider = { ...nextProvider, isDefault: isSelectedProvider }
+          changed = true
+        }
+        if (!isSelectedProvider) {
+          return nextProvider
+        }
+
+        const nextCredentialId = selection.credentialId ?? ''
+        let modelsChanged = false
+        const nextModels = provider.models.map((model) => {
+          if (model.id !== selection.modelId || !selection.reasoningEffort) {
+            return model
+          }
+          if (model.defaultReasoning === selection.reasoningEffort) {
+            return model
+          }
+          modelsChanged = true
+          return {
+            ...model,
+            defaultReasoning:
+              selection.reasoningEffort as NonNullable<typeof model.defaultReasoning>,
+          }
+        })
+
+        if (
+          provider.defaultModel !== selection.modelId ||
+          provider.defaultCredentialId !== nextCredentialId
+        ) {
+          changed = true
+        }
+
+        if (modelsChanged) {
+          changed = true
+        }
+
+        return {
+          ...nextProvider,
+          defaultModel: selection.modelId,
+          defaultCredentialId: nextCredentialId,
+          models: nextModels,
+        }
+      })
+
+      if (!changed) {
+        return
+      }
+
+      try {
+        const saved = await updateSettings({
+          devenvPath: settings.devenvPath,
+          providerNotes: settings.providerNotes ?? null,
+          uiPreferences: settings.uiPreferences,
+          providers: nextProviders,
+        })
+        const normalized = normalizeSettings(saved)
+        setState((current) => ({
+          ...current,
+          settings: normalized,
+          providers: normalized.providers,
+        }))
+      } catch (caught) {
+        showWorkspaceToast(
+          'error',
+          caught instanceof Error ? caught.message : String(caught),
+        )
+      }
+    },
+    [setState, state.providers, state.settings],
+  )
+
   const runTask = async (
     prompt: string,
     selection: {
@@ -389,6 +483,7 @@ function Workspace({
           assistantMessage,
           run.traces,
           pendingAssistantMessage.id,
+          run.contextCompaction ?? null,
         ),
       )
     } catch (caught) {
@@ -636,6 +731,9 @@ function Workspace({
               value={composerDraft}
               onChange={setComposerDraft}
               onSend={runTask}
+              onModelSelectionChange={(selection) => {
+                void persistComposerModelSelection(selection)
+              }}
             />
           </div>
         </main>
@@ -717,6 +815,7 @@ function completeSessionRun(
   assistantMessage: ChatMessage,
   traces: ToolTraceEvent[],
   pendingAssistantMessageId: string,
+  contextCompaction: ContextCompactionResult | null,
 ): AppState {
   const task = state.tasksById[sessionTaskId]
   if (!task) {
@@ -729,6 +828,20 @@ function completeSessionRun(
     traceEvents: mergedTraces,
     status: failed ? 'failed' : assistantMessage.status,
   }
+  const completedMessages = replaceMessageById(
+    task.messages,
+    pendingAssistantMessageId,
+    completedAssistantMessage,
+  )
+  const nextMessages =
+    contextCompaction && !failed ?
+      applyContextCompactionToMessages(
+        sessionTaskId,
+        completedMessages,
+        completedAssistantMessage,
+        contextCompaction,
+      )
+    : completedMessages
   return {
     ...state,
     traceDrawerOpen: state.traceDrawerOpen,
@@ -736,11 +849,7 @@ function completeSessionRun(
       ...state.tasksById,
       [sessionTaskId]: {
         ...task,
-        messages: replaceMessageById(
-          task.messages,
-          pendingAssistantMessageId,
-          completedAssistantMessage,
-        ),
+        messages: nextMessages,
         traceEvents: mergedTraces,
         status: failed ? 'failed' : 'completed',
         messagesLoaded: true,
@@ -914,11 +1023,7 @@ function mergeTraceEvents(
 
 function createConversationMessages(messages: ChatMessage[]): AgentConversationMessage[] {
   return messages
-    .filter(
-      (message): message is ChatMessage & { role: 'user' | 'assistant' } =>
-        (message.role === 'user' || message.role === 'assistant') &&
-        !isTransientConversationMessage(message),
-    )
+    .filter(isConversationHistoryMessage)
     .map((message) => {
       const content = sanitizeConversationContent(message.content)
       return {
@@ -937,6 +1042,16 @@ function createConversationMessages(messages: ChatMessage[]): AgentConversationM
         message.content.trim().length > 0 ||
         Boolean(message.attachments && message.attachments.length > 0),
     )
+}
+
+function isConversationHistoryMessage(message: ChatMessage): boolean {
+  if (message.role === 'system') {
+    return isContextCompactionMessage(message)
+  }
+  return (
+    (message.role === 'user' || message.role === 'assistant') &&
+    !isTransientConversationMessage(message)
+  )
 }
 
 function isTransientConversationMessage(message: ChatMessage): boolean {
@@ -982,6 +1097,41 @@ function createMessage(
     ...(attachments && attachments.length > 0 ? { attachments } : {}),
     createdAt: new Date().toISOString(),
   }
+}
+
+const CONTEXT_COMPACTION_MESSAGE_PREFIX = '[CodeForge context compacted]'
+
+function createContextCompactionMessage(
+  taskId: string,
+  compaction: ContextCompactionResult,
+): ChatMessage {
+  return createMessage(
+    taskId,
+    'system',
+    `${CONTEXT_COMPACTION_MESSAGE_PREFIX}\n\nEarlier conversation summary:\n${compaction.summary.trim()}`,
+  )
+}
+
+function isContextCompactionMessage(message: ChatMessage): boolean {
+  return message.content.trimStart().startsWith(CONTEXT_COMPACTION_MESSAGE_PREFIX)
+}
+
+function applyContextCompactionToMessages(
+  sessionTaskId: string,
+  messages: ChatMessage[],
+  completedAssistantMessage: ChatMessage,
+  compaction: ContextCompactionResult,
+): ChatMessage[] {
+  const retainedMessages = messages
+    .filter((message) => message.id !== completedAssistantMessage.id)
+    .filter(isConversationHistoryMessage)
+    .slice(-compaction.retainedMessageCount)
+
+  return [
+    createContextCompactionMessage(sessionTaskId, compaction),
+    ...retainedMessages,
+    completedAssistantMessage,
+  ]
 }
 
 function createPendingAssistantMessage(taskId: string, attachmentCount = 0): ChatMessage {

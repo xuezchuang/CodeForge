@@ -35,6 +35,12 @@ interface ComposerProps {
     },
     attachments: MessageAttachment[],
   ) => void
+  onModelSelectionChange?: (selection: {
+    providerId: string
+    credentialId: string | null
+    modelId: string
+    reasoningEffort: string | null
+  }) => void
 }
 
 type ReasoningChoice = {
@@ -42,6 +48,20 @@ type ReasoningChoice = {
   label: string
   description: string
 }
+
+type SlashCommand = {
+  command: string
+  title: string
+  description: string
+}
+
+const slashCommands: SlashCommand[] = [
+  {
+    command: '/init',
+    title: 'Init AI context',
+    description: 'Create or update doc/ai-context for this workspace.',
+  },
+]
 
 function Composer({
   providers,
@@ -51,6 +71,7 @@ function Composer({
   value,
   onChange,
   onSend,
+  onModelSelectionChange,
 }: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -60,6 +81,8 @@ function Composer({
   const [pickerOpen, setPickerOpen] = useState(false)
   const [attachments, setAttachments] = useState<MessageAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState('')
+  const [composerFocused, setComposerFocused] = useState(false)
+  const [dismissedSlashValue, setDismissedSlashValue] = useState('')
   const selectableModels = useMemo(() => getSelectableModels(providers), [providers])
   const defaultSelectableModel = useMemo(
     () => getDefaultSelectableModel(providers, selectableModels),
@@ -81,6 +104,12 @@ function Composer({
     () => buildReasoningChoices(selectedModelReasoningMode),
     [selectedModelReasoningMode],
   )
+  const slashMatches = useMemo(() => matchingSlashCommands(value), [value])
+  const showSlashMenu =
+    composerFocused &&
+    !busy &&
+    value !== dismissedSlashValue &&
+    slashMatches.length > 0
 
   useEffect(() => {
     if (reasoningChoices.length === 0) {
@@ -172,7 +201,33 @@ function Composer({
     setAttachmentError('')
   }
 
+  const selectSlashCommand = (command: SlashCommand) => {
+    onChange(command.command)
+    setDismissedSlashValue('')
+    window.requestAnimationFrame(() => textareaRef.current?.focus())
+  }
+
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (showSlashMenu) {
+      const firstCommand = slashMatches[0]
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setDismissedSlashValue(value)
+        return
+      }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault()
+        return
+      }
+      if (
+        firstCommand &&
+        (event.key === 'Tab' || (event.key === 'Enter' && value.trim() !== firstCommand.command))
+      ) {
+        event.preventDefault()
+        selectSlashCommand(firstCommand)
+        return
+      }
+    }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
       send()
@@ -242,13 +297,37 @@ function Composer({
           ref={textareaRef}
           className="composer-input"
           value={value}
-          onChange={(event) => onChange(event.target.value)}
+          onChange={(event) => {
+            setDismissedSlashValue('')
+            onChange(event.target.value)
+          }}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
+          onFocus={() => setComposerFocused(true)}
+          onBlur={() => setComposerFocused(false)}
           placeholder="Ask for follow-up changes"
           rows={1}
           disabled={busy}
         />
+        {showSlashMenu ? (
+          <div className="composer-slash-menu" role="listbox" aria-label="Slash commands">
+            {slashMatches.map((command) => (
+              <button
+                type="button"
+                className="composer-slash-command"
+                key={command.command}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => selectSlashCommand(command)}
+              >
+                <span className="composer-slash-command-name">{command.command}</span>
+                <span className="composer-slash-command-copy">
+                  <strong>{command.title}</strong>
+                  <small>{command.description}</small>
+                </span>
+              </button>
+            ))}
+          </div>
+        ) : null}
         <div className="composer-bottom-bar">
           <div className="composer-tool-group">
             <button
@@ -326,7 +405,25 @@ function Composer({
                           role="option"
                           aria-selected={model.id === selectedModel?.id}
                           onClick={() => {
+                            const nextReasoningMode = resolveReasoningMode(model, providers)
+                            const nextReasoningChoices =
+                              buildReasoningChoices(nextReasoningMode)
+                            const nextDefaultReasoning = resolveDefaultReasoning(model, providers)
+                            const nextReasoning =
+                              nextReasoningChoices.find(
+                                (choice) => choice.value === nextDefaultReasoning,
+                              )?.value ??
+                              nextReasoningChoices[0]?.value ??
+                              ''
                             setSelectedModelId(model.id)
+                            setSelectedReasoning(nextReasoning)
+                            onModelSelectionChange?.({
+                              providerId: model.providerId,
+                              credentialId: model.credentialId,
+                              modelId: model.modelId,
+                              reasoningEffort:
+                                nextReasoningChoices.length > 0 ? nextReasoning : null,
+                            })
                             setPickerOpen(false)
                           }}
                         >
@@ -355,6 +452,14 @@ function Composer({
                             aria-selected={choice.value === selectedReasoning}
                             onClick={() => {
                               setSelectedReasoning(choice.value)
+                              if (selectedModel) {
+                                onModelSelectionChange?.({
+                                  providerId: selectedModel.providerId,
+                                  credentialId: selectedModel.credentialId,
+                                  modelId: selectedModel.modelId,
+                                  reasoningEffort: choice.value,
+                                })
+                              }
                               setPickerOpen(false)
                             }}
                             title={choice.description}
@@ -437,6 +542,16 @@ function fileToImageAttachment(file: File): Promise<MessageAttachment> {
 }
 
 export default Composer
+
+function matchingSlashCommands(value: string): SlashCommand[] {
+  if (!value.startsWith('/') || /\s/.test(value)) {
+    return []
+  }
+  const query = value.slice(1).toLowerCase()
+  return slashCommands.filter((command) =>
+    command.command.slice(1).toLowerCase().startsWith(query),
+  )
+}
 
 function resolveReasoningMode(
   model: SelectableModel | null,

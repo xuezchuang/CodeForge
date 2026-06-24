@@ -86,6 +86,7 @@ impl HistoryStore {
             .map_err(|error| format!("SQLite open failed {}: {error}", path.to_string_lossy()))?;
         let store = Self { conn };
         store.init_schema()?;
+        store.fail_abandoned_running_runs()?;
         Ok(store)
     }
 
@@ -374,6 +375,90 @@ impl HistoryStore {
         Ok(())
     }
 
+    fn fail_abandoned_running_runs(&self) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let runs = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT run_id, session_id
+                     FROM agent_runs
+                     WHERE status = 'running'",
+                )
+                .map_err(sql_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(sql_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql_error)?;
+            rows
+        };
+
+        for (run_id, session_id) in runs {
+            let next_step_index = self
+                .conn
+                .query_row(
+                    "SELECT COALESCE(MAX(step_index), 0) + 1
+                     FROM trace_events
+                     WHERE run_id = ?1",
+                    params![run_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(sql_error)?;
+            let summary = "Agent run was abandoned before completion. The previous CodeForge process exited before the model request returned.";
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO trace_events (
+                        id, run_id, session_id, step_index, event_type, tool_name, title,
+                        input_json, output_json, output_summary, started_at, ended_at,
+                        duration_ms, status
+                    ) VALUES (?1, ?2, ?3, ?4, 'error', NULL, 'agent_run_abandoned',
+                        NULL, ?5, ?6, ?7, ?7, 0, 'failed')",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        run_id.as_str(),
+                        session_id.as_str(),
+                        next_step_index,
+                        serde_json::json!({ "error": summary }).to_string(),
+                        summary,
+                        now.as_str(),
+                    ],
+                )
+                .map_err(sql_error)?;
+            self.conn
+                .execute(
+                    "UPDATE agent_runs
+                     SET status = 'failed',
+                         ended_at = COALESCE(ended_at, ?2),
+                         final_summary = ?3
+                     WHERE run_id = ?1 AND status = 'running'",
+                    params![run_id.as_str(), now.as_str(), summary],
+                )
+                .map_err(sql_error)?;
+            self.conn
+                .execute(
+                    "UPDATE conversation_sessions
+                     SET status = 'failed',
+                         updated_at = ?2
+                     WHERE id = ?1 AND status = 'running'",
+                    params![session_id.as_str(), now.as_str()],
+                )
+                .map_err(sql_error)?;
+            self.conn
+                .execute(
+                    "UPDATE conversation_messages
+                     SET status = 'failed'
+                     WHERE task_id = ?1 AND status = 'running'",
+                    params![run_id.as_str()],
+                )
+                .map_err(sql_error)?;
+        }
+
+        Ok(())
+    }
+
     fn init_schema(&self) -> Result<(), String> {
         self.conn
             .execute_batch(
@@ -591,14 +676,13 @@ impl HistoryStore {
         let mut traces_by_task_id: HashMap<String, Vec<ToolTraceEvent>> = HashMap::new();
         rows.into_iter()
             .map(|row| {
-                let trace_events =
-                    if let Some(trace_events) = traces_by_task_id.get(&row.task_id) {
-                        trace_events.clone()
-                    } else {
-                        let trace_events = self.list_trace_events(&row.task_id)?;
-                        traces_by_task_id.insert(row.task_id.clone(), trace_events.clone());
-                        trace_events
-                    };
+                let trace_events = if let Some(trace_events) = traces_by_task_id.get(&row.task_id) {
+                    trace_events.clone()
+                } else {
+                    let trace_events = self.list_trace_events(&row.task_id)?;
+                    traces_by_task_id.insert(row.task_id.clone(), trace_events.clone());
+                    trace_events
+                };
                 Ok(ChatMessageRecord {
                     id: row.id,
                     task_id: row.task_id,
@@ -875,6 +959,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(metadata, ("provider-1".to_string(), "model-1".to_string()));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_marks_abandoned_running_runs_failed() {
+        let path = std::env::temp_dir().join(format!(
+            "codeforge-history-test-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let mut store = HistoryStore::load(path.clone()).unwrap();
+            let task = AgentTaskRecord {
+                id: "session-1".to_string(),
+                project_id: "project-1".to_string(),
+                prompt: "ask".to_string(),
+                messages: vec![ChatMessageRecord {
+                    id: "message-1".to_string(),
+                    task_id: "run-1".to_string(),
+                    role: "assistant".to_string(),
+                    content: "Thinking...".to_string(),
+                    status: Some("running".to_string()),
+                    code_links: None,
+                    attachments: None,
+                    trace_events: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                }],
+                trace_events: Vec::new(),
+                status: "running".to_string(),
+                messages_loaded: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            };
+            store.save_workspace_session(&task, 0).unwrap();
+            store
+                .insert_trace_event(
+                    "session-1",
+                    &ToolTraceEvent {
+                        id: "trace-1".to_string(),
+                        task_id: "run-1".to_string(),
+                        step_index: 1,
+                        event_type: TraceEventType::LlmRequest,
+                        tool_name: None,
+                        title: "llm_request:1".to_string(),
+                        input: None,
+                        output: None,
+                        output_summary: Some("model=test".to_string()),
+                        started_at: "2026-01-01T00:00:00Z".to_string(),
+                        ended_at: Some("2026-01-01T00:00:00Z".to_string()),
+                        duration_ms: Some(0),
+                        status: TraceStatus::Success,
+                    },
+                )
+                .unwrap();
+        }
+
+        let store = HistoryStore::load(path.clone()).unwrap();
+        let run = store
+            .conn
+            .query_row(
+                "SELECT status, ended_at, final_summary FROM agent_runs WHERE run_id = ?1",
+                params!["run-1"],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(run.0, "failed");
+        assert!(run.1.is_some());
+        assert!(run
+            .2
+            .as_deref()
+            .is_some_and(|summary| summary.contains("abandoned before completion")));
+
+        let traces = store.list_trace_events("run-1").unwrap();
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces[1].title, "agent_run_abandoned");
+        assert!(matches!(traces[1].status, TraceStatus::Failed));
+
+        let task = store.load_workspace_session("session-1").unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.messages[0].status.as_deref(), Some("failed"));
 
         let _ = std::fs::remove_file(path);
     }

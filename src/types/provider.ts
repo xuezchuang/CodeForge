@@ -46,6 +46,7 @@ export interface ProviderModel {
   reasoningMode?: ModelReasoningMode
   defaultReasoning?: ModelDefaultReasoning
   supportsVision?: boolean | null
+  supportsDeveloperRole?: boolean | null
   ownedBy?: string | null
   created?: number | null
 }

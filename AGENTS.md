@@ -162,6 +162,24 @@ Trace is the main product surface.
 - When testing MCP/skill-like behavior, make the adapter boundary explicit: what input is sent, what output comes back, what failed, and how long it took.
 - Do not add broad automation or multi-domain assistant features unless they directly support coding workflow traceability.
 
+## AI Context Library
+
+CodeForge supports an optional retrieval-style project context library under:
+
+```text
+doc/ai-context/
+```
+
+Rules:
+
+- `doc/ai-context/README.md` is the only context file that should be loaded by default.
+- Treat `doc/ai-context/README.md` as an index and navigation map, not as source of truth.
+- Do not load every file under `doc/ai-context/` by default. Read only task-relevant linked docs.
+- For code-specific answers or edits, verify context-doc claims against current source code, diagnostics, or tool output before concluding.
+- The `/init` command may create or update `doc/ai-context/README.md` plus focused context docs. These docs should contain source scopes, entry points, relationships, search keywords, and verification notes.
+- Context docs must stay concise and evidence-oriented. If a relationship is uncertain, write that it is uncertain and name the files that need verification.
+- When code changes invalidate a context doc, update that doc when in scope or report that it may be stale.
+
 ## Planned Semantic VSIX Tools
 
 The current bridge opens files. The next stage is to expose semantic C++ project tools from Visual Studio:

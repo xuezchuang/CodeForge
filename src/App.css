@@ -1453,6 +1453,28 @@ button:focus-visible {
   gap: 10px;
 }
 
+.context-compaction-divider {
+  display: grid;
+  grid-template-columns: minmax(20px, 1fr) auto minmax(20px, 1fr);
+  align-items: center;
+  gap: 10px;
+  color: #667085;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
+}
+
+.context-compaction-divider::before,
+.context-compaction-divider::after {
+  content: '';
+  height: 1px;
+  background: #d0d5dd;
+}
+
+.context-compaction-divider span {
+  white-space: nowrap;
+}
+
 .chat-message.user .message-body {
   background: #edf6f8;
 }
@@ -2053,6 +2075,7 @@ button.thinking-item:focus-visible {
 }
 
 .composer-surface {
+  position: relative;
   min-height: 72px;
   max-height: 180px;
   border: 1px solid #cbd5e1;
@@ -2135,6 +2158,68 @@ button.thinking-item:focus-visible {
 
 .composer-input:focus {
   outline: none;
+}
+
+.composer-slash-menu {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: calc(100% + 8px);
+  z-index: 24;
+  max-width: 420px;
+  padding: 6px;
+  border: 1px solid #d8dde7;
+  border-radius: 10px;
+  background: #ffffff;
+  box-shadow: 0 16px 40px rgb(15 23 42 / 16%);
+}
+
+.composer-slash-command {
+  width: 100%;
+  border: 0;
+  border-radius: 7px;
+  padding: 8px 9px;
+  background: transparent;
+  color: #20242c;
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.composer-slash-command:hover,
+.composer-slash-command:focus {
+  background: #f1f5f9;
+  outline: none;
+}
+
+.composer-slash-command-name {
+  align-self: start;
+  color: #2563eb;
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.composer-slash-command-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.composer-slash-command-copy strong {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.composer-slash-command-copy small {
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .composer-bottom-bar,
@@ -3726,6 +3811,17 @@ pre {
   gap: 0;
 }
 
+.app-root.codex-style .context-compaction-divider {
+  width: var(--codex-chat-rail-width);
+  color: #8d9699;
+  font-size: 12px;
+}
+
+.app-root.codex-style .context-compaction-divider::before,
+.app-root.codex-style .context-compaction-divider::after {
+  background: #2a2f31;
+}
+
 .app-root.codex-style .chat-message.user {
   justify-content: flex-end;
 }
@@ -4070,6 +4166,30 @@ pre {
 
 .app-root.codex-style .composer-input::placeholder {
   color: #8d8d8d;
+}
+
+.app-root.codex-style .composer-slash-menu {
+  border-color: #3d3d3d;
+  border-radius: 11px;
+  background: #2d2d2d;
+  box-shadow: 0 18px 42px rgb(0 0 0 / 44%);
+}
+
+.app-root.codex-style .composer-slash-command {
+  color: #f1f4f5;
+}
+
+.app-root.codex-style .composer-slash-command:hover,
+.app-root.codex-style .composer-slash-command:focus {
+  background: #3a3a3a;
+}
+
+.app-root.codex-style .composer-slash-command-name {
+  color: #8ab4ff;
+}
+
+.app-root.codex-style .composer-slash-command-copy small {
+  color: #a8a8a8;
 }
 
 .app-root.codex-style .composer-icon-button,

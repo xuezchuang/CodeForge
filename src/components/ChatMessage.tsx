@@ -34,6 +34,21 @@ interface ChatMessageProps {
 
 function ChatMessage({
   message,
+  ...props
+}: ChatMessageProps) {
+  if (isContextCompactionMessage(message)) {
+    return (
+      <div className="context-compaction-divider" role="separator">
+        <span>Context compacted</span>
+      </div>
+    )
+  }
+
+  return <ConversationChatMessage message={message} {...props} />
+}
+
+function ConversationChatMessage({
+  message,
   projectId,
   onCodeLinkResult,
   onCodeLinkError,
@@ -369,6 +384,12 @@ interface MarkdownTableData {
 
 const THINKING_PREFIX = 'Thinking...\n\n'
 const THINKING_RUNNING_TEXT = 'Thinking...'
+const CONTEXT_COMPACTION_MESSAGE_PREFIX = '[CodeForge context compacted]'
+
+function isContextCompactionMessage(message: ChatMessageModel): boolean {
+  return message.role === 'system' &&
+    message.content.trimStart().startsWith(CONTEXT_COMPACTION_MESSAGE_PREFIX)
+}
 
 function useThinkingClock(enabled: boolean): number {
   const [nowMs, setNowMs] = useState(() => Date.now())

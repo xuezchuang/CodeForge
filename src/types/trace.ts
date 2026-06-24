@@ -30,10 +30,20 @@ export interface ToolTraceEvent {
 export interface MockAgentRun {
   taskId: string
   traces: ToolTraceEvent[]
+  contextCompaction?: ContextCompactionResult | null
+}
+
+export interface ContextCompactionResult {
+  summary: string
+  originalMessageCount: number
+  retainedMessageCount: number
+  droppedMessageCount: number
+  estimatedOriginalTokens: number
+  estimatedCompactedTokens: number
 }
 
 export interface AgentConversationMessage {
-  role: 'user' | 'assistant'
+  role: 'user' | 'assistant' | 'system'
   content: string
   attachments?: AgentMessageAttachment[]
 }

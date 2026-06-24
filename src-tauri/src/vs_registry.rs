@@ -122,6 +122,8 @@ pub struct ProviderModel {
     #[serde(default)]
     pub supports_vision: Option<bool>,
     #[serde(default)]
+    pub supports_developer_role: Option<bool>,
+    #[serde(default)]
     pub owned_by: Option<String>,
     #[serde(default)]
     pub created: Option<i64>,
@@ -602,6 +604,8 @@ struct ModelCatalogEntry {
     display_name: String,
     #[serde(default)]
     supports_vision: Option<bool>,
+    #[serde(default, alias = "supportsDeveloperRole")]
+    supports_developer_role: Option<bool>,
     #[serde(default, alias = "inputModalities")]
     input_modalities: Vec<String>,
     #[serde(default)]
@@ -657,6 +661,7 @@ fn read_model_catalog(config_path: &Path, catalog_path: Option<String>) -> Vec<P
                 reasoning_mode,
                 default_reasoning,
                 supports_vision: Some(catalog_model_supports_vision(&model, id, &name)),
+                supports_developer_role: model.supports_developer_role,
                 owned_by: None,
                 created: None,
             })
@@ -701,6 +706,8 @@ struct CodeBuddyModelConfig {
     supports_tool_call: Option<bool>,
     #[serde(default)]
     supports_vision: Option<bool>,
+    #[serde(default)]
+    supports_developer_role: Option<bool>,
 }
 
 struct CodeBuddyProviderGroup {
@@ -756,6 +763,7 @@ fn import_codebuddy_models(path: &Path) -> Option<Vec<ProviderConfig>> {
                 supports_vision: model
                     .supports_vision
                     .or_else(|| Some(infer_model_supports_vision(&model.id, &model.id))),
+                supports_developer_role: model.supports_developer_role,
                 owned_by: Some(model.vendor.trim().to_string()).filter(|value| !value.is_empty()),
                 created: None,
             });
@@ -1107,6 +1115,7 @@ fn provider_model(id: &str, name: &str) -> ProviderModel {
             "",
         ),
         supports_vision: Some(infer_model_supports_vision(id, name)),
+        supports_developer_role: None,
         owned_by: None,
         created: None,
     }
@@ -1188,6 +1197,7 @@ fn normalize_config_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderCon
                     supports_vision: model
                         .supports_vision
                         .or_else(|| Some(infer_model_supports_vision(&model.id, &model.name))),
+                    supports_developer_role: model.supports_developer_role,
                     owned_by: model.owned_by,
                     created: model.created,
                 })
@@ -1291,6 +1301,7 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                             supports_vision: model.supports_vision.or_else(|| {
                                 Some(infer_model_supports_vision(&model.id, &model.name))
                             }),
+                            supports_developer_role: model.supports_developer_role,
                             owned_by: model.owned_by,
                             created: model.created,
                         })
@@ -1334,6 +1345,7 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                     supports_vision: model
                         .supports_vision
                         .or_else(|| Some(infer_model_supports_vision(&model.id, &model.name))),
+                    supports_developer_role: model.supports_developer_role,
                     owned_by: model.owned_by,
                     created: model.created,
                 })
@@ -1627,7 +1639,7 @@ requires_openai_auth = false
         let catalog_path = root.join("models.json");
         fs::write(
             &catalog_path,
-            r#"{"models":[{"slug":"MiniMax-M3","display_name":"MiniMax-M3","input_modalities":["text","image"]}]}"#,
+            r#"{"models":[{"slug":"MiniMax-M3","display_name":"MiniMax-M3","input_modalities":["text","image"],"supports_developer_role":true}]}"#,
         )
         .unwrap();
 
@@ -1638,6 +1650,7 @@ requires_openai_auth = false
             .expect("MiniMax-M3 should be loaded from catalog");
 
         assert_eq!(model.supports_vision, Some(true));
+        assert_eq!(model.supports_developer_role, Some(true));
     }
 
     #[test]

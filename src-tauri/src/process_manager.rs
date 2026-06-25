@@ -1,8 +1,13 @@
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
 use crate::project_registry::{validate_project_paths, ProjectSession};
 use crate::vs_registry::AppSettings;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub struct OpenVsProcess {
     pub process_id: u32,
@@ -88,7 +93,9 @@ fn find_devenv_with_vswhere() -> Option<String> {
         return None;
     }
 
-    let output = Command::new(vswhere)
+    let mut command = Command::new(vswhere);
+    hide_child_console(&mut command);
+    let output = command
         .args([
             "-latest",
             "-products",
@@ -110,4 +117,15 @@ fn find_devenv_with_vswhere() -> Option<String> {
         return None;
     }
     Some(path)
+}
+
+fn hide_child_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
 }

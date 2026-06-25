@@ -1,5 +1,7 @@
 use std::env;
 use std::io::{Read, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -13,6 +15,8 @@ pub const CODEX_CLI_TOOL_NAME: &str = "codex_exec";
 
 const CODEX_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const CODEX_EXEC_SANDBOX: &str = "workspace-write";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug)]
 pub struct CodexCliExecution {
@@ -68,7 +72,9 @@ fn run_codex_process(
     prompt: String,
 ) -> Result<CodexCliExecution, String> {
     let started = Instant::now();
-    let mut child = Command::new(&executable)
+    let mut command = Command::new(&executable);
+    hide_child_console(&mut command);
+    let mut child = command
         .args(&args)
         .current_dir(&workspace_root)
         .stdin(Stdio::piped())
@@ -142,6 +148,17 @@ fn run_codex_process(
         final_message,
         usage,
     })
+}
+
+fn hide_child_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
 }
 
 fn read_pipe_to_string<R>(mut pipe: R) -> thread::JoinHandle<Result<String, String>>

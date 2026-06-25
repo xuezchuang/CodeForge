@@ -452,7 +452,7 @@ fn read_file_definition() -> Value {
         "type": "function",
         "function": {
             "name": READ_FILE_TOOL_NAME,
-            "description": "Read a local text file with line numbers. Accepts workspace-relative paths and absolute local paths. Defaults to at most 300 lines; use start_line and end_line for large files. Binary files are rejected.",
+            "description": "Read a local text file from the current filesystem with line numbers. Accepts workspace-relative paths and absolute local paths. Treat a successful result as current disk contents for this turn, not a stale cache or snapshot. Defaults to at most 300 lines; use start_line and end_line for large files. Binary files are rejected.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1305,6 +1305,16 @@ mod tests {
         assert!(!names.contains(&WRITE_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&SHELL_COMMAND_TOOL_NAME.to_string()));
+    }
+
+    #[test]
+    fn read_file_definition_says_results_are_current_disk_contents() {
+        let tool = read_file_definition();
+        let description = tool["function"]["description"].as_str().unwrap();
+
+        assert!(description.contains("current filesystem"));
+        assert!(description.contains("current disk contents"));
+        assert!(description.contains("not a stale cache or snapshot"));
     }
 
     #[test]

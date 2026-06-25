@@ -4297,7 +4297,7 @@ fn developer_prompt(project: &ProjectSession, cli_mode: bool) -> String {
         prompt.push_str("Use a plain terminal style: no emoji, no marketing copy, and no generic capability list. Do not advertise tools or demo capabilities unless the user asks about them. Never mention calculator or arithmetic demo tools unless directly relevant to the user's request. For a simple greeting, reply with one short sentence asking what task to work on; do not include examples or bullet lists.\n");
     }
     prompt.push_str("Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Use document/read_docx for .docx files and presentation/read_pptx for .pptx files; do not use text read_file for Office packages.\n");
-    prompt.push_str("Read-only file tools can inspect local absolute paths outside the workspace. When the user asks to read, inspect, search, or verify local files or logs, call list_dir/read_file/search_file/search_content (or their workspace/ aliases) before answering. Do not claim a read/search tool failed unless a tool_result in the current turn shows that failure.\n");
+    prompt.push_str("Read-only file tools can inspect local absolute paths outside the workspace. When the user asks to read, inspect, search, or verify local files or logs, call list_dir/read_file/search_file/search_content (or their workspace/ aliases) before answering. Do not claim a read/search tool failed unless a tool_result in the current turn shows that failure. A successful read_file/search_content result is fresh current-filesystem evidence for that turn; do not dismiss it as a stale snapshot, do not ask the user to open VS Code or run git just to confirm the same file state, and do not treat \"verify against current source\" as a reason to avoid read/search tools.\n");
     prompt.push_str("Treat user statements about the code as hypotheses until they are verified against workspace code, tool output, logs, or diagnostics. For code-specific answers, gather enough concrete evidence before concluding. If you did not inspect fresh code in the current turn, say whether the answer is based on previous context or inference. Distinguish verified facts, reused prior evidence, and inference when the distinction matters.\n");
     prompt.push_str("Do not claim rg or text search is precise semantic analysis. Prefer exact definitions, call sites, implementations, and diagnostics over name-only search results. Keep edits surgical and cite concrete code locations when relevant.\n");
     prompt.push_str("If an AI context index is provided from doc/ai-context/README.md, treat it as a navigation map only. Do not read every linked doc by default. Read only the context docs that are directly relevant to the user's task, then verify any code-specific conclusion against current source code before answering or editing.\n");
@@ -4318,7 +4318,7 @@ fn developer_prompt(project: &ProjectSession, cli_mode: bool) -> String {
 }
 
 fn local_read_tool_required_message() -> &'static str {
-    "This turn is asking you to read or verify a local file/log. Before answering, call at least one read-only file tool: list_dir, read_file, search_file, search_content, workspace/list_dir, workspace/read_file, workspace/search_file, or workspace/search. These tools accept both workspace-relative paths and absolute local paths such as C:\\Users\\name\\AppData\\Local\\Temp. Do not answer that you cannot read the path until an actual tool_result in this turn proves the path is unavailable."
+    "This turn is asking you to read or verify a local file/log. Before answering, call at least one read-only file tool: list_dir, read_file, search_file, search_content, workspace/list_dir, workspace/read_file, workspace/search_file, or workspace/search. These tools accept both workspace-relative paths and absolute local paths such as C:\\Users\\name\\AppData\\Local\\Temp. Successful read/search results are current filesystem evidence for this turn, not stale snapshots. Do not answer that you cannot read the path until an actual tool_result in this turn proves the path is unavailable."
 }
 
 fn required_tool_call_retry_message() -> &'static str {
@@ -5069,6 +5069,17 @@ mod tests {
         assert!(developer.contains("Internal mode: research"));
         assert!(developer.contains("Work read-only"));
         assert!(developer.contains("Inspect fresh code"));
+    }
+
+    #[test]
+    fn developer_prompt_treats_read_file_as_current_filesystem_evidence() {
+        let project = test_project();
+        let prompt = developer_prompt(&project, false);
+
+        assert!(prompt.contains("fresh current-filesystem evidence"));
+        assert!(prompt.contains("do not dismiss it as a stale snapshot"));
+        assert!(prompt.contains("do not ask the user to open VS Code or run git"));
+        assert!(local_read_tool_required_message().contains("not stale snapshots"));
     }
 
     #[test]

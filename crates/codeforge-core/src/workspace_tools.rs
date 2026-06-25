@@ -7,6 +7,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
@@ -24,6 +26,8 @@ const MAX_CONTEXT_LINES: usize = 200;
 const BINARY_SAMPLE_BYTES: usize = 8192;
 const SEARCH_CONTENT_SCAN_LIMIT: usize = 25_000;
 const SEARCH_SCAN_TIMEOUT_MS: u128 = 12_000;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const IGNORED_DIRS: &[&str] = &[
     ".git",
@@ -420,6 +424,7 @@ pub async fn shell_command(
         cmd.arg("-c").arg(command);
         cmd
     };
+    hide_child_console(&mut process);
     process
         .current_dir(&workspace)
         .stdout(Stdio::piped())
@@ -587,6 +592,7 @@ fn search_content_with_rg(
     regex: bool,
 ) -> Result<Value, String> {
     let mut command = Command::new("rg");
+    hide_child_console(&mut command);
     command
         .current_dir(root)
         .arg("--json")
@@ -1192,10 +1198,23 @@ fn compile_regex(query: &str, case_sensitive: bool) -> Result<Regex, String> {
 }
 
 fn ripgrep_available() -> bool {
-    Command::new("rg")
+    let mut command = Command::new("rg");
+    hide_child_console(&mut command);
+    command
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+fn hide_child_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
 }
 
 fn add_ignore_globs(command: &mut Command) {

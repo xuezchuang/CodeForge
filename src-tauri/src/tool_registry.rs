@@ -38,6 +38,10 @@ pub const VS_GET_ERROR_LIST_TOOL_NAME: &str = "vs.get_error_list";
 pub const GOAL_GET_TOOL_NAME: &str = "goal/get";
 pub const GOAL_SET_TOOL_NAME: &str = "goal/set";
 pub const GOAL_CLEAR_TOOL_NAME: &str = "goal/clear";
+pub const AGENT_SPAWN_TOOL_NAME: &str = "agent/spawn";
+pub const AGENT_WAIT_TOOL_NAME: &str = "agent/wait";
+pub const AGENT_LIST_TOOL_NAME: &str = "agent/list";
+pub const PROGRESS_UPDATE_STEPS_TOOL_NAME: &str = "progress/update_steps";
 
 pub struct ToolExecutionContext<'a> {
     pub workspace_root: &'a str,
@@ -92,9 +96,38 @@ pub fn tool_definitions() -> Vec<Value> {
         goal_get_definition(),
         goal_set_definition(),
         goal_clear_definition(),
+        progress_update_steps_definition(),
     ]);
     tools.extend(workspace_namespace_aliases());
     tools
+}
+
+pub fn read_only_tool_definitions() -> Vec<Value> {
+    let mut tools = read_only_workspace_tool_definitions();
+    tools.extend([
+        list_dir_definition(),
+        get_file_context_definition(),
+        document_read_docx_definition(),
+        presentation_read_pptx_definition(),
+        vs_current_solution_definition(),
+        vs_current_document_definition(),
+        vs_current_selection_definition(),
+        vs_list_projects_definition(),
+        vs_list_project_files_definition(),
+        vs_get_error_list_definition(),
+        goal_get_definition(),
+        progress_update_steps_definition(),
+    ]);
+    tools.extend(read_only_workspace_namespace_aliases());
+    tools
+}
+
+pub fn agent_tool_definitions() -> Vec<Value> {
+    vec![
+        agent_spawn_definition(),
+        agent_wait_definition(),
+        agent_list_definition(),
+    ]
 }
 
 pub fn tool_call_test_definitions() -> Vec<Value> {
@@ -124,6 +157,30 @@ fn workspace_tool_definitions() -> Vec<Value> {
         search_content_definition(),
         edit_file_definition(),
         write_file_definition(),
+    ]
+}
+
+fn read_only_workspace_tool_definitions() -> Vec<Value> {
+    vec![
+        read_file_definition(),
+        search_file_definition(),
+        search_content_definition(),
+    ]
+}
+
+fn read_only_workspace_namespace_aliases() -> Vec<Value> {
+    vec![
+        workspace_alias(WORKSPACE_LIST_DIR_TOOL_NAME, &list_dir_definition()),
+        workspace_alias(WORKSPACE_READ_FILE_TOOL_NAME, &read_file_definition()),
+        workspace_alias(WORKSPACE_SEARCH_FILE_TOOL_NAME, &search_file_definition()),
+        workspace_alias(
+            WORKSPACE_SEARCH_CONTENT_TOOL_NAME,
+            &search_content_definition(),
+        ),
+        workspace_alias(
+            WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME,
+            &get_file_context_definition(),
+        ),
     ]
 }
 
@@ -216,6 +273,8 @@ async fn execute_tool_inner(
         GOAL_GET_TOOL_NAME => goal_get(context),
         GOAL_SET_TOOL_NAME => goal_set(context, arguments),
         GOAL_CLEAR_TOOL_NAME => goal_clear(context),
+        PROGRESS_UPDATE_STEPS_TOOL_NAME => progress_update_steps(arguments),
+        AGENT_SPAWN_TOOL_NAME | AGENT_WAIT_TOOL_NAME | AGENT_LIST_TOOL_NAME => Err("rejected: agent tools are handled by the agent runner".to_string()),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -373,13 +432,13 @@ fn list_dir_definition() -> Value {
         "type": "function",
         "function": {
             "name": LIST_DIR_TOOL_NAME,
-            "description": "List immediate child directories and files under a workspace-relative path. Paths cannot escape the workspace root. Ignored directories include .git, .vs, bin, obj, build, out, node_modules, and .cache.",
+            "description": "List immediate child directories and files under a directory path. Accepts workspace-relative paths and absolute local paths. Ignored directories include .git, .vs, bin, obj, build, out, node_modules, and .cache.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative directory path, for example . or src."
+                        "description": "Directory path, for example ., src, or C:\\\\Users\\\\name\\\\AppData\\\\Local\\\\Temp."
                     }
                 },
                 "required": ["path"]
@@ -393,13 +452,13 @@ fn read_file_definition() -> Value {
         "type": "function",
         "function": {
             "name": READ_FILE_TOOL_NAME,
-            "description": "Read a text file inside the workspace with line numbers. Defaults to at most 300 lines; use start_line and end_line for large files. Binary files are rejected.",
+            "description": "Read a local text file with line numbers. Accepts workspace-relative paths and absolute local paths. Defaults to at most 300 lines; use start_line and end_line for large files. Binary files are rejected.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative file path."
+                        "description": "File path, relative to the workspace or absolute."
                     },
                     "start_line": {
                         "type": "integer",
@@ -421,17 +480,17 @@ fn search_file_definition() -> Value {
         "type": "function",
         "function": {
             "name": SEARCH_FILE_TOOL_NAME,
-            "description": "Search for file paths. When Visual Studio Bridge is connected, searches the active Visual Studio solution first and falls back to workspace fuzzy search. Use this to locate filenames or paths, not to search file contents.",
+            "description": "Search for file paths. When Visual Studio Bridge is connected, searches the active Visual Studio solution first and falls back to local search. Supports fuzzy filename search and simple wildcard patterns such as *.log or wz_render_frame_trace_*.log. Use this to locate filenames or paths, not to search file contents.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Filename or path pattern to search for."
+                        "description": "Filename or path pattern to search for. Use plain text for fuzzy search, or * and ? for wildcard matching."
                     },
                     "root": {
                         "type": "string",
-                        "description": "Optional workspace-relative directory to search under."
+                        "description": "Optional root directory to search under, relative to the workspace or absolute."
                     },
                     "max_results": {
                         "type": "integer",
@@ -450,7 +509,7 @@ fn search_content_definition() -> Value {
         "type": "function",
         "function": {
             "name": SEARCH_CONTENT_TOOL_NAME,
-            "description": "Search text content. When Visual Studio Bridge is connected, searches active Visual Studio solution files first and falls back to workspace content search. Returns structured matches with file, line, column, text, before, and after. Narrow root or file_glob for large repositories.",
+            "description": "Search text content. When Visual Studio Bridge is connected, searches active Visual Studio solution files first and falls back to local content search. Accepts workspace-relative and absolute roots. Returns structured matches with file, line, column, text, before, and after. Narrow root or file_glob for large repositories.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -460,7 +519,7 @@ fn search_content_definition() -> Value {
                     },
                     "root": {
                         "type": "string",
-                        "description": "Optional workspace-relative directory to search under."
+                        "description": "Optional root directory or file to search under, relative to the workspace or absolute."
                     },
                     "file_glob": {
                         "type": "string",
@@ -568,13 +627,13 @@ fn get_file_context_definition() -> Value {
         "type": "function",
         "function": {
             "name": GET_FILE_CONTEXT_TOOL_NAME,
-            "description": "Read line-numbered context around one line in a workspace file. Defaults to 30 lines before and after.",
+            "description": "Read line-numbered context around one line in a local text file. Accepts workspace-relative paths and absolute local paths. Defaults to 30 lines before and after.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative file path."
+                        "description": "File path, relative to the workspace or absolute."
                     },
                     "line": {
                         "type": "integer",
@@ -602,13 +661,13 @@ fn document_read_docx_definition() -> Value {
         "type": "function",
         "function": {
             "name": DOCUMENT_READ_DOCX_TOOL_NAME,
-            "description": "Read a .docx Word document inside the workspace. Extracts paragraphs, headings, tables, comments, headers, footers, footnotes, endnotes, images, and plain text. Read-only; does not preserve exact visual layout.",
+            "description": "Read a local .docx Word document. Accepts workspace-relative paths and absolute local paths. Extracts paragraphs, headings, tables, comments, headers, footers, footnotes, endnotes, images, and plain text. Read-only; does not preserve exact visual layout.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative .docx file path."
+                        "description": ".docx file path, relative to the workspace or absolute."
                     },
                     "max_items": {
                         "type": "integer",
@@ -628,13 +687,13 @@ fn presentation_read_pptx_definition() -> Value {
         "type": "function",
         "function": {
             "name": PRESENTATION_READ_PPTX_TOOL_NAME,
-            "description": "Read a .pptx PowerPoint deck inside the workspace. Extracts slide order, titles, text boxes, speaker notes, and image relationship targets. Read-only; does not preserve exact visual layout.",
+            "description": "Read a local .pptx PowerPoint deck. Accepts workspace-relative paths and absolute local paths. Extracts slide order, titles, text boxes, speaker notes, and image relationship targets. Read-only; does not preserve exact visual layout.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative .pptx file path."
+                        "description": ".pptx file path, relative to the workspace or absolute."
                     },
                     "max_items": {
                         "type": "integer",
@@ -746,6 +805,242 @@ fn vs_get_error_list_definition() -> Value {
             }
         }
     })
+}
+
+fn agent_spawn_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": AGENT_SPAWN_TOOL_NAME,
+            "description": "Spawn a read-only CodeForge subagent for a bounded code investigation task. Use proactively for broad, multi-file, review, architecture, debugging, performance, security, or test-gap tasks; avoid it for simple single-file edits or direct answers. The child agent returns a concise summary; raw child trace is stored separately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "taskName": {
+                        "type": "string",
+                        "description": "Short stable name for the child task, such as architecture-review or test-gap-scan."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Exact task for the child agent. Include scope, files or systems to inspect, and required summary format."
+                    },
+                    "agentKind": {
+                        "type": "string",
+                        "enum": ["explorer", "reviewer", "worker"],
+                        "default": "explorer",
+                        "description": "Subagent profile. The first implementation treats all child agents as read-only; worker is accepted for naming only."
+                    },
+                    "modelId": {
+                        "type": "string",
+                        "description": "Optional model override. Omit to inherit the parent model."
+                    },
+                    "reasoningEffort": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Optional reasoning effort override."
+                    },
+                    "readOnly": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Must be true in this implementation. Write-capable subagents are rejected."
+                    }
+                },
+                "required": ["taskName", "message"]
+            }
+        }
+    })
+}
+
+fn agent_wait_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": AGENT_WAIT_TOOL_NAME,
+            "description": "Wait for spawned subagents to finish and collect their concise summaries. If childTaskIds is omitted, waits for all active child agents for this parent run.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "childTaskIds": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional child task IDs returned by agent/spawn."
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn agent_list_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": AGENT_LIST_TOOL_NAME,
+            "description": "List subagents spawned by the current parent run and their status.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn progress_update_steps_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": PROGRESS_UPDATE_STEPS_TOOL_NAME,
+            "description": "Update the visible task-specific Steps panel for the current run. Use this for non-trivial research, review, debug, verify, or implement work. The steps must be generated for the current user request; do not use a fixed template.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "default": "Steps",
+                        "description": "Short panel title. Prefer Steps unless a mode-specific title is clearer."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["research", "debug", "implement", "review", "verify", "default"],
+                        "description": "Current internal mode when useful for display."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Optional one-line progress summary or current focus."
+                    },
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 12,
+                        "description": "Task-specific steps for this run. Send the full current list on every update.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Stable short id for this step within the current run."
+                                },
+                                "title": {
+                                    "type": "string",
+                                    "description": "Human-readable step title."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed", "blocked", "skipped"],
+                                    "description": "Current step state."
+                                },
+                                "detail": {
+                                    "type": "string",
+                                    "description": "Optional short detail, evidence target, or blocker."
+                                }
+                            },
+                            "required": ["id", "title", "status"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }
+        }
+    })
+}
+
+fn progress_update_steps(arguments: &Value) -> Result<Value, String> {
+    let steps = arguments
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "invalid_arguments: steps must be a non-empty array".to_string())?;
+    if steps.is_empty() {
+        return Err("invalid_arguments: steps must not be empty".to_string());
+    }
+
+    let normalized_steps = steps
+        .iter()
+        .take(12)
+        .enumerate()
+        .map(|(index, step)| normalize_progress_step(step, index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let completed_count = normalized_steps
+        .iter()
+        .filter(|step| step.get("status").and_then(Value::as_str) == Some("completed"))
+        .count();
+    let active_step = normalized_steps
+        .iter()
+        .find(|step| step.get("status").and_then(Value::as_str) == Some("in_progress"))
+        .and_then(|step| step.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let total_count = normalized_steps.len();
+    let title =
+        optional_non_empty_string(arguments, "title").unwrap_or_else(|| "Steps".to_string());
+    let mode = optional_non_empty_string(arguments, "mode");
+    let summary = optional_non_empty_string(arguments, "summary");
+
+    Ok(json!({
+        "title": title,
+        "mode": mode,
+        "summary": summary,
+        "steps": normalized_steps,
+        "completedCount": completed_count,
+        "totalCount": total_count,
+        "activeStep": active_step,
+    }))
+}
+
+fn normalize_progress_step(step: &Value, index: usize) -> Result<Value, String> {
+    let object = step
+        .as_object()
+        .ok_or_else(|| "invalid_arguments: each step must be an object".to_string())?;
+    let title = object
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "invalid_arguments: each step requires a non-empty title".to_string())?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("step-{}", index + 1));
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .map(normalize_progress_status)
+        .unwrap_or("pending");
+    let detail = object
+        .get("detail")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    Ok(json!({
+        "id": id,
+        "title": title,
+        "status": status,
+        "detail": detail,
+    }))
+}
+
+fn normalize_progress_status(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "in_progress" | "in-progress" | "running" | "active" => "in_progress",
+        "completed" | "complete" | "done" => "completed",
+        "blocked" | "failed" => "blocked",
+        "skipped" | "skip" => "skipped",
+        _ => "pending",
+    }
+}
+
+fn optional_non_empty_string(arguments: &Value, key: &str) -> Option<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn add(arguments: &Value) -> Result<Value, String> {
@@ -970,6 +1265,7 @@ mod tests {
         assert!(names.contains(&VS_LIST_PROJECTS_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_LIST_PROJECT_FILES_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_GET_ERROR_LIST_TOOL_NAME.to_string()));
+        assert!(names.contains(&PROGRESS_UPDATE_STEPS_TOOL_NAME.to_string()));
         assert!(!names.contains(&CALCULATOR_ADD_TOOL_NAME.to_string()));
     }
 
@@ -986,6 +1282,94 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec![CALCULATOR_ADD_TOOL_NAME.to_string()]);
+    }
+
+    #[test]
+    fn read_only_tool_definitions_exclude_write_and_shell_tools() {
+        let names = read_only_tool_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&WORKSPACE_SEARCH_CONTENT_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_GET_ERROR_LIST_TOOL_NAME.to_string()));
+        assert!(names.contains(&PROGRESS_UPDATE_STEPS_TOOL_NAME.to_string()));
+        assert!(!names.contains(&EDIT_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&WRITE_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&SHELL_COMMAND_TOOL_NAME.to_string()));
+    }
+
+    #[test]
+    fn agent_tool_definitions_expose_spawn_wait_and_list() {
+        let names = agent_tool_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                AGENT_SPAWN_TOOL_NAME.to_string(),
+                AGENT_WAIT_TOOL_NAME.to_string(),
+                AGENT_LIST_TOOL_NAME.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_spawn_definition_allows_proactive_readonly_delegation() {
+        let tools = agent_tool_definitions();
+        let spawn = tools
+            .iter()
+            .find(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    == Some(AGENT_SPAWN_TOOL_NAME)
+            })
+            .unwrap();
+        let description = spawn["function"]["description"].as_str().unwrap();
+
+        assert!(description.contains("Use proactively"));
+        assert!(description.contains("read-only CodeForge subagent"));
+        assert!(!description.contains("explicitly asks"));
+    }
+
+    #[test]
+    fn progress_update_steps_normalizes_dynamic_steps() {
+        let output = progress_update_steps(&json!({
+            "title": "Investigation",
+            "mode": "research",
+            "summary": "Checking tool wiring",
+            "steps": [
+                { "id": "entry", "title": "Find entry point", "status": "done" },
+                { "id": "tools", "title": "Inspect tools", "status": "running", "detail": "tool_registry.rs" },
+                { "id": "answer", "title": "Summarize result", "status": "pending" }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(output["title"], json!("Investigation"));
+        assert_eq!(output["mode"], json!("research"));
+        assert_eq!(output["completedCount"], json!(1));
+        assert_eq!(output["totalCount"], json!(3));
+        assert_eq!(output["activeStep"], json!("Inspect tools"));
+        assert_eq!(output["steps"][0]["status"], json!("completed"));
+        assert_eq!(output["steps"][1]["status"], json!("in_progress"));
+        assert_eq!(output["steps"][1]["detail"], json!("tool_registry.rs"));
     }
 
     #[test]

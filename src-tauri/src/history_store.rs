@@ -86,6 +86,7 @@ impl HistoryStore {
             .map_err(|error| format!("SQLite open failed {}: {error}", path.to_string_lossy()))?;
         let store = Self { conn };
         store.init_schema()?;
+        store.ensure_agent_run_metadata_columns()?;
         store.fail_abandoned_running_runs()?;
         Ok(store)
     }
@@ -320,12 +321,17 @@ impl HistoryStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, run_id, step_index, event_type, tool_name, title,
-                        input_json, output_json, output_summary, started_at,
-                        ended_at, duration_ms, status
+                "SELECT trace_events.id, trace_events.run_id, trace_events.step_index,
+                        trace_events.event_type, trace_events.tool_name, trace_events.title,
+                        trace_events.input_json, trace_events.output_json,
+                        trace_events.output_summary, trace_events.started_at,
+                        trace_events.ended_at, trace_events.duration_ms, trace_events.status,
+                        agent_runs.parent_run_id, agent_runs.agent_name,
+                        agent_runs.task_name, agent_runs.read_only, agent_runs.depth
                  FROM trace_events
-                 WHERE run_id = ?1
-                 ORDER BY step_index ASC, started_at ASC, id ASC",
+                 LEFT JOIN agent_runs ON agent_runs.run_id = trace_events.run_id
+                 WHERE trace_events.run_id = ?1
+                 ORDER BY trace_events.step_index ASC, trace_events.started_at ASC, trace_events.id ASC",
             )
             .map_err(sql_error)?;
         let rows = stmt
@@ -346,6 +352,11 @@ impl HistoryStore {
                     ended_at: row.get(10)?,
                     duration_ms: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
                     status_text,
+                    parent_task_id: row.get(13)?,
+                    agent_name: row.get(14)?,
+                    task_name: row.get(15)?,
+                    read_only: row.get::<_, Option<i64>>(16)?.map(|value| value != 0),
+                    subagent_depth: row.get::<_, Option<i64>>(17)?.map(|value| value as u32),
                 })
             })
             .map_err(sql_error)?
@@ -497,6 +508,11 @@ impl HistoryStore {
                 CREATE TABLE IF NOT EXISTS agent_runs (
                     run_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
+                    parent_run_id TEXT,
+                    agent_name TEXT,
+                    task_name TEXT,
+                    read_only INTEGER,
+                    depth INTEGER,
                     provider_id TEXT,
                     model_id TEXT,
                     status TEXT NOT NULL,
@@ -534,6 +550,37 @@ impl HistoryStore {
                 "#,
             )
             .map_err(sql_error)
+    }
+
+    fn ensure_agent_run_metadata_columns(&self) -> Result<(), String> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(agent_runs)")
+            .map_err(sql_error)?;
+        let existing = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+
+        for (name, sql_type) in [
+            ("parent_run_id", "TEXT"),
+            ("agent_name", "TEXT"),
+            ("task_name", "TEXT"),
+            ("read_only", "INTEGER"),
+            ("depth", "INTEGER"),
+        ] {
+            if existing.iter().any(|column| column == name) {
+                continue;
+            }
+            self.conn
+                .execute(
+                    &format!("ALTER TABLE agent_runs ADD COLUMN {name} {sql_type}"),
+                    [],
+                )
+                .map_err(sql_error)?;
+        }
+        Ok(())
     }
 
     fn meta_value(&self, key: &str) -> Result<Option<String>, String> {
@@ -736,16 +783,29 @@ impl HistoryStore {
         self.conn
             .execute(
                 "INSERT INTO agent_runs (
-                    run_id, session_id, status, started_at, ended_at, final_summary
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    run_id, session_id, parent_run_id, agent_name, task_name,
+                    read_only, depth, status, started_at, ended_at, final_summary
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(run_id) DO UPDATE SET
                     session_id = excluded.session_id,
+                    parent_run_id = COALESCE(excluded.parent_run_id, agent_runs.parent_run_id),
+                    agent_name = COALESCE(excluded.agent_name, agent_runs.agent_name),
+                    task_name = COALESCE(excluded.task_name, agent_runs.task_name),
+                    read_only = COALESCE(excluded.read_only, agent_runs.read_only),
+                    depth = COALESCE(excluded.depth, agent_runs.depth),
                     status = excluded.status,
                     ended_at = COALESCE(excluded.ended_at, agent_runs.ended_at),
                     final_summary = COALESCE(excluded.final_summary, agent_runs.final_summary)",
                 params![
                     event.task_id.as_str(),
                     session_id,
+                    event.parent_task_id.as_deref(),
+                    event.agent_name.as_deref(),
+                    event.task_name.as_deref(),
+                    event
+                        .read_only
+                        .map(|value| if value { 1_i64 } else { 0_i64 }),
+                    event.subagent_depth.map(|value| value as i64),
                     status,
                     started_at,
                     ended_at,
@@ -771,6 +831,11 @@ struct MessageRow {
 struct TraceEventRow {
     id: String,
     task_id: String,
+    parent_task_id: Option<String>,
+    agent_name: Option<String>,
+    task_name: Option<String>,
+    read_only: Option<bool>,
+    subagent_depth: Option<u32>,
     step_index: u32,
     event_type_text: String,
     tool_name: Option<String>,
@@ -789,6 +854,11 @@ impl TraceEventRow {
         Ok(ToolTraceEvent {
             id: self.id,
             task_id: self.task_id,
+            parent_task_id: self.parent_task_id,
+            agent_name: self.agent_name,
+            task_name: self.task_name,
+            read_only: self.read_only,
+            subagent_depth: self.subagent_depth,
             step_index: self.step_index,
             event_type: enum_from_text(&self.event_type_text)?,
             tool_name: self.tool_name,
@@ -869,6 +939,11 @@ mod tests {
         let trace = ToolTraceEvent {
             id: "trace-1".to_string(),
             task_id: "run-1".to_string(),
+            parent_task_id: None,
+            agent_name: None,
+            task_name: None,
+            read_only: None,
+            subagent_depth: None,
             step_index: 1,
             event_type: TraceEventType::ToolResult,
             tool_name: Some("workspace/read_file".to_string()),
@@ -964,6 +1039,47 @@ mod tests {
     }
 
     #[test]
+    fn subagent_run_metadata_round_trips_with_trace_events() {
+        let path = std::env::temp_dir().join(format!(
+            "codeforge-history-test-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let mut store = HistoryStore::load(path.clone()).unwrap();
+        let trace = ToolTraceEvent {
+            id: "trace-1".to_string(),
+            task_id: "child-run-1".to_string(),
+            parent_task_id: Some("parent-run-1".to_string()),
+            agent_name: Some("explorer".to_string()),
+            task_name: Some("architecture-review".to_string()),
+            read_only: Some(true),
+            subagent_depth: Some(1),
+            step_index: 1,
+            event_type: TraceEventType::FinalResponse,
+            tool_name: None,
+            title: "final_response".to_string(),
+            input: None,
+            output: Some(serde_json::json!({ "message": "done" })),
+            output_summary: Some("done".to_string()),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            ended_at: Some("2026-01-01T00:00:01Z".to_string()),
+            duration_ms: Some(10),
+            status: TraceStatus::Success,
+        };
+
+        store.insert_trace_event("session-1", &trace).unwrap();
+        let loaded = store.list_trace_events("child-run-1").unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].parent_task_id.as_deref(), Some("parent-run-1"));
+        assert_eq!(loaded[0].agent_name.as_deref(), Some("explorer"));
+        assert_eq!(loaded[0].task_name.as_deref(), Some("architecture-review"));
+        assert_eq!(loaded[0].read_only, Some(true));
+        assert_eq!(loaded[0].subagent_depth, Some(1));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn load_marks_abandoned_running_runs_failed() {
         let path = std::env::temp_dir().join(format!(
             "codeforge-history-test-{}.sqlite3",
@@ -999,6 +1115,11 @@ mod tests {
                     &ToolTraceEvent {
                         id: "trace-1".to_string(),
                         task_id: "run-1".to_string(),
+                        parent_task_id: None,
+                        agent_name: None,
+                        task_name: None,
+                        read_only: None,
+                        subagent_depth: None,
                         step_index: 1,
                         event_type: TraceEventType::LlmRequest,
                         tool_name: None,

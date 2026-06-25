@@ -1114,28 +1114,21 @@ fn canonical_workspace_root(workspace_root: &str) -> Result<PathBuf, String> {
 }
 
 fn resolve_existing_path(workspace: &Path, raw_path: &str) -> Result<PathBuf, String> {
-    let input = PathBuf::from(raw_path);
-    if input.is_absolute() {
-        return Err(format!(
-            "path_outside_workspace: {}",
-            normalize_display_path(raw_path)
-        ));
-    }
-    let candidate = workspace.join(&input);
+    let normalized = normalize_display_path(raw_path);
+    let trimmed = normalized.trim();
+    let input = PathBuf::from(trimmed);
+    let candidate = if input.is_absolute() {
+        input
+    } else {
+        workspace.join(&input)
+    };
     let canonical = candidate.canonicalize().map_err(|error| {
         format!(
             "file_not_found: {}: {error}",
             normalize_display_path(raw_path)
         )
     })?;
-    if canonical.starts_with(workspace) {
-        Ok(canonical)
-    } else {
-        Err(format!(
-            "path_outside_workspace: {}",
-            normalize_display_path(raw_path)
-        ))
-    }
+    Ok(canonical)
 }
 
 fn relative_path(workspace: &Path, path: &Path) -> String {

@@ -9,6 +9,7 @@ pub mod history_store;
 pub mod path_utils;
 pub mod process_manager;
 pub mod project_registry;
+pub mod subagent_manager;
 pub mod tool_registry;
 pub mod tool_trace;
 pub mod vs_bridge_client;

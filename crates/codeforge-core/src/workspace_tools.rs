@@ -40,13 +40,13 @@ const IGNORED_SEARCH_PATHS: &[&[&str]] = &[&[".claude", "worktrees"]];
 
 const DEFAULT_CONTENT_EXTENSIONS: &[&str] = &[
     ".h", ".hpp", ".c", ".cpp", ".cc", ".cxx", ".inl", ".ixx", ".cs", ".sln", ".vcxproj", ".props",
-    ".targets", ".json", ".xml", ".txt", ".md",
+    ".targets", ".json", ".xml", ".txt", ".md", ".log",
 ];
 
 pub fn list_dir(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
     let workspace = canonical_workspace_root(workspace_root)?;
     let raw_path = required_string(arguments, "path")?;
-    let dir = resolve_existing_path(&workspace, &raw_path)?;
+    let dir = resolve_existing_read_path(&workspace, &raw_path)?;
     if !dir.is_dir() {
         return Err(format!(
             "not_directory: {}",
@@ -104,7 +104,7 @@ pub fn list_dir(workspace_root: &str, arguments: &Value) -> Result<Value, String
 pub fn read_file(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
     let workspace = canonical_workspace_root(workspace_root)?;
     let raw_path = required_string(arguments, "path")?;
-    let file = resolve_existing_path(&workspace, &raw_path)?;
+    let file = resolve_existing_read_path(&workspace, &raw_path)?;
     ensure_regular_text_file(&workspace, &file)?;
 
     let start_line = optional_usize(arguments, "start_line", 1)?;
@@ -164,6 +164,9 @@ pub fn search_file(workspace_root: &str, arguments: &Value) -> Result<Value, Str
     let pattern = pattern.trim();
     if pattern.is_empty() {
         return Err("invalid_arguments: pattern must not be empty".to_string());
+    }
+    if wildcard_pattern(pattern) {
+        return search_file_with_wildcard(&workspace, &root, pattern, max_results);
     }
 
     let search_result = crate::file_search::run(
@@ -225,6 +228,61 @@ pub fn search_file(workspace_root: &str, arguments: &Value) -> Result<Value, Str
     }))
 }
 
+fn search_file_with_wildcard(
+    workspace: &Path,
+    root: &Path,
+    pattern: &str,
+    max_results: usize,
+) -> Result<Value, String> {
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    let scanned_files = walk_files_until(workspace, root, &mut |path, scanned| {
+        if scanned > SEARCH_CONTENT_SCAN_LIMIT {
+            truncated = true;
+            return Ok(WalkControl::Stop);
+        }
+        let relative = relative_path(workspace, path);
+        if matches_file_glob(&relative, pattern) {
+            if matches.len() >= max_results {
+                truncated = true;
+                return Ok(WalkControl::Stop);
+            }
+            matches.push(json!({
+                "path": relative,
+                "type": "file",
+                "score": 0,
+                "indices": [],
+            }));
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    let paths = matches
+        .iter()
+        .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "root": relative_path(workspace, root),
+        "pattern": pattern,
+        "matches": matches,
+        "paths": paths,
+        "count": paths.len(),
+        "totalMatches": paths.len(),
+        "shown": paths.len(),
+        "complete": !truncated,
+        "maxResults": max_results,
+        "truncated": truncated,
+        "scannedFiles": scanned_files,
+        "engine": "wildcard-file-search",
+        "message": if truncated {
+            Some(format!("search_limited: returned {max_results} matches before scanning all files"))
+        } else {
+            None
+        }
+    }))
+}
+
 pub fn search_content(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
     let workspace = canonical_workspace_root(workspace_root)?;
     let query = required_string(arguments, "query")?;
@@ -232,7 +290,7 @@ pub fn search_content(workspace_root: &str, arguments: &Value) -> Result<Value, 
         return Err("invalid_arguments: query must not be empty".to_string());
     }
 
-    let root = resolve_search_root(&workspace, arguments)?;
+    let root = resolve_search_path(&workspace, arguments)?;
     let file_glob = optional_string(arguments, "file_glob")?;
     let max_results = max_results(arguments)?;
     let context_lines = optional_usize(arguments, "context_lines", DEFAULT_CONTENT_CONTEXT_LINES)?
@@ -245,8 +303,8 @@ pub fn search_content(workspace_root: &str, arguments: &Value) -> Result<Value, 
         None
     };
 
-    if ripgrep_available() {
-        search_content_with_rg(
+    if root.is_dir() && ripgrep_available() {
+        match search_content_with_rg(
             &workspace,
             &root,
             &query,
@@ -255,19 +313,23 @@ pub fn search_content(workspace_root: &str, arguments: &Value) -> Result<Value, 
             context_lines,
             case_sensitive,
             regex,
-        )
-    } else {
-        search_content_with_fallback(
-            &workspace,
-            &root,
-            &query,
-            file_glob.as_deref(),
-            max_results,
-            context_lines,
-            case_sensitive,
-            compiled_regex.as_ref(),
-        )
+        ) {
+            Ok(output) => return Ok(output),
+            Err(error) if error.starts_with("invalid_regex:") => return Err(error),
+            Err(_) => {}
+        }
     }
+
+    search_content_with_fallback(
+        &workspace,
+        &root,
+        &query,
+        file_glob.as_deref(),
+        max_results,
+        context_lines,
+        case_sensitive,
+        compiled_regex.as_ref(),
+    )
 }
 
 pub fn edit_file(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
@@ -472,7 +534,7 @@ pub fn get_file_context(workspace_root: &str, arguments: &Value) -> Result<Value
         return Err("invalid_range: line must be >= 1".to_string());
     }
 
-    let file = resolve_existing_path(&workspace, &raw_path)?;
+    let file = resolve_existing_read_path(&workspace, &raw_path)?;
     ensure_regular_text_file(&workspace, &file)?;
     let before =
         optional_usize(arguments, "before", DEFAULT_FILE_CONTEXT_BEFORE)?.min(MAX_CONTEXT_LINES);
@@ -656,6 +718,7 @@ fn search_content_with_fallback(
     let mut matches = Vec::new();
     let mut truncated = false;
     let mut scan_limited = false;
+    let mut skipped_files = 0usize;
     let started = Instant::now();
     let normalized_query = if case_sensitive {
         query.to_string()
@@ -677,24 +740,36 @@ fn search_content_with_fallback(
         if !content_file_allowed(workspace, path, file_glob) {
             return Ok(WalkControl::Continue);
         }
-        if is_binary_file(path)? {
-            return Ok(WalkControl::Continue);
+        match is_binary_file(path) {
+            Ok(true) => return Ok(WalkControl::Continue),
+            Ok(false) => {}
+            Err(_) => {
+                skipped_files += 1;
+                return Ok(WalkControl::Continue);
+            }
         }
 
         let mut line_number = 0usize;
-        let file = File::open(path).map_err(|error| {
-            format!(
-                "file_not_found: {}: {error}",
-                relative_path(workspace, path)
-            )
-        })?;
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(_) => {
+                skipped_files += 1;
+                return Ok(WalkControl::Continue);
+            }
+        };
         let mut reader = BufReader::new(file);
         let mut bytes = Vec::new();
-        while reader
-            .read_until(b'\n', &mut bytes)
-            .map_err(|error| format!("read_failed: {}: {error}", relative_path(workspace, path)))?
-            > 0
-        {
+        loop {
+            let read = match reader.read_until(b'\n', &mut bytes) {
+                Ok(read) => read,
+                Err(_) => {
+                    skipped_files += 1;
+                    return Ok(WalkControl::Continue);
+                }
+            };
+            if read == 0 {
+                break;
+            }
             line_number += 1;
             let line = bytes_to_line(&bytes);
             let columns = find_columns(&line, &normalized_query, case_sensitive, regex);
@@ -704,7 +779,13 @@ fn search_content_with_fallback(
                     return Ok(WalkControl::Stop);
                 }
                 let (before, after) =
-                    read_before_after(path, line_number, context_lines, context_lines)?;
+                    match read_before_after(path, line_number, context_lines, context_lines) {
+                        Ok(context) => context,
+                        Err(_) => {
+                            skipped_files += 1;
+                            return Ok(WalkControl::Continue);
+                        }
+                    };
                 matches.push(json!({
                     "file": relative_path(workspace, path),
                     "line": line_number,
@@ -732,6 +813,7 @@ fn search_content_with_fallback(
         "matches": matches,
         "count": matches.len(),
         "scannedFiles": scanned_files,
+        "skippedFiles": skipped_files,
         "complete": !truncated && !scan_limited,
         "truncated": truncated || scan_limited,
         "message": if scan_limited {
@@ -780,9 +862,26 @@ fn resolve_existing_path(workspace: &Path, raw_path: &str) -> Result<PathBuf, St
     Ok(canonical)
 }
 
+fn resolve_existing_read_path(base: &Path, raw_path: &str) -> Result<PathBuf, String> {
+    let normalized = normalize_display_path(raw_path);
+    let trimmed = normalized.trim();
+    let candidate = if trimmed.is_empty() || trimmed == "." {
+        base.to_path_buf()
+    } else {
+        let path = PathBuf::from(trimmed);
+        if path.is_absolute() {
+            path
+        } else {
+            base.join(path)
+        }
+    };
+    canonicalize_path(&candidate)
+        .map_err(|_| format!("file_not_found: {}", display_input_path(raw_path)))
+}
+
 fn resolve_search_root(workspace: &Path, arguments: &Value) -> Result<PathBuf, String> {
     let root = optional_string(arguments, "root")?.unwrap_or_else(|| ".".to_string());
-    let path = resolve_existing_path(workspace, &root)?;
+    let path = resolve_existing_read_path(workspace, &root)?;
     if !path.is_dir() {
         return Err(format!(
             "not_directory: {}",
@@ -792,18 +891,20 @@ fn resolve_search_root(workspace: &Path, arguments: &Value) -> Result<PathBuf, S
     Ok(path)
 }
 
-fn resolve_rg_path(workspace: &Path, root: &Path, path_text: &str) -> Result<PathBuf, String> {
-    let raw = normalize_display_path(path_text);
-    let path = PathBuf::from(raw.trim());
-    let candidate = if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
-    };
-    let canonical = canonicalize_path(&candidate)
-        .map_err(|_| format!("file_not_found: {}", candidate.display()))?;
-    ensure_inside_workspace(workspace, &canonical, path_text)?;
-    Ok(canonical)
+fn resolve_search_path(workspace: &Path, arguments: &Value) -> Result<PathBuf, String> {
+    let root = optional_string(arguments, "root")?.unwrap_or_else(|| ".".to_string());
+    let path = resolve_existing_read_path(workspace, &root)?;
+    if path.is_dir() || path.is_file() {
+        return Ok(path);
+    }
+    Err(format!(
+        "not_file_or_directory: {}",
+        relative_or_display(workspace, &path)
+    ))
+}
+
+fn resolve_rg_path(_workspace: &Path, root: &Path, path_text: &str) -> Result<PathBuf, String> {
+    resolve_existing_read_path(root, path_text)
 }
 
 fn ensure_inside_workspace(workspace: &Path, path: &Path, raw_path: &str) -> Result<(), String> {
@@ -857,27 +958,39 @@ enum WalkControl {
 }
 
 fn walk_files_until(
-    workspace: &Path,
+    _workspace: &Path,
     root: &Path,
     visit: &mut impl FnMut(&Path, usize) -> Result<WalkControl, String>,
 ) -> Result<usize, String> {
+    if root.is_file() {
+        if matches!(visit(root, 1)?, WalkControl::Stop) {
+            return Ok(1);
+        }
+        return Ok(1);
+    }
+
     let mut stack = vec![root.to_path_buf()];
     let mut scanned = 0usize;
     while let Some(dir) = stack.pop() {
-        for entry in sorted_read_dir(&dir)? {
+        let entries = match sorted_read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if dir == root => return Err(error),
+            Err(_) => continue,
+        };
+        for entry in entries {
             let path = entry.path();
             if path.is_dir() {
                 if is_ignored_dir(&path) {
                     continue;
                 }
-                let canonical = canonicalize_path(&path)
-                    .map_err(|error| format!("read_dir_failed: {}: {error}", path.display()))?;
-                ensure_inside_workspace(workspace, &canonical, &path.to_string_lossy())?;
+                let Ok(canonical) = canonicalize_path(&path) else {
+                    continue;
+                };
                 stack.push(canonical);
             } else if path.is_file() {
-                let canonical = canonicalize_path(&path)
-                    .map_err(|error| format!("file_not_found: {}: {error}", path.display()))?;
-                ensure_inside_workspace(workspace, &canonical, &path.to_string_lossy())?;
+                let Ok(canonical) = canonicalize_path(&path) else {
+                    continue;
+                };
                 scanned += 1;
                 if matches!(visit(&canonical, scanned)?, WalkControl::Stop) {
                     return Ok(scanned);
@@ -1035,6 +1148,10 @@ fn matches_file_glob(relative_path: &str, glob: &str) -> bool {
         .unwrap_or(relative_path)
         .to_ascii_lowercase();
     wildcard_match(&path, &pattern) || wildcard_match(&file_name, &pattern)
+}
+
+fn wildcard_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
 }
 
 fn wildcard_match(text: &str, pattern: &str) -> bool {
@@ -1279,25 +1396,58 @@ mod tests {
     }
 
     #[test]
-    fn paths_cannot_escape_workspace() {
+    fn read_tools_allow_absolute_paths_outside_workspace() {
         let workspace = TestWorkspace::new();
-        let outside = std::env::temp_dir().join(format!(
-            "snowagent-outside-{}",
+        let outside_dir = std::env::temp_dir().join(format!(
+            "snowagent-outside-dir-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("outside.log");
         fs::write(&outside, "outside").unwrap();
 
-        let error = read_file(
+        let listed = list_dir(
+            &workspace.root_str(),
+            &json!({ "path": outside_dir.to_string_lossy() }),
+        )
+        .unwrap();
+        let read = read_file(
             &workspace.root_str(),
             &json!({ "path": outside.to_string_lossy() }),
         )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(outside_dir);
+        assert!(listed["files"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("outside.log"));
+        assert_eq!(read["text"], json!("outside"));
+        assert!(read["file"].as_str().unwrap().contains("outside.log"));
+    }
+
+    #[test]
+    fn write_tools_still_reject_absolute_paths_outside_workspace() {
+        let workspace = TestWorkspace::new();
+        let outside = std::env::temp_dir().join(format!(
+            "snowagent-outside-write-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let error = write_file(
+            &workspace.root_str(),
+            &json!({ "file": outside.to_string_lossy(), "content": "outside" }),
+        )
         .unwrap_err();
 
-        let _ = fs::remove_file(outside);
         assert!(error.contains("path_outside_workspace"));
+        assert!(!outside.exists());
     }
 
     #[test]
@@ -1337,6 +1487,70 @@ mod tests {
     }
 
     #[test]
+    fn search_file_allows_absolute_root_outside_workspace() {
+        let workspace = TestWorkspace::new();
+        let outside_dir = std::env::temp_dir().join(format!(
+            "snowagent-outside-search-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("render_trace.log"), "trace").unwrap();
+
+        let result = search_file(
+            &workspace.root_str(),
+            &json!({
+                "pattern": "render_trace.log",
+                "root": outside_dir.to_string_lossy(),
+                "max_results": 10
+            }),
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(outside_dir);
+        assert_eq!(result["paths"].as_array().unwrap().len(), 1);
+        assert!(result["paths"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("render_trace.log"));
+    }
+
+    #[test]
+    fn search_file_supports_wildcard_pattern() {
+        let workspace = TestWorkspace::new();
+        let outside_dir = std::env::temp_dir().join(format!(
+            "snowagent-outside-wildcard-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("wz_render_frame_trace_9020.log"), "trace").unwrap();
+        fs::write(outside_dir.join("wz_model_render_trace_9020.log"), "trace").unwrap();
+
+        let result = search_file(
+            &workspace.root_str(),
+            &json!({
+                "pattern": "wz_render_frame_trace_*.log",
+                "root": outside_dir.to_string_lossy(),
+                "max_results": 10
+            }),
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(outside_dir);
+        assert_eq!(result["engine"], json!("wildcard-file-search"));
+        assert_eq!(result["paths"].as_array().unwrap().len(), 1);
+        assert!(result["paths"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("wz_render_frame_trace_9020.log"));
+    }
+
+    #[test]
     fn search_content_finds_matches_with_context_and_columns() {
         let workspace = TestWorkspace::new();
         workspace.write_text("src/code.cpp", "before\nneedle here needle\nafter\n");
@@ -1360,6 +1574,75 @@ mod tests {
         assert_eq!(first["before"][0]["text"], json!("before"));
         assert_eq!(first["after"][0]["text"], json!("after"));
         assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_content_allows_absolute_root_outside_workspace() {
+        let workspace = TestWorkspace::new();
+        let outside_dir = std::env::temp_dir().join(format!(
+            "snowagent-outside-content-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("render_trace.log"), "frame needle\n").unwrap();
+
+        let result = search_content(
+            &workspace.root_str(),
+            &json!({
+                "query": "needle",
+                "root": outside_dir.to_string_lossy(),
+                "file_glob": "*.log",
+                "max_results": 10
+            }),
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(outside_dir);
+        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+        assert!(result["matches"][0]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("render_trace.log"));
+    }
+
+    #[test]
+    fn search_content_accepts_file_root() {
+        let workspace = TestWorkspace::new();
+        let outside_dir = std::env::temp_dir().join(format!(
+            "snowagent-outside-file-root-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&outside_dir).unwrap();
+        let log = outside_dir.join("wz_model_render_trace_9020.log");
+        fs::write(&log, "before\nsubmitCachedTransparencyFaces.end ms=109\n").unwrap();
+
+        let result = search_content(
+            &workspace.root_str(),
+            &json!({
+                "query": "submitCachedTransparencyFaces.end",
+                "root": log.to_string_lossy(),
+                "max_results": 10,
+                "context_lines": 0
+            }),
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(outside_dir);
+        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+        assert!(result["matches"][0]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("wz_model_render_trace_9020.log"));
+        assert_eq!(
+            result["matches"][0]["text"],
+            json!("submitCachedTransparencyFaces.end ms=109")
+        );
     }
 
     #[test]

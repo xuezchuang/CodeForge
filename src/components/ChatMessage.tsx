@@ -4,12 +4,16 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Circle,
   CircleAlert,
+  CircleDot,
   Copy,
   Eye,
+  GitFork,
   ListTree,
   PanelRightOpen,
   Pencil,
+  RotateCcw,
   Search,
   ThumbsDown,
   ThumbsUp,
@@ -29,7 +33,13 @@ interface ChatMessageProps {
   onCodeLinkError: (message: string) => void
   onTraceChanged: (taskId: string) => void
   onOpenTrace: (message: ChatMessageModel) => void
-  onEditUserMessage: (message: ChatMessageModel) => void
+  canEditUserMessage: boolean
+  editingUserMessageId: string | null
+  onStartEditUserMessage: (message: ChatMessageModel) => void
+  onCancelEditUserMessage: () => void
+  onSaveUserMessageEdit: (message: ChatMessageModel, content: string) => void
+  onForkMessage: (message: ChatMessageModel) => void
+  onRetryMessage: (message: ChatMessageModel) => void
 }
 
 function ChatMessage({
@@ -54,9 +64,16 @@ function ConversationChatMessage({
   onCodeLinkError,
   onTraceChanged,
   onOpenTrace,
-  onEditUserMessage,
+  canEditUserMessage,
+  editingUserMessageId,
+  onStartEditUserMessage,
+  onCancelEditUserMessage,
+  onSaveUserMessageEdit,
+  onForkMessage,
+  onRetryMessage,
 }: ChatMessageProps) {
   const isUser = message.role === 'user'
+  const isEditingUserMessage = isUser && editingUserMessageId === message.id
   const displayContent = isUser ? message.content : sanitizeModelMessage(message.content)
   const isRunningAssistant =
     !isUser && message.status === 'running' && !hasTerminalTraceEvent(message.traceEvents ?? [])
@@ -66,6 +83,7 @@ function ConversationChatMessage({
     isRunningAssistant && displayContent.startsWith(THINKING_PREFIX)
   const [copiedTarget, setCopiedTarget] = useState<'user' | 'assistant' | null>(null)
   const [activeToolTrace, setActiveToolTrace] = useState<ToolTraceEvent | null>(null)
+  const [editDraft, setEditDraft] = useState(message.content)
   const thinkingSummary = useMemo(
     () =>
       createThinkingSummary(message.traceEvents ?? [], {
@@ -88,6 +106,20 @@ function ConversationChatMessage({
         }, 1200)
       })
       .catch(() => undefined)
+  }
+
+  useEffect(() => {
+    if (isEditingUserMessage) {
+      setEditDraft(message.content)
+    }
+  }, [isEditingUserMessage, message.content])
+
+  const saveEdit = () => {
+    const nextContent = editDraft.trim()
+    if (!nextContent) {
+      return
+    }
+    onSaveUserMessageEdit(message, nextContent)
   }
 
   const messageClassName = [
@@ -134,7 +166,48 @@ function ConversationChatMessage({
             ))}
           </div>
         ) : null}
-        {!animateThinkingPrefix && (displayContent.trim().length > 0 || !message.attachments?.length) ? (
+        {isEditingUserMessage ? (
+          <div className="message-edit-form">
+            <textarea
+              className="message-edit-input"
+              value={editDraft}
+              onChange={(event) => setEditDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') {
+                  event.preventDefault()
+                  onCancelEditUserMessage()
+                }
+                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                  event.preventDefault()
+                  saveEdit()
+                }
+              }}
+              rows={Math.min(Math.max(editDraft.split(/\r?\n/).length, 2), 8)}
+              autoFocus
+            />
+            <div className="message-edit-actions">
+              <button
+                type="button"
+                className="message-action-button"
+                aria-label="Cancel edit"
+                title="Cancel"
+                onClick={onCancelEditUserMessage}
+              >
+                <X size={15} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className="message-action-button"
+                aria-label="Save edit"
+                title="Save edit"
+                onClick={saveEdit}
+                disabled={editDraft.trim().length === 0}
+              >
+                <Check size={15} aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+        ) : !animateThinkingPrefix && (displayContent.trim().length > 0 || !message.attachments?.length) ? (
           <div className="message-content">
             <MarkdownMessage
               text={displayContent}
@@ -163,15 +236,17 @@ function ConversationChatMessage({
                 <Copy size={15} aria-hidden="true" />
               )}
             </button>
-            <button
-              type="button"
-              className="message-action-button"
-              aria-label="Edit message"
-              title="Edit"
-              onClick={() => onEditUserMessage(message)}
-            >
-              <Pencil size={15} aria-hidden="true" />
-            </button>
+            {canEditUserMessage ? (
+              <button
+                type="button"
+                className="message-action-button"
+                aria-label="Edit message"
+                title="Edit"
+                onClick={() => onStartEditUserMessage(message)}
+              >
+                <Pencil size={15} aria-hidden="true" />
+              </button>
+            ) : null}
           </div>
         ) : null}
         {message.codeLinks && message.codeLinks.length > 0 ? (
@@ -253,6 +328,24 @@ function ConversationChatMessage({
               onClick={() => onOpenTrace(message)}
             >
               <PanelRightOpen size={15} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className="message-action-button"
+              aria-label="Fork from response"
+              title="Fork"
+              onClick={() => onForkMessage(message)}
+            >
+              <GitFork size={15} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className="message-action-button"
+              aria-label="Retry response in fork"
+              title="Retry"
+              onClick={() => onRetryMessage(message)}
+            >
+              <RotateCcw size={15} aria-hidden="true" />
             </button>
           </div>
         ) : null}
@@ -1005,6 +1098,24 @@ function isLongInlineCode(codeText: string): boolean {
   return codeText.length > 72
 }
 
+type ProgressStepStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'skipped'
+
+export interface ProgressStepSnapshot {
+  id: string
+  title: string
+  status: ProgressStepStatus
+  detail?: string
+}
+
+export interface ProgressSnapshot {
+  title: string
+  mode: string
+  summary: string
+  steps: ProgressStepSnapshot[]
+  completedCount: number
+  totalCount: number
+}
+
 interface ThinkingSummary {
   toolCalls: number
   llmCalls: number
@@ -1030,6 +1141,149 @@ const THINKING_REVEAL_DELAY_MS = 120
 const THINKING_TEXT_TICK_MS = 40
 const THINKING_TEXT_CHARS_PER_SECOND = 120
 const THINKING_MAX_VISIBLE_ITEMS = 50
+const PROGRESS_UPDATE_STEPS_TOOL = 'progress/update_steps'
+
+export function ProgressStepsPanel({
+  snapshot,
+  compact = false,
+}: {
+  snapshot: ProgressSnapshot
+  compact?: boolean
+}) {
+  const [collapsed, setCollapsed] = useState(compact)
+  const currentStep = currentProgressStep(snapshot)
+  const collapsedTitle = currentStep?.step.title ?? snapshot.title
+  const isCollapsed = compact && collapsed
+
+  return (
+    <section
+      className={
+        [
+          'progress-steps-card',
+          compact ? 'compact' : '',
+          isCollapsed ? 'collapsed' : '',
+        ]
+          .filter(Boolean)
+          .join(' ')
+      }
+      aria-label={snapshot.title}
+    >
+      <header className="progress-steps-header">
+        {compact ? (
+          <button
+            type="button"
+            className="progress-steps-toggle"
+            aria-expanded={!collapsed}
+            onClick={() => setCollapsed((current) => !current)}
+          >
+            <span className="progress-steps-current">
+              {currentStep ? (
+                <ProgressStepMarker status={currentStep.step.status} index={currentStep.index} />
+              ) : null}
+              <span>
+                <strong>{isCollapsed ? collapsedTitle : 'Steps'}</strong>
+                {isCollapsed && currentStep?.step.detail ? (
+                  <small>{currentStep.step.detail}</small>
+                ) : null}
+              </span>
+            </span>
+            <span className="progress-steps-meta">
+              <span className="progress-steps-count">
+                {snapshot.completedCount} / {snapshot.totalCount} done
+              </span>
+              {collapsed ? (
+                <ChevronRight size={14} aria-hidden="true" />
+              ) : (
+                <ChevronDown size={14} aria-hidden="true" />
+              )}
+            </span>
+          </button>
+        ) : (
+          <>
+            <strong>{snapshot.title}</strong>
+            <span className="progress-steps-count">
+              {snapshot.completedCount} / {snapshot.totalCount} done
+            </span>
+          </>
+        )}
+      </header>
+      {!isCollapsed ? (
+        <ol className="progress-steps-list">
+          {snapshot.steps.map((step, index) => (
+            <li className={`progress-step ${step.status}`} key={step.id}>
+              {compact ?
+                <ProgressStepMarker status={step.status} index={index} />
+              : <ProgressStepIcon status={step.status} />}
+              <span className="progress-step-body">
+                <strong>{step.title}</strong>
+                {!compact && step.detail ? <small>{step.detail}</small> : null}
+              </span>
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      {!compact && (snapshot.mode || snapshot.summary) ? (
+        <footer className="progress-steps-footer">
+          {snapshot.mode ? <span>Mode: {snapshot.mode}</span> : null}
+          {snapshot.summary ? <span>{snapshot.summary}</span> : null}
+        </footer>
+      ) : null}
+    </section>
+  )
+}
+
+function currentProgressStep(
+  snapshot: ProgressSnapshot,
+): { step: ProgressStepSnapshot; index: number } | null {
+  const inProgressIndex = snapshot.steps.findIndex((step) => step.status === 'in_progress')
+  if (inProgressIndex >= 0) {
+    return { step: snapshot.steps[inProgressIndex], index: inProgressIndex }
+  }
+
+  const pendingIndex = snapshot.steps.findIndex((step) => step.status === 'pending')
+  if (pendingIndex >= 0) {
+    return { step: snapshot.steps[pendingIndex], index: pendingIndex }
+  }
+
+  for (let index = snapshot.steps.length - 1; index >= 0; index -= 1) {
+    const step = snapshot.steps[index]
+    if (step.status === 'completed' || step.status === 'blocked') {
+      return { step, index }
+    }
+  }
+
+  return null
+}
+
+function ProgressStepMarker({
+  status,
+  index,
+}: {
+  status: ProgressStepStatus
+  index: number
+}) {
+  return (
+    <span className={`progress-step-marker ${status}`}>
+      {status === 'completed' ? <Check size={11} aria-hidden="true" /> : index + 1}
+    </span>
+  )
+}
+
+function ProgressStepIcon({ status }: { status: ProgressStepStatus }) {
+  if (status === 'completed') {
+    return <Check size={13} aria-hidden="true" />
+  }
+  if (status === 'blocked') {
+    return <CircleAlert size={13} aria-hidden="true" />
+  }
+  if (status === 'skipped') {
+    return <X size={13} aria-hidden="true" />
+  }
+  if (status === 'in_progress') {
+    return <CircleDot size={13} aria-hidden="true" />
+  }
+  return <Circle size={13} aria-hidden="true" />
+}
 
 function ThinkingPanel({
   summary,
@@ -1208,6 +1462,7 @@ function ThinkingIcon({ kind }: { kind: ThinkingItem['kind'] }) {
 function isClickableToolTrace(event: ToolTraceEvent): boolean {
   return Boolean(
     event.toolName &&
+      event.toolName !== PROGRESS_UPDATE_STEPS_TOOL &&
       (event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'error'),
   )
 }
@@ -1251,6 +1506,78 @@ function createThinkingSummary(
   }
 }
 
+export function createProgressSnapshot(events: ToolTraceEvent[]): ProgressSnapshot | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event.toolName !== PROGRESS_UPDATE_STEPS_TOOL) {
+      continue
+    }
+    const snapshot = progressSnapshotFromEvent(event)
+    if (snapshot) {
+      return snapshot
+    }
+  }
+  return null
+}
+
+function progressSnapshotFromEvent(event: ToolTraceEvent): ProgressSnapshot | null {
+  const input = asRecord(event.input)
+  const argumentsValue = asRecord(input.arguments)
+  const output = asRecord(event.output)
+  const outputValue = asRecord(output.output)
+  const source = Array.isArray(outputValue.steps) ? outputValue : argumentsValue
+  const rawSteps = Array.isArray(source.steps) ? source.steps : []
+  const steps = rawSteps
+    .map((step, index) => normalizeProgressStep(step, index))
+    .filter((step): step is ProgressStepSnapshot => step !== null)
+  if (steps.length === 0) {
+    return null
+  }
+  const completedCount =
+    numberValue(source.completedCount) ??
+    steps.filter((step) => step.status === 'completed').length
+  const totalCount = numberValue(source.totalCount) ?? steps.length
+  return {
+    title: stringValue(source.title).trim() || 'Steps',
+    mode: stringValue(source.mode).trim(),
+    summary: stringValue(source.summary).trim(),
+    steps,
+    completedCount,
+    totalCount,
+  }
+}
+
+function normalizeProgressStep(value: unknown, index: number): ProgressStepSnapshot | null {
+  const record = asRecord(value)
+  const title = stringValue(record.title).trim()
+  if (!title) {
+    return null
+  }
+  return {
+    id: stringValue(record.id).trim() || `step-${index + 1}`,
+    title,
+    status: normalizeProgressStatus(record.status),
+    detail: stringValue(record.detail).trim() || undefined,
+  }
+}
+
+function normalizeProgressStatus(value: unknown): ProgressStepStatus {
+  const status = stringValue(value).trim().toLowerCase()
+  if (status === 'in_progress' || status === 'in-progress' || status === 'running') {
+    return 'in_progress'
+  }
+  if (status === 'completed' || status === 'complete' || status === 'done') {
+    return 'completed'
+  }
+  if (status === 'blocked' || status === 'failed') {
+    return 'blocked'
+  }
+  if (status === 'skipped' || status === 'skip') {
+    return 'skipped'
+  }
+  return 'pending'
+}
+
 function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
   const input = asRecord(event.input)
   const argumentsValue = asRecord(input.arguments)
@@ -1283,6 +1610,9 @@ function createThinkingItem(event: ToolTraceEvent): ThinkingItem | null {
 
 function isVisibleThinkingEvent(event: ToolTraceEvent): boolean {
   if (event.type === 'user_message') {
+    return false
+  }
+  if (event.toolName === PROGRESS_UPDATE_STEPS_TOOL) {
     return false
   }
   if (event.toolName === 'open_code_link') {
@@ -2024,6 +2354,17 @@ function stringValue(value: unknown): string {
     return ''
   }
   return typeof value === 'string' ? value : String(value)
+}
+
+function numberValue(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
 }
 
 function formatTime(value: string): string {

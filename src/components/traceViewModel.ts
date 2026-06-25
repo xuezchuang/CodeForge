@@ -140,6 +140,9 @@ function toTraceStepViewModel(event: ToolTraceEvent): TraceStepViewModel {
     if (event.title === 'chat_completion') {
       return createChatCompletionStep(event, input, output, rawInput, rawOutput)
     }
+    if (isAgentTool(event.toolName)) {
+      return createAgentToolStep(event, input, output, rawInput, rawOutput)
+    }
 
     const argumentsValue = asRecord(input.arguments)
     return {
@@ -217,6 +220,39 @@ function toTraceStepViewModel(event: ToolTraceEvent): TraceStepViewModel {
       item('Tool', event.toolName ?? ''),
       item('Summary', event.outputSummary ?? '', true),
       item('Duration', formatDuration(event.durationMs)),
+    ]),
+  }
+}
+
+function createAgentToolStep(
+  event: ToolTraceEvent,
+  input: Record<string, unknown>,
+  output: Record<string, unknown>,
+  rawInput: unknown | null,
+  rawOutput: unknown | null,
+): TraceStepViewModel {
+  const payload = asRecord(output.output)
+  const subagents = Array.isArray(payload.subagents) ? payload.subagents : []
+  const childTaskId = stringValue(payload.childTaskId)
+  return {
+    ...baseStep(event, 'Subagent', rawInput, rawOutput),
+    shortSummary: event.outputSummary ?? toolStatusSummary(event, output),
+    summaryItems: compactItems([
+      item('Tool', event.toolName ?? ''),
+      item('Status', stringValue(output.status)),
+      item('Child', childTaskId),
+      item('Subagents', subagents.length ? String(subagents.length) : ''),
+      item('Completed', stringValue(payload.completedCount)),
+      item('Failed', stringValue(payload.failedCount)),
+    ]),
+    inputSummary: compactItems([
+      item('Tool', event.toolName ?? stringValue(input.toolName)),
+      item('Arguments', compactJson(asRecord(input.arguments))),
+    ]),
+    outputSummary: compactItems([
+      item('Summary', event.outputSummary ?? '', true),
+      item('Child Task', childTaskId),
+      item('Subagents', compactJson(subagents), true),
     ]),
   }
 }
@@ -540,6 +576,10 @@ export interface AggregatedTokenUsage {
   eventCount: number
   hasAny: boolean
   display: string
+}
+
+function isAgentTool(toolName: string | null): boolean {
+  return typeof toolName === 'string' && toolName.startsWith('agent/')
 }
 
 export function aggregateTokenUsage(events: ToolTraceEvent[]): AggregatedTokenUsage {

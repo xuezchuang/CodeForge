@@ -668,7 +668,7 @@ function isInRange(date: Date | null, now: Date, range: ProfileRange): boolean {
 }
 
 function taskDate(task: AgentTask): Date | null {
-  return parseDate(task.messages[0]?.createdAt)
+  return parseDate(task.createdAt) ?? parseDate(task.messages[0]?.createdAt)
 }
 
 function parseDate(value: string | undefined): Date | null {

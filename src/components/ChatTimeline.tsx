@@ -13,7 +13,12 @@ interface ChatTimelineProps {
   onCodeLinkError: (message: string) => void
   onTraceChanged: (taskId: string) => void
   onOpenTrace: (message: ChatMessageModel) => void
-  onEditUserMessage: (message: ChatMessageModel) => void
+  editingUserMessageId: string | null
+  onStartEditUserMessage: (message: ChatMessageModel) => void
+  onCancelEditUserMessage: () => void
+  onSaveUserMessageEdit: (message: ChatMessageModel, content: string) => void
+  onForkMessage: (message: ChatMessageModel) => void
+  onRetryMessage: (message: ChatMessageModel) => void
   onSuggestionSelect: (prompt: string) => void
 }
 
@@ -25,7 +30,12 @@ function ChatTimeline({
   onCodeLinkError,
   onTraceChanged,
   onOpenTrace,
-  onEditUserMessage,
+  editingUserMessageId,
+  onStartEditUserMessage,
+  onCancelEditUserMessage,
+  onSaveUserMessageEdit,
+  onForkMessage,
+  onRetryMessage,
   onSuggestionSelect,
 }: ChatTimelineProps) {
   const timelineRef = useRef<HTMLDivElement>(null)
@@ -140,6 +150,8 @@ function ChatTimeline({
     )
   }
 
+  const lastUserMessageId = findLastUserMessageId(task)
+
   return (
     <div className="chat-timeline" ref={timelineRef} onScroll={handleTimelineScroll}>
       {task.messages.map((message) => (
@@ -151,11 +163,27 @@ function ChatTimeline({
           onCodeLinkError={onCodeLinkError}
           onTraceChanged={onTraceChanged}
           onOpenTrace={onOpenTrace}
-          onEditUserMessage={onEditUserMessage}
+          canEditUserMessage={message.id === lastUserMessageId && task.status !== 'running'}
+          editingUserMessageId={editingUserMessageId}
+          onStartEditUserMessage={onStartEditUserMessage}
+          onCancelEditUserMessage={onCancelEditUserMessage}
+          onSaveUserMessageEdit={onSaveUserMessageEdit}
+          onForkMessage={onForkMessage}
+          onRetryMessage={onRetryMessage}
         />
       ))}
     </div>
   )
+}
+
+function findLastUserMessageId(task: AgentTask): string | null {
+  for (let index = task.messages.length - 1; index >= 0; index -= 1) {
+    const message = task.messages[index]
+    if (message.role === 'user') {
+      return message.id
+    }
+  }
+  return null
 }
 
 function isPinnedToBottom(timeline: HTMLDivElement): boolean {

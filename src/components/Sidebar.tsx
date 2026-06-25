@@ -56,18 +56,6 @@ function Sidebar({
     })
   }
 
-  function openProjectCollapsed(projectId: string) {
-    setExpandedProjectIds((current) => {
-      if (!current.has(projectId)) {
-        return current
-      }
-      const next = new Set(current)
-      next.delete(projectId)
-      return next
-    })
-    onOpenProject(projectId)
-  }
-
   function openProjectAndToggleHistory(project: ProjectSession, hasHistory: boolean) {
     onOpenProject(project.id)
     if (hasHistory) {
@@ -124,7 +112,7 @@ function Sidebar({
                         'sidebar-project-button active'
                       : 'sidebar-project-button'
                     }
-                    onClick={() => openProjectCollapsed(project.id)}
+                    onClick={() => openProjectAndToggleHistory(project, hasHistory)}
                     title={project.name}
                     aria-expanded={hasHistory ? expanded : undefined}
                   >

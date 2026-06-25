@@ -5,6 +5,7 @@ import {
   importWorkspaceHistory,
   listProjects,
   loadWorkspaceHistory,
+  loadWorkspaceSession,
   saveWorkspaceSelection,
 } from './api/tauriApi'
 import Profile from './components/Profile'
@@ -21,6 +22,7 @@ import {
   initialAppState,
   latestTaskIdForProject,
   loadLegacyWorkspaceHistoryState,
+  normalizeAgentTask,
   normalizeWorkspaceHistoryState,
   normalizeSettings,
 } from './state/appState'
@@ -152,6 +154,61 @@ function App() {
       window.clearInterval(intervalId)
     }
   }, [refreshProjects, showToast])
+
+  useEffect(() => {
+    if (view !== 'profile' || !historyLoaded) {
+      return undefined
+    }
+    const unloadedTaskIds = Object.values(appState.tasksById)
+      .filter((task) => task.messagesLoaded === false)
+      .map((task) => task.id)
+    if (unloadedTaskIds.length === 0) {
+      return undefined
+    }
+
+    let cancelled = false
+    const loadProfileTasks = async () => {
+      const results = await Promise.allSettled(
+        unloadedTaskIds.map((taskId) => loadWorkspaceSession(taskId)),
+      )
+      if (cancelled) {
+        return
+      }
+
+      const loadedTasks = results
+        .filter((result): result is PromiseFulfilledResult<AgentTask> =>
+          result.status === 'fulfilled',
+        )
+        .map((result) => normalizeAgentTask(result.value))
+      if (loadedTasks.length > 0) {
+        setAppState((current) => {
+          let changed = false
+          const tasksById = { ...current.tasksById }
+          for (const task of loadedTasks) {
+            if (!tasksById[task.id]) {
+              continue
+            }
+            tasksById[task.id] = task
+            changed = true
+          }
+          return changed ? { ...current, tasksById } : current
+        })
+      }
+
+      const failed = results.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      )
+      if (failed) {
+        showToast('error', toMessage(failed.reason))
+      }
+    }
+
+    void loadProfileTasks()
+
+    return () => {
+      cancelled = true
+    }
+  }, [appState.tasksById, historyLoaded, showToast, view])
 
   const navigate = (nextView: View) => {
     if (nextView === 'workspace') {

@@ -252,6 +252,7 @@ pub async fn run_agent(
     };
     let trace_state = state.inner().clone();
     let session_id = input.session_id.clone();
+    let live_session_id = session_id.clone();
     let provider_id = input.provider_id.clone();
     let model_id = input.model_id.clone();
 
@@ -260,7 +261,7 @@ pub async fn run_agent(
             traces.append_event(&event.task_id, event.clone());
         }
         if let Ok(mut history) = trace_state.history.lock() {
-            let session_id = session_id.as_deref().unwrap_or(event.task_id.as_str());
+            let session_id = live_session_id.as_deref().unwrap_or(event.task_id.as_str());
             let _ = history.insert_trace_event(session_id, event);
         }
         let _ = app_handle.emit("agent_trace_event", event.clone());
@@ -268,8 +269,22 @@ pub async fn run_agent(
     .await?;
     let mut traces = state.traces.lock().map_err(|_| lock_error())?;
     traces.insert_task(run.task_id.clone(), run.traces.clone());
+    for subagent_run in &run.subagent_runs {
+        traces.insert_task(subagent_run.task_id.clone(), subagent_run.traces.clone());
+    }
     let mut history = state.history.lock().map_err(|_| lock_error())?;
     history.update_agent_run_metadata(&run.task_id, provider_id.as_deref(), model_id.as_deref())?;
+    let history_session_id = session_id.as_deref().unwrap_or(run.task_id.as_str());
+    for subagent_run in &run.subagent_runs {
+        for event in &subagent_run.traces {
+            history.insert_trace_event(history_session_id, event)?;
+        }
+        history.update_agent_run_metadata(
+            &subagent_run.task_id,
+            provider_id.as_deref(),
+            model_id.as_deref(),
+        )?;
+    }
     Ok(run)
 }
 

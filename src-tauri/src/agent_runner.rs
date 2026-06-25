@@ -14,12 +14,14 @@ use crate::agent::stream::StreamingChatCompletionAccumulator;
 use crate::codex_cli_runner::{self, CODEX_CLI_PROVIDER_TYPE, CODEX_CLI_TOOL_NAME};
 use crate::goal_state::GoalState;
 use crate::project_registry::ProjectSession;
+use crate::subagent_manager::SubagentManager;
 use crate::tool_interface::ToolOutput;
 use crate::tool_registry::{
     self, ToolExecutionContext, CALCULATOR_ADD_TOOL_NAME, PRESENTATION_READ_PPTX_TOOL_NAME,
 };
 use crate::tool_trace::{
-    self, ContextCompactionResult, MockAgentRun, ToolTraceEvent, TraceEventType, TraceStatus,
+    self, ContextCompactionResult, MockAgentRun, SubagentTraceRun, ToolTraceEvent, TraceEventType,
+    TraceStatus,
 };
 use crate::vs_registry::{
     infer_model_supports_vision, AppSettings, ProviderConfig, ProviderCredential, ProviderModel,
@@ -51,6 +53,8 @@ pub struct AgentRunInput {
     pub project_id: String,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
     pub user_prompt: String,
     pub messages: Option<Vec<AgentConversationMessage>>,
     pub provider_id: Option<String>,
@@ -66,6 +70,16 @@ pub struct AgentRunInput {
     pub cli_mode: bool,
     #[serde(default)]
     pub goal: Option<GoalState>,
+    #[serde(default)]
+    pub parent_task_id: Option<String>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub task_name: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub subagent_depth: u32,
     /// Optional mutable slot for tools to write goal changes back to. When set,
     /// the tool execution context receives a &mut Option<GoalState> and any
     /// goal/set calls from tools mutate this slot directly. Callers that do
@@ -165,6 +179,46 @@ struct PromptLayers {
     system: String,
     developer: String,
     user_context: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentIntentMode {
+    Default,
+    Research,
+    Debug,
+    Implement,
+    Review,
+    Verify,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IntentClassification {
+    mode: AgentIntentMode,
+    reason: &'static str,
+}
+
+impl AgentIntentMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            AgentIntentMode::Default => "default",
+            AgentIntentMode::Research => "research",
+            AgentIntentMode::Debug => "debug",
+            AgentIntentMode::Implement => "implement",
+            AgentIntentMode::Review => "review",
+            AgentIntentMode::Verify => "verify",
+        }
+    }
+
+    fn enforces_read_only(self) -> bool {
+        !matches!(self, AgentIntentMode::Implement)
+    }
+
+    fn allows_auto_readonly_subagents(self) -> bool {
+        matches!(
+            self,
+            AgentIntentMode::Research | AgentIntentMode::Debug | AgentIntentMode::Review
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -300,8 +354,22 @@ pub async fn run_agent(
     mut input: AgentRunInput,
     mut on_trace: impl FnMut(&ToolTraceEvent) + Send,
 ) -> Result<MockAgentRun, String> {
-    let task_id = Uuid::new_v4().to_string();
+    let task_id = input
+        .task_id
+        .take()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let init_command = is_init_command(&input.user_prompt);
+    let intent_classification = if init_command {
+        IntentClassification {
+            mode: AgentIntentMode::Implement,
+            reason: "init_command",
+        }
+    } else {
+        classify_intent_mode(&input.user_prompt)
+    };
+    let intent_mode = intent_classification.mode;
+    let effective_read_only =
+        input.read_only || (!init_command && intent_mode.enforces_read_only());
     let mut conversation_messages = if init_command {
         vec![chat_message("user", ai_context_init_prompt(project))]
     } else {
@@ -330,6 +398,37 @@ pub async fn run_agent(
         &mut on_trace,
     );
 
+    push_trace(
+        &mut traces,
+        trace(
+            &task_id,
+            2,
+            TraceEventType::SystemEvent,
+            None,
+            "intent_mode",
+            Some(json!({
+                "prompt": input.user_prompt,
+            })),
+            Some(json!({
+                "mode": intent_mode.as_str(),
+                "reason": intent_classification.reason,
+                "readOnly": effective_read_only,
+            })),
+            Some(format!(
+                "Mode: {}{}",
+                intent_mode.as_str(),
+                if effective_read_only {
+                    " (read-only)"
+                } else {
+                    ""
+                }
+            )),
+            TraceStatus::Success,
+            0,
+        ),
+        &mut on_trace,
+    );
+
     let selected = match select_model(
         settings,
         input.provider_id.as_deref(),
@@ -343,7 +442,7 @@ pub async fn run_agent(
                 &mut traces,
                 error_trace(
                     &task_id,
-                    2,
+                    3,
                     "select_model failed",
                     Some(json!({
                         "providerId": input.provider_id,
@@ -355,7 +454,12 @@ pub async fn run_agent(
                 ),
                 &mut on_trace,
             );
-            return Ok(mock_agent_run(task_id, traces, context_compaction));
+            return Ok(mock_agent_run(
+                task_id,
+                traces,
+                Vec::new(),
+                context_compaction,
+            ));
         }
     };
 
@@ -363,7 +467,7 @@ pub async fn run_agent(
         &mut traces,
         trace(
             &task_id,
-            2,
+            3,
             TraceEventType::SystemEvent,
             None,
             "select_model",
@@ -392,7 +496,27 @@ pub async fn run_agent(
         &mut on_trace,
     );
 
-    let mut step_index = 3;
+    let auto_readonly_subagents = input.subagent_depth == 0
+        && !input.cli_mode
+        && intent_mode.allows_auto_readonly_subagents();
+    let mut subagent_manager = if auto_readonly_subagents {
+        Some(SubagentManager::new(
+            task_id.clone(),
+            project.clone(),
+            settings.clone(),
+            Some(selected.provider.id.clone()),
+            selected
+                .credential
+                .as_ref()
+                .map(|credential| credential.id.clone()),
+            Some(selected.model_id.clone()),
+            selected.reasoning_effort.clone(),
+        ))
+    } else {
+        None
+    };
+
+    let mut step_index = 4;
     if !init_command && selected.provider.provider_type != CODEX_CLI_PROVIDER_TYPE {
         if let Some(compaction) = maybe_compact_conversation(
             project,
@@ -428,7 +552,12 @@ pub async fn run_agent(
                 ),
                 &mut on_trace,
             );
-            return Ok(mock_agent_run(task_id, traces, context_compaction));
+            return Ok(mock_agent_run(
+                task_id,
+                traces,
+                Vec::new(),
+                context_compaction,
+            ));
         }
         record_codex_cli_completion(
             project,
@@ -440,7 +569,12 @@ pub async fn run_agent(
             &mut on_trace,
         )
         .await;
-        return Ok(mock_agent_run(task_id, traces, context_compaction));
+        return Ok(mock_agent_run(
+            task_id,
+            traces,
+            Vec::new(),
+            context_compaction,
+        ));
     }
 
     if init_command && !supports_openai_tool_calls(&selected) {
@@ -459,12 +593,31 @@ pub async fn run_agent(
             ),
             &mut on_trace,
         );
-        return Ok(mock_agent_run(task_id, traces, context_compaction));
+        return Ok(mock_agent_run(
+            task_id,
+            traces,
+            Vec::new(),
+            context_compaction,
+        ));
     }
 
     if supports_openai_tool_calls(&selected) {
-        let initial_messages =
-            build_openai_messages(project, &conversation_messages, input.cli_mode, &selected);
+        let require_read_tool_call =
+            should_require_local_read_tool_call(&conversation_messages, &input.user_prompt);
+        let mut initial_messages = build_openai_messages_for_mode(
+            project,
+            &conversation_messages,
+            input.cli_mode,
+            &selected,
+            auto_readonly_subagents,
+            Some(intent_mode),
+        );
+        if require_read_tool_call {
+            initial_messages.push(json!({
+                "role": "system",
+                "content": local_read_tool_required_message(),
+            }));
+        }
         let mut tool_context = ToolExecutionContext {
             workspace_root: &project.repo_root,
             vs_bridge_endpoint: project.vs_bridge_endpoint.as_deref(),
@@ -473,7 +626,12 @@ pub async fn run_agent(
             cli_mode: input.cli_mode,
             goal: input.goal_slot.as_deref_mut(),
         };
-        let tools = openai_tool_definitions(&selected, &tool_context);
+        let tools = openai_tool_definitions(
+            &selected,
+            &tool_context,
+            effective_read_only,
+            auto_readonly_subagents,
+        );
         run_openai_tool_agent_loop(
             &task_id,
             &selected,
@@ -483,7 +641,8 @@ pub async fn run_agent(
             &mut traces,
             &mut step_index,
             DEFAULT_MAX_TOOL_ROUNDS,
-            false,
+            require_read_tool_call,
+            subagent_manager.as_mut(),
             &mut on_trace,
         )
         .await?;
@@ -493,6 +652,7 @@ pub async fn run_agent(
             &selected,
             &conversation_messages,
             input.cli_mode,
+            intent_mode,
             &task_id,
             &mut traces,
             step_index,
@@ -501,7 +661,18 @@ pub async fn run_agent(
         .await;
     }
 
-    Ok(mock_agent_run(task_id, traces, context_compaction))
+    let subagent_runs = if let Some(mut manager) = subagent_manager {
+        manager.finish_all().await;
+        manager.into_trace_runs()
+    } else {
+        Vec::new()
+    };
+    Ok(mock_agent_run(
+        task_id,
+        traces,
+        subagent_runs,
+        context_compaction,
+    ))
 }
 
 /// End-to-end tool-calling test harness.
@@ -566,7 +737,7 @@ pub async fn run_tool_call_test(
                 ),
                 &mut on_trace,
             );
-            return Ok(mock_agent_run(task_id, traces, None));
+            return Ok(mock_agent_run(task_id, traces, Vec::new(), None));
         }
     };
 
@@ -591,7 +762,7 @@ pub async fn run_tool_call_test(
             ),
             &mut on_trace,
         );
-        return Ok(mock_agent_run(task_id, traces, None));
+        return Ok(mock_agent_run(task_id, traces, Vec::new(), None));
     }
 
     let initial_messages = build_tool_call_test_messages(project);
@@ -613,21 +784,24 @@ pub async fn run_tool_call_test(
         &mut step_index,
         DEFAULT_MAX_TOOL_ROUNDS,
         true,
+        None,
         &mut on_trace,
     )
     .await?;
 
-    Ok(mock_agent_run(task_id, traces, None))
+    Ok(mock_agent_run(task_id, traces, Vec::new(), None))
 }
 
 fn mock_agent_run(
     task_id: String,
     traces: Vec<ToolTraceEvent>,
+    subagent_runs: Vec<SubagentTraceRun>,
     context_compaction: Option<ContextCompactionResult>,
 ) -> MockAgentRun {
     MockAgentRun {
         task_id,
         traces,
+        subagent_runs,
         context_compaction,
     }
 }
@@ -911,10 +1085,12 @@ async fn run_openai_tool_agent_loop(
     step_index: &mut u32,
     max_tool_rounds: usize,
     require_tool_call: bool,
+    mut subagent_manager: Option<&mut SubagentManager>,
     on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) -> Result<(), String> {
     let mut empty_tool_call_response_retries = 0usize;
-    let mut next_tool_choice: Option<Value> = None;
+    let mut required_tool_call_response_retries = 0usize;
+    let mut next_tool_choice: Option<Value> = require_tool_call.then(|| json!("required"));
 
     for round_index in 0..=max_tool_rounds {
         let request = build_chat_completion_request_with_tool_choice(
@@ -1024,6 +1200,27 @@ async fn run_openai_tool_agent_loop(
         }
 
         if tool_calls.is_empty() {
+            if require_tool_call
+                && round_index == 0
+                && required_tool_call_response_retries == 0
+                && finish_reason.as_deref() != Some("tool_calls")
+            {
+                required_tool_call_response_retries += 1;
+                push_required_tool_call_retry_trace(
+                    task_id,
+                    traces,
+                    step_index,
+                    &completion,
+                    on_trace,
+                );
+                messages.push(json!({
+                    "role": "system",
+                    "content": required_tool_call_retry_message(),
+                }));
+                next_tool_choice = Some(json!("required"));
+                continue;
+            }
+
             if finish_reason.as_deref() == Some("tool_calls") {
                 let can_retry = empty_tool_call_response_retries
                     < EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT
@@ -1272,7 +1469,12 @@ async fn run_openai_tool_agent_loop(
             });
         }
 
-        let completed_tool_calls = execute_parsed_tool_calls(tool_context, parsed_tool_calls).await;
+        let completed_tool_calls = execute_parsed_tool_calls(
+            tool_context,
+            subagent_manager.as_deref_mut(),
+            parsed_tool_calls,
+        )
+        .await;
 
         for completed in completed_tool_calls {
             let tool_result = completed.result.to_model_value();
@@ -1300,7 +1502,13 @@ async fn run_openai_tool_agent_loop(
                         "arguments": completed.arguments.clone(),
                     })),
                     Some(tool_result.clone()),
-                    Some(tool_result_summary(&tool_result)),
+                    Some(
+                        completed
+                            .result
+                            .summary
+                            .clone()
+                            .unwrap_or_else(|| tool_result_summary(&tool_result)),
+                    ),
                     trace_status,
                     completed.result.elapsed_ms,
                 ),
@@ -1334,12 +1542,13 @@ async fn run_openai_tool_agent_loop(
 
 async fn execute_parsed_tool_calls(
     tool_context: &mut ToolExecutionContext<'_>,
+    subagent_manager: Option<&mut SubagentManager>,
     parsed_tool_calls: Vec<ParsedToolCall>,
 ) -> Vec<CompletedToolCall> {
     if should_execute_tool_calls_in_parallel(&parsed_tool_calls) {
         execute_parallel_readonly_tool_calls(tool_context, parsed_tool_calls).await
     } else {
-        execute_tool_calls_sequentially(tool_context, parsed_tool_calls).await
+        execute_tool_calls_sequentially(tool_context, subagent_manager, parsed_tool_calls).await
     }
 }
 
@@ -1352,16 +1561,33 @@ fn should_execute_tool_calls_in_parallel(parsed_tool_calls: &[ParsedToolCall]) -
 
 async fn execute_tool_calls_sequentially(
     tool_context: &mut ToolExecutionContext<'_>,
+    mut subagent_manager: Option<&mut SubagentManager>,
     parsed_tool_calls: Vec<ParsedToolCall>,
 ) -> Vec<CompletedToolCall> {
     let mut completed = Vec::with_capacity(parsed_tool_calls.len());
     for parsed in parsed_tool_calls {
-        let result = tool_registry::execute_tool_result(
-            tool_context,
-            &parsed.tool_call.function.name,
-            &parsed.arguments,
-        )
-        .await;
+        let result = if let Some(manager) = subagent_manager.as_deref_mut() {
+            if let Some(result) = manager
+                .execute_tool(&parsed.tool_call.function.name, &parsed.arguments)
+                .await
+            {
+                result
+            } else {
+                tool_registry::execute_tool_result(
+                    tool_context,
+                    &parsed.tool_call.function.name,
+                    &parsed.arguments,
+                )
+                .await
+            }
+        } else {
+            tool_registry::execute_tool_result(
+                tool_context,
+                &parsed.tool_call.function.name,
+                &parsed.arguments,
+            )
+            .await
+        };
         completed.push(CompletedToolCall {
             tool_call: parsed.tool_call,
             arguments: parsed.arguments,
@@ -1477,6 +1703,8 @@ fn is_parallel_readonly_tool(tool_name: &str) -> bool {
 fn openai_tool_definitions(
     selected: &SelectedModel,
     tool_context: &ToolExecutionContext<'_>,
+    read_only: bool,
+    include_agent_tools: bool,
 ) -> Vec<Value> {
     if tool_context.cli_mode {
         tool_registry::cli_tool_definitions(
@@ -1484,8 +1712,18 @@ fn openai_tool_definitions(
             &selected.model_id,
             tool_context.allow_shell,
         )
+    } else if read_only {
+        let mut tools = tool_registry::read_only_tool_definitions();
+        if include_agent_tools {
+            tools.extend(tool_registry::agent_tool_definitions());
+        }
+        tools
     } else {
-        tool_registry::tool_definitions()
+        let mut tools = tool_registry::tool_definitions();
+        if include_agent_tools {
+            tools.extend(tool_registry::agent_tool_definitions());
+        }
+        tools
     }
 }
 
@@ -2061,6 +2299,39 @@ fn push_empty_tool_call_response_trace(
     *step_index += 1;
 }
 
+fn push_required_tool_call_retry_trace(
+    task_id: &str,
+    traces: &mut Vec<ToolTraceEvent>,
+    step_index: &mut u32,
+    completion: &ChatCompletionResult,
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
+) {
+    push_trace(
+        traces,
+        trace(
+            task_id,
+            *step_index,
+            TraceEventType::SystemEvent,
+            None,
+            "required_tool_call_missing",
+            Some(json!({
+                "request": redact_trace_value(&completion.request_body),
+            })),
+            Some(json!({
+                "response": completion.response_body.clone(),
+                "warning": "required_tool_call_missing",
+                "retrying": true,
+                "tokenUsage": serde_json::to_value(&completion.token_usage).unwrap_or_default(),
+            })),
+            Some("Model answered without the required tool call; retrying once with tool_choice=required.".to_string()),
+            TraceStatus::Warning,
+            completion.duration_ms,
+        ),
+        on_trace,
+    );
+    *step_index += 1;
+}
+
 fn empty_tool_call_retry_tool_choice(response_body: &Value, tools: &[Value]) -> Value {
     let available_names = tool_definition_names(tools);
     let intent = response_intent_text(response_body);
@@ -2183,12 +2454,21 @@ async fn record_plain_provider_completion(
     selected: &SelectedModel,
     conversation_messages: &[ChatMessage],
     cli_mode: bool,
+    intent_mode: AgentIntentMode,
     task_id: &str,
     traces: &mut Vec<ToolTraceEvent>,
     step_index: u32,
     on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) {
-    match call_provider(project, selected, conversation_messages, cli_mode).await {
+    match call_provider_for_mode(
+        project,
+        selected,
+        conversation_messages,
+        cli_mode,
+        Some(intent_mode),
+    )
+    .await
+    {
         Ok(completion) => {
             let message = completion.message;
             let message_chars = message.chars().count();
@@ -2689,17 +2969,48 @@ async fn call_provider(
     conversation_messages: &[ChatMessage],
     cli_mode: bool,
 ) -> Result<ProviderCompletion, String> {
+    call_provider_for_mode(project, selected, conversation_messages, cli_mode, None).await
+}
+
+async fn call_provider_for_mode(
+    project: &ProjectSession,
+    selected: &SelectedModel,
+    conversation_messages: &[ChatMessage],
+    cli_mode: bool,
+    intent_mode: Option<AgentIntentMode>,
+) -> Result<ProviderCompletion, String> {
     let provider_type = selected.provider.provider_type.as_str();
     if provider_type == "claude" {
-        return call_claude(project, selected, conversation_messages, cli_mode).await;
+        return call_claude_for_mode(
+            project,
+            selected,
+            conversation_messages,
+            cli_mode,
+            intent_mode,
+        )
+        .await;
     }
     if provider_type == "ollama" {
-        return call_ollama(project, selected, conversation_messages, cli_mode).await;
+        return call_ollama_for_mode(
+            project,
+            selected,
+            conversation_messages,
+            cli_mode,
+            intent_mode,
+        )
+        .await;
     }
     if provider_type == CODEX_CLI_PROVIDER_TYPE {
         return Err("Codex CLI provider must be executed through codex exec.".to_string());
     }
-    call_openai_compatible(project, selected, conversation_messages, cli_mode).await
+    call_openai_compatible_for_mode(
+        project,
+        selected,
+        conversation_messages,
+        cli_mode,
+        intent_mode,
+    )
+    .await
 }
 
 fn build_chat_completion_request(
@@ -3010,6 +3321,11 @@ fn maybe_emit_streaming_thinking(
     let event = ToolTraceEvent {
         id: event_id.to_string(),
         task_id: sink.task_id.to_string(),
+        parent_task_id: None,
+        agent_name: None,
+        task_name: None,
+        read_only: None,
+        subagent_depth: None,
         step_index: sink.step_index,
         event_type: TraceEventType::ModelMessage,
         tool_name: None,
@@ -3049,13 +3365,21 @@ fn model_http_client() -> Result<reqwest::Client, String> {
         .map_err(|error| format!("Model client build failed: {error}"))
 }
 
-async fn call_openai_compatible(
+async fn call_openai_compatible_for_mode(
     project: &ProjectSession,
     selected: &SelectedModel,
     conversation_messages: &[ChatMessage],
     cli_mode: bool,
+    intent_mode: Option<AgentIntentMode>,
 ) -> Result<ProviderCompletion, String> {
-    let messages = build_openai_messages(project, conversation_messages, cli_mode, selected);
+    let messages = build_openai_messages_for_mode(
+        project,
+        conversation_messages,
+        cli_mode,
+        selected,
+        false,
+        intent_mode,
+    );
     let request_body = build_chat_completion_request(selected, messages, None);
     let completion = send_chat_completion(selected, &request_body, None).await?;
     let response_body = completion.response_body.clone();
@@ -3100,13 +3424,18 @@ async fn call_openai_compatible(
     })
 }
 
-async fn call_claude(
+async fn call_claude_for_mode(
     project: &ProjectSession,
     selected: &SelectedModel,
     conversation_messages: &[ChatMessage],
     cli_mode: bool,
+    intent_mode: Option<AgentIntentMode>,
 ) -> Result<ProviderCompletion, String> {
-    let layers = prompt_layers(project, cli_mode);
+    let mut layers = prompt_layers(project, cli_mode);
+    if let Some(intent_mode) = intent_mode {
+        layers.developer.push_str("\n");
+        layers.developer.push_str(intent_mode_guidance(intent_mode));
+    }
     let base_url = selected
         .provider
         .base_url
@@ -3216,11 +3545,12 @@ async fn call_claude(
     })
 }
 
-async fn call_ollama(
+async fn call_ollama_for_mode(
     project: &ProjectSession,
     selected: &SelectedModel,
     conversation_messages: &[ChatMessage],
     cli_mode: bool,
+    intent_mode: Option<AgentIntentMode>,
 ) -> Result<ProviderCompletion, String> {
     let base_url = selected.provider.base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
@@ -3230,7 +3560,9 @@ async fn call_ollama(
     let url = format!("{base_url}/api/chat");
     let request_body = json!({
         "model": selected.model_id,
-        "messages": build_messages(project, conversation_messages, cli_mode),
+        "messages": intent_mode
+            .map(|mode| build_messages_for_mode(project, conversation_messages, cli_mode, mode))
+            .unwrap_or_else(|| build_messages(project, conversation_messages, cli_mode)),
         "stream": false,
         "options": {
             "temperature": selected.provider.temperature,
@@ -3338,6 +3670,392 @@ fn normalize_conversation_messages(
     normalized
 }
 
+fn should_require_local_read_tool_call(messages: &[ChatMessage], user_prompt: &str) -> bool {
+    let current = normalize_intent_text(user_prompt);
+    if current.is_empty() {
+        return false;
+    }
+
+    let asks_to_read = contains_any(
+        &current,
+        &[
+            "读",
+            "读取",
+            "去读",
+            "看日志",
+            "读日志",
+            "读文件",
+            "读取文件",
+            "read ",
+            "read_file",
+            "read the",
+            "open file",
+            "check log",
+            "read log",
+        ],
+    );
+    let local_file_context = contains_any(
+        &current,
+        &[
+            "日志",
+            ".log",
+            ".txt",
+            ".md",
+            ".cpp",
+            ".h",
+            ".hpp",
+            ".rs",
+            ".json",
+            ".xml",
+            ".toml",
+            ".yaml",
+            ".yml",
+            ".bat",
+            ".ps1",
+            "文件",
+            "路径",
+            "temp",
+            "%temp%",
+            "appdata",
+            "c:\\",
+            "d:\\",
+            "读取不到",
+            "读不到",
+            "权限读",
+            "有权限读",
+        ],
+    );
+    if asks_to_read && local_file_context {
+        return true;
+    }
+
+    if !contains_any(&current, &["读", "读取", "权限读", "有权限读", "read"]) {
+        return false;
+    }
+
+    let recent_context = messages
+        .iter()
+        .rev()
+        .take(8)
+        .map(|message| normalize_intent_text(&message.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    contains_any(
+        &recent_context,
+        &[
+            "日志",
+            ".log",
+            "wz_render_frame_trace",
+            "wz_model_render_trace",
+            "%temp%",
+            "appdata\\local\\temp",
+            "c:\\users",
+            "路径",
+            "读取不到",
+            "读不到",
+        ],
+    )
+}
+
+fn classify_intent_mode(prompt: &str) -> IntentClassification {
+    let normalized = normalize_intent_text(prompt);
+    if normalized.is_empty() {
+        return IntentClassification {
+            mode: AgentIntentMode::Default,
+            reason: "empty_prompt",
+        };
+    }
+
+    let read_only_requested = contains_any(
+        &normalized,
+        &[
+            "先回答",
+            "只回答",
+            "先别做",
+            "先不要做",
+            "不要改",
+            "别改",
+            "不用改",
+            "不要写",
+            "别写",
+            "只读",
+            "只看",
+            "don't edit",
+            "do not edit",
+            "no changes",
+            "read only",
+            "answer first",
+        ],
+    );
+    if read_only_requested || looks_like_question(&normalized) {
+        return classify_read_only_intent(&normalized, "question_or_read_only");
+    }
+
+    if contains_any(
+        &normalized,
+        &[
+            "do it",
+            "start doing",
+            "开始做",
+            "动手",
+            "实现",
+            "改成",
+            "修改",
+            "更改",
+            "修复",
+            "修一下",
+            "帮我改",
+            "给我改",
+            "加一个",
+            "加上",
+            "新增",
+            "删除",
+            "替换",
+            "重构",
+            "优化",
+            "接入",
+            "写一个",
+            "补上",
+            "做一下",
+            "做下",
+            "做成",
+            "弄一下",
+            "搞一下",
+            "implement",
+            "fix ",
+            "fix the",
+            "add ",
+            "remove ",
+            "delete ",
+            "update ",
+            "change ",
+            "refactor",
+            "optimize",
+            "wire ",
+        ],
+    ) {
+        return IntentClassification {
+            mode: AgentIntentMode::Implement,
+            reason: "explicit_write_intent",
+        };
+    }
+
+    classify_read_only_intent(&normalized, "default_read_only")
+}
+
+fn classify_read_only_intent(
+    normalized: &str,
+    fallback_reason: &'static str,
+) -> IntentClassification {
+    if contains_capability_question(normalized) {
+        return IntentClassification {
+            mode: AgentIntentMode::Research,
+            reason: "capability_question",
+        };
+    }
+    if contains_review_intent(normalized) {
+        return IntentClassification {
+            mode: AgentIntentMode::Review,
+            reason: "review_keywords",
+        };
+    }
+    if contains_verify_intent(normalized) {
+        return IntentClassification {
+            mode: AgentIntentMode::Verify,
+            reason: "verify_keywords",
+        };
+    }
+    if contains_debug_intent(normalized) {
+        return IntentClassification {
+            mode: AgentIntentMode::Debug,
+            reason: "debug_keywords",
+        };
+    }
+    if contains_research_intent(normalized) || looks_like_question(normalized) {
+        return IntentClassification {
+            mode: AgentIntentMode::Research,
+            reason: "research_or_question_keywords",
+        };
+    }
+    IntentClassification {
+        mode: AgentIntentMode::Default,
+        reason: fallback_reason,
+    }
+}
+
+fn normalize_intent_text(prompt: &str) -> String {
+    prompt
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn looks_like_question(normalized: &str) -> bool {
+    normalized.ends_with('?')
+        || normalized.ends_with('？')
+        || contains_any(
+            normalized,
+            &[
+                "?",
+                "？",
+                "吗",
+                "么",
+                "是不是",
+                "是否",
+                "有没有",
+                "哪里",
+                "在哪",
+                "哪个",
+                "什么",
+                "怎么",
+                "如何",
+                "为什么",
+                "为何",
+                "对吗",
+                "可以吗",
+                "能不能",
+                "能否",
+            ],
+        )
+        || starts_with_any(
+            normalized,
+            &[
+                "what ", "where ", "how ", "why ", "which ", "who ", "can ", "could ", "should ",
+                "is ", "are ", "does ",
+            ],
+        )
+        || (normalized.starts_with("do ") && !normalized.starts_with("do it"))
+}
+
+fn contains_review_intent(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "审查",
+            "代码审查",
+            "找问题",
+            "风险",
+            "安全问题",
+            "测试缺口",
+            "code review",
+            "review code",
+            "review this",
+            "review the",
+            "find issues",
+            "security issue",
+            "test gap",
+            "risk",
+        ],
+    )
+}
+
+fn contains_verify_intent(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "确认",
+            "验证",
+            "是否已经",
+            "是不是已经",
+            "有没有生效",
+            "检查结果",
+            "生效了吗",
+            "prove",
+            "confirm",
+            "verify",
+            "confirmed",
+            "is it fixed",
+            "does it pass",
+            "already fixed",
+        ],
+    )
+}
+
+fn contains_debug_intent(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "为什么",
+            "报错",
+            "崩溃",
+            "不生效",
+            "失败",
+            "异常",
+            "错误",
+            "没反应",
+            "定位",
+            "原因",
+            "bug",
+            "crash",
+            "error",
+            "fails",
+            "failure",
+            "not working",
+            "doesn't work",
+            "wrong behavior",
+            "why is",
+        ],
+    )
+}
+
+fn contains_research_intent(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "有没有",
+            "在哪",
+            "哪里",
+            "哪个文件",
+            "谁调用",
+            "怎么实现",
+            "如何实现",
+            "什么",
+            "看看",
+            "查一下",
+            "分析",
+            "解释",
+            "看下",
+            "trace",
+            "where",
+            "how",
+            "what",
+            "who calls",
+            "find where",
+            "look up",
+            "inspect",
+            "explain",
+            "analyze",
+        ],
+    )
+}
+
+fn contains_capability_question(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "功能吗",
+            "有这个功能",
+            "有代码审查",
+            "能做什么",
+            "可以做什么",
+            "what can",
+            "can it",
+            "can this",
+            "do i have",
+        ],
+    )
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn starts_with_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.starts_with(needle))
+}
+
 fn is_synthetic_continuation_reminder(content: &str) -> bool {
     let trimmed = content.trim();
     trimmed.starts_with("[System reminder:")
@@ -3358,33 +4076,88 @@ fn build_messages(
     conversation_messages: &[ChatMessage],
     cli_mode: bool,
 ) -> Vec<ChatMessage> {
-    build_layered_chat_messages(project, conversation_messages, cli_mode, false)
+    build_layered_chat_messages_for_mode(
+        project,
+        conversation_messages,
+        cli_mode,
+        false,
+        false,
+        None,
+    )
 }
 
+fn build_messages_for_mode(
+    project: &ProjectSession,
+    conversation_messages: &[ChatMessage],
+    cli_mode: bool,
+    intent_mode: AgentIntentMode,
+) -> Vec<ChatMessage> {
+    build_layered_chat_messages_for_mode(
+        project,
+        conversation_messages,
+        cli_mode,
+        false,
+        false,
+        Some(intent_mode),
+    )
+}
+
+#[cfg(test)]
 fn build_openai_messages(
     project: &ProjectSession,
     conversation_messages: &[ChatMessage],
     cli_mode: bool,
     selected: &SelectedModel,
+    auto_readonly_subagents: bool,
 ) -> Vec<Value> {
-    build_layered_chat_messages(
+    build_openai_messages_for_mode(
+        project,
+        conversation_messages,
+        cli_mode,
+        selected,
+        auto_readonly_subagents,
+        None,
+    )
+}
+
+fn build_openai_messages_for_mode(
+    project: &ProjectSession,
+    conversation_messages: &[ChatMessage],
+    cli_mode: bool,
+    selected: &SelectedModel,
+    auto_readonly_subagents: bool,
+    intent_mode: Option<AgentIntentMode>,
+) -> Vec<Value> {
+    build_layered_chat_messages_for_mode(
         project,
         conversation_messages,
         cli_mode,
         provider_supports_developer_role(selected),
+        auto_readonly_subagents,
+        intent_mode,
     )
     .into_iter()
     .map(openai_chat_message_value)
     .collect()
 }
 
-fn build_layered_chat_messages(
+fn build_layered_chat_messages_for_mode(
     project: &ProjectSession,
     conversation_messages: &[ChatMessage],
     cli_mode: bool,
     use_developer_role: bool,
+    auto_readonly_subagents: bool,
+    intent_mode: Option<AgentIntentMode>,
 ) -> Vec<ChatMessage> {
-    let layers = prompt_layers(project, cli_mode);
+    let mut layers = prompt_layers(project, cli_mode);
+    if let Some(intent_mode) = intent_mode {
+        layers.developer.push_str("\n");
+        layers.developer.push_str(intent_mode_guidance(intent_mode));
+    }
+    if auto_readonly_subagents {
+        layers.developer.push_str("\n");
+        layers.developer.push_str(auto_readonly_subagent_guidance());
+    }
     let mut messages = Vec::new();
     if use_developer_role {
         messages.push(chat_message("system", layers.system));
@@ -3524,6 +4297,7 @@ fn developer_prompt(project: &ProjectSession, cli_mode: bool) -> String {
         prompt.push_str("Use a plain terminal style: no emoji, no marketing copy, and no generic capability list. Do not advertise tools or demo capabilities unless the user asks about them. Never mention calculator or arithmetic demo tools unless directly relevant to the user's request. For a simple greeting, reply with one short sentence asking what task to work on; do not include examples or bullet lists.\n");
     }
     prompt.push_str("Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Use document/read_docx for .docx files and presentation/read_pptx for .pptx files; do not use text read_file for Office packages.\n");
+    prompt.push_str("Read-only file tools can inspect local absolute paths outside the workspace. When the user asks to read, inspect, search, or verify local files or logs, call list_dir/read_file/search_file/search_content (or their workspace/ aliases) before answering. Do not claim a read/search tool failed unless a tool_result in the current turn shows that failure.\n");
     prompt.push_str("Treat user statements about the code as hypotheses until they are verified against workspace code, tool output, logs, or diagnostics. For code-specific answers, gather enough concrete evidence before concluding. If you did not inspect fresh code in the current turn, say whether the answer is based on previous context or inference. Distinguish verified facts, reused prior evidence, and inference when the distinction matters.\n");
     prompt.push_str("Do not claim rg or text search is precise semantic analysis. Prefer exact definitions, call sites, implementations, and diagnostics over name-only search results. Keep edits surgical and cite concrete code locations when relevant.\n");
     prompt.push_str("If an AI context index is provided from doc/ai-context/README.md, treat it as a navigation map only. Do not read every linked doc by default. Read only the context docs that are directly relevant to the user's task, then verify any code-specific conclusion against current source code before answering or editing.\n");
@@ -3541,6 +4315,14 @@ fn developer_prompt(project: &ProjectSession, cli_mode: bool) -> String {
     }
 
     prompt
+}
+
+fn local_read_tool_required_message() -> &'static str {
+    "This turn is asking you to read or verify a local file/log. Before answering, call at least one read-only file tool: list_dir, read_file, search_file, search_content, workspace/list_dir, workspace/read_file, workspace/search_file, or workspace/search. These tools accept both workspace-relative paths and absolute local paths such as C:\\Users\\name\\AppData\\Local\\Temp. Do not answer that you cannot read the path until an actual tool_result in this turn proves the path is unavailable."
+}
+
+fn required_tool_call_retry_message() -> &'static str {
+    "Your previous response did not include the required tool call. Call the most relevant available tool now with valid JSON arguments. Do not answer from assumptions, and do not claim that a tool failed unless a current tool_result shows the failure."
 }
 
 fn user_context_prompt(project: &ProjectSession) -> Option<String> {
@@ -3687,7 +4469,34 @@ fn provider_supports_developer_role(selected: &SelectedModel) -> bool {
 }
 
 fn code_navigation_response_guidance() -> &'static str {
-    "For code-location answers, do not paste C/C++ source code blocks unless the user explicitly asks for source text. Prefer concise Markdown tables with a short description column and a location column. Use compact visible labels but unique link targets, for example [Foo.cpp:123](src/module/Foo.cpp:123). Link targets are local workspace file paths, not URLs: preserve the exact workspace-relative path returned by tools, keep literal spaces in directory names, and do not URL-encode or percent-encode them. For example write [wzShaderProgram.cpp:163](src/core/wz_render_core/09 shader/wzShaderProgram.cpp:163), not [wzShaderProgram.cpp:163](src/core/wz_render_core/09%20shader/wzShaderProgram.cpp:163). Use single-backtick inline code only for short identifiers, paths, or commands; use fenced code blocks for long snippets, pseudocode, loops, or code with comments. The UI displays the short label while opening the unique target in Visual Studio."
+    "For code-location answers, do not paste C/C++ source code blocks unless the user explicitly asks for source text. Prefer concise Markdown tables with a short description column and a location column. Use compact visible labels but unique link targets, for example [Foo.cpp:123](src/module/Foo.cpp:123). Link targets are local file paths, not URLs: preserve the exact workspace-relative or absolute local path returned by tools, keep literal spaces in directory names, and do not URL-encode or percent-encode them. For example write [wzShaderProgram.cpp:163](src/core/wz_render_core/09 shader/wzShaderProgram.cpp:163), not [wzShaderProgram.cpp:163](src/core/wz_render_core/09%20shader/wzShaderProgram.cpp:163). Use single-backtick inline code only for short identifiers, paths, or commands; use fenced code blocks for long snippets, pseudocode, loops, or code with comments. The UI displays the short label while opening the unique target in Visual Studio."
+}
+
+fn intent_mode_guidance(intent_mode: AgentIntentMode) -> &'static str {
+    match intent_mode {
+        AgentIntentMode::Research => {
+            "Internal mode: research. The user is asking to understand the current code or behavior, not to change it. Work read-only. For non-trivial research, call progress/update_steps early with task-specific investigation steps, then update those steps as evidence is gathered; do not use a fixed template. Inspect fresh code, definitions, call sites, configuration, docs, and VS context before concluding. Prefer concrete evidence over guesses, and distinguish verified facts, inferences, and unknowns. If the scope is unclear, ask a concise clarification question instead of editing or inventing."
+        }
+        AgentIntentMode::Debug => {
+            "Internal mode: debug. The user is reporting or investigating wrong behavior. For non-trivial debugging, call progress/update_steps early with task-specific diagnosis steps, then update those steps as evidence is gathered; do not use a fixed template. Start read-only: define expected versus actual behavior, gather evidence from code, diagnostics, logs available through tools, and VS context, then identify the most likely cause. Do not edit files unless the user explicitly asked for a fix and the requested change is clear."
+        }
+        AgentIntentMode::Implement => {
+            "Internal mode: implement. The user has explicitly asked for a code or documentation change. For non-trivial implementation, call progress/update_steps before editing with task-specific implementation and validation steps, then update progress after meaningful milestones; do not use a fixed template. Before editing, make sure the goal, scope, and expected result are clear enough to execute safely; if not, ask a concise clarification question. Make the smallest change that satisfies the request, avoid unrelated cleanup, and verify honestly with the best available check."
+        }
+        AgentIntentMode::Review => {
+            "Internal mode: review. Use a code-review stance. Work read-only. For non-trivial review, call progress/update_steps early with task-specific review areas, then update those steps as findings are checked; do not use a fixed template. Inspect the relevant code or active VS context before judging. Prioritize correctness bugs, regressions, safety issues, architecture mismatches, and missing tests. Report findings first, ordered by severity, with concrete evidence and file locations. If no actionable issues are found, say so and note residual risk or unreviewed scope."
+        }
+        AgentIntentMode::Verify => {
+            "Internal mode: verify. The user is asking whether a fact, fix, behavior, or result is confirmed. For non-trivial verification, call progress/update_steps early with task-specific checks, then update those steps as checks complete; do not use a fixed template. Work read-only. Check the strongest available evidence before answering. Clearly separate verified facts from inference and state any blocker that prevents confirmation. Do not modify files while verifying."
+        }
+        AgentIntentMode::Default => {
+            "Internal mode: default. Answer directly and conservatively. If the user's intent is ambiguous or only asks for confirmation or discussion, do not edit files. Ask a concise clarification question before taking any action that would require guessing."
+        }
+    }
+}
+
+fn auto_readonly_subagent_guidance() -> &'static str {
+    "Auto read-only subagent policy: for broad, multi-file, review, architecture, debugging, performance, security, or test-gap tasks, proactively spawn bounded read-only subagents in the background instead of waiting for the user to ask. Keep this selective: do not spawn subagents for simple single-file edits, one-line answers, direct UI polish, or tasks where delegation would add noise. Use at most three subagents by default, set readOnly=true, give each child a narrow scope and required evidence format, wait for their summaries before the final answer, and keep final integration and correctness judgment in the main agent."
 }
 
 fn build_tool_call_test_messages(project: &ProjectSession) -> Vec<Value> {
@@ -3761,7 +4570,7 @@ fn tool_error_result(error: &str) -> Value {
         "ok": false,
         "output": null,
         "error": error,
-        "recoveryHint": "The tool failed. If a path was not found, use list_dir with path='.' or retry search_file/search_content with a valid workspace-relative root. If the requested file is outside the active workspace, explain that limitation."
+        "recoveryHint": "The tool failed. If a path was not found, use list_dir with path='.' or an absolute directory, or retry search_file/search_content with a valid workspace-relative or absolute root. Read tools can inspect local paths outside the active workspace; write and edit tools remain workspace-bound."
     })
 }
 
@@ -3831,6 +4640,20 @@ fn response_summary(response_body: &Value) -> String {
 }
 
 fn tool_call_summary(tool_name: &str, arguments: &Value) -> String {
+    if tool_name == tool_registry::PROGRESS_UPDATE_STEPS_TOOL_NAME {
+        let count = arguments
+            .get("steps")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let title = arguments
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Steps");
+        return format!("Update {title}: {count} step(s)");
+    }
+
     if tool_name == CALCULATOR_ADD_TOOL_NAME {
         let a = arguments
             .get("a")
@@ -4028,6 +4851,7 @@ mod tests {
             )],
             false,
             &selected,
+            false,
         );
 
         assert_eq!(messages[0]["role"], json!("system"));
@@ -4062,6 +4886,7 @@ mod tests {
             &[chat_message("user", "Explain this.".to_string())],
             false,
             &selected,
+            false,
         );
 
         assert_eq!(messages[0]["role"], json!("system"));
@@ -4088,6 +4913,7 @@ mod tests {
             &[chat_message("user", "Explain this.".to_string())],
             false,
             &selected,
+            false,
         );
 
         assert_eq!(messages[0]["role"], json!("system"));
@@ -4107,6 +4933,7 @@ mod tests {
             &[chat_message("user", "Explain this.".to_string())],
             false,
             &selected,
+            false,
         );
 
         assert!(messages
@@ -4135,12 +4962,42 @@ mod tests {
             &[chat_message("user", "Where is this?".to_string())],
             false,
             &selected,
+            false,
         );
         let user_context = messages[1]["content"].as_str().unwrap();
 
         assert!(user_context.contains("<ai_context_index>"));
         assert!(user_context.contains("Read rendering.md only for rendering tasks."));
         assert!(!user_context.contains("Do not inject this full document by default."));
+    }
+
+    #[test]
+    fn openai_messages_include_auto_readonly_subagent_policy_for_root_tool_runs() {
+        let root = test_workspace();
+        let project = test_project_with_root(root.to_str().unwrap());
+        let selected = test_selected_model("openai");
+        let messages = build_openai_messages(
+            &project,
+            &[chat_message("user", "Review this repo.".to_string())],
+            false,
+            &selected,
+            true,
+        );
+        let developer = messages[1]["content"].as_str().unwrap();
+
+        assert!(developer.contains("Auto read-only subagent policy"));
+        assert!(developer.contains("proactively spawn bounded read-only subagents"));
+        assert!(developer.contains("Use at most three subagents by default"));
+
+        let child_messages = build_openai_messages(
+            &project,
+            &[chat_message("user", "Inspect one file.".to_string())],
+            false,
+            &selected,
+            false,
+        );
+        let child_developer = child_messages[1]["content"].as_str().unwrap();
+        assert!(!child_developer.contains("Auto read-only subagent policy"));
     }
 
     #[test]
@@ -4153,6 +5010,89 @@ mod tests {
         assert!(prompt.contains("Write only documentation files under `doc/ai-context/`"));
         assert!(prompt.contains("current code wins over this doc"));
         assert!(prompt.contains("Do not use shell commands"));
+    }
+
+    #[test]
+    fn intent_classifier_keeps_questions_readonly_and_detects_modes() {
+        assert_eq!(
+            classify_intent_mode("看看我现在有代码审查的功能吗?").mode,
+            AgentIntentMode::Research
+        );
+        assert_eq!(
+            classify_intent_mode("审查代码").mode,
+            AgentIntentMode::Review
+        );
+        assert_eq!(
+            classify_intent_mode("Review this repo.").mode,
+            AgentIntentMode::Review
+        );
+        assert_eq!(
+            classify_intent_mode("为什么这里崩溃").mode,
+            AgentIntentMode::Debug
+        );
+        assert_eq!(
+            classify_intent_mode("确认这个修复是否已经生效").mode,
+            AgentIntentMode::Verify
+        );
+        assert_eq!(
+            classify_intent_mode("把按钮改成蓝色").mode,
+            AgentIntentMode::Implement
+        );
+        assert_eq!(
+            classify_intent_mode("可以把这个做成自动识别吗?先回答").mode,
+            AgentIntentMode::Research
+        );
+        assert_eq!(
+            classify_intent_mode("do it").mode,
+            AgentIntentMode::Implement
+        );
+    }
+
+    #[test]
+    fn openai_messages_include_intent_mode_guidance() {
+        let root = test_workspace();
+        let project = test_project_with_root(root.to_str().unwrap());
+        let selected = test_selected_model("openai");
+        let messages = build_openai_messages_for_mode(
+            &project,
+            &[chat_message(
+                "user",
+                "Where is this implemented?".to_string(),
+            )],
+            false,
+            &selected,
+            false,
+            Some(AgentIntentMode::Research),
+        );
+        let developer = messages[1]["content"].as_str().unwrap();
+
+        assert!(developer.contains("Internal mode: research"));
+        assert!(developer.contains("Work read-only"));
+        assert!(developer.contains("Inspect fresh code"));
+    }
+
+    #[test]
+    fn readonly_research_tools_keep_agent_spawn_without_write_tools() {
+        let root = test_workspace();
+        let project = test_project_with_root(root.to_str().unwrap());
+        let selected = test_selected_model("openai");
+        let tool_context = ToolExecutionContext {
+            workspace_root: &project.repo_root,
+            vs_bridge_endpoint: None,
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
+            goal: None,
+        };
+        let tools = openai_tool_definitions(&selected, &tool_context, true, true);
+        let names = tool_definition_names(&tools);
+
+        assert!(names.contains(&tool_registry::WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::WORKSPACE_SEARCH_CONTENT_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::AGENT_SPAWN_TOOL_NAME.to_string()));
+        assert!(!names.contains(&tool_registry::WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&tool_registry::WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&tool_registry::SHELL_COMMAND_TOOL_NAME.to_string()));
     }
 
     #[test]
@@ -4281,6 +5221,7 @@ mod tests {
         let input = AgentRunInput {
             project_id: project.id.clone(),
             session_id: None,
+            task_id: None,
             user_prompt: "请读取 sample.txt".to_string(),
             messages: None,
             provider_id: Some("provider".to_string()),
@@ -4291,6 +5232,11 @@ mod tests {
             assume_yes: false,
             cli_mode: false,
             goal: None,
+            parent_task_id: None,
+            agent_name: None,
+            task_name: None,
+            read_only: false,
+            subagent_depth: 0,
             goal_slot: None,
         };
 
@@ -4300,7 +5246,7 @@ mod tests {
         let requests = server_thread.join().unwrap();
 
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["tool_choice"], json!("auto"));
+        assert_eq!(requests[0]["tool_choice"], json!("required"));
         let names = request_tool_names(&requests[0]);
         assert!(names.contains(&tool_registry::WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&CALCULATOR_ADD_TOOL_NAME.to_string()));
@@ -4337,6 +5283,122 @@ mod tests {
     }
 
     #[test]
+    fn local_read_followup_requires_tool_call_before_answering() {
+        let messages = vec![
+            chat_message(
+                "user",
+                "你现在给我去读日志,路径在 C:\\Users\\13436\\AppData\\Local\\Temp".to_string(),
+            ),
+            chat_message(
+                "assistant",
+                "我没这个工具读 %TEMP%,只能读工作区。".to_string(),
+            ),
+        ];
+
+        assert!(should_require_local_read_tool_call(
+            &messages,
+            "你已经可以有权限读了"
+        ));
+    }
+
+    #[test]
+    fn run_agent_retries_when_local_read_request_answers_without_tool() {
+        let root = test_workspace();
+        let outside_dir =
+            std::env::temp_dir().join(format!("codeforge-read-retry-{}", Uuid::new_v4()));
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("wz_model_render_trace_123.log"), "trace\n").unwrap();
+        let (base_url, server_thread) = start_mock_openai_server(vec![
+            final_message_response("读不到。"),
+            tool_call_response_with_args(
+                tool_registry::WORKSPACE_LIST_DIR_TOOL_NAME,
+                json!({ "path": outside_dir.to_string_lossy() }),
+            ),
+            final_message_response("读到了日志目录。"),
+        ]);
+        let project = test_project_with_root(root.to_str().unwrap());
+        let settings = test_settings(&base_url);
+        let input = AgentRunInput {
+            project_id: project.id.clone(),
+            session_id: None,
+            task_id: None,
+            user_prompt: "你已经可以有权限读了".to_string(),
+            messages: Some(vec![
+                AgentConversationMessage {
+                    role: "user".to_string(),
+                    content: format!(
+                        "你现在给我去读日志,路径在 {}",
+                        outside_dir.to_string_lossy()
+                    ),
+                    attachments: Vec::new(),
+                },
+                AgentConversationMessage {
+                    role: "assistant".to_string(),
+                    content: "我没这个工具读 %TEMP%,只能读工作区。".to_string(),
+                    attachments: Vec::new(),
+                },
+                AgentConversationMessage {
+                    role: "user".to_string(),
+                    content: "你已经可以有权限读了".to_string(),
+                    attachments: Vec::new(),
+                },
+            ]),
+            provider_id: Some("provider".to_string()),
+            credential_id: Some("default".to_string()),
+            model_id: Some("test-model".to_string()),
+            reasoning_effort: None,
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
+            goal: None,
+            parent_task_id: None,
+            agent_name: None,
+            task_name: None,
+            read_only: false,
+            subagent_depth: 0,
+            goal_slot: None,
+        };
+
+        let run =
+            tauri::async_runtime::block_on(run_agent(&project, &settings, input, |_event| {}))
+                .unwrap();
+        let requests = server_thread.join().unwrap();
+        let _ = fs::remove_dir_all(outside_dir);
+
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["tool_choice"], json!("required"));
+        assert_eq!(requests[1]["tool_choice"], json!("required"));
+        assert!(requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"].as_str() == Some("system")
+                    && message["content"].as_str().is_some_and(|content| {
+                        content.contains("read-only file tool")
+                            && content.contains("absolute local paths")
+                    })
+            }));
+        assert!(run.traces.iter().any(|event| {
+            event.title == "required_tool_call_missing"
+                && matches!(&event.event_type, TraceEventType::SystemEvent)
+                && matches!(&event.status, TraceStatus::Warning)
+        }));
+        assert!(run.traces.iter().any(|event| {
+            matches!(&event.event_type, TraceEventType::ToolResult)
+                && event.tool_name.as_deref() == Some(tool_registry::WORKSPACE_LIST_DIR_TOOL_NAME)
+                && event
+                    .output_summary
+                    .as_deref()
+                    .is_some_and(|summary| summary.contains("wz_model_render_trace_123.log"))
+        }));
+        assert!(run.traces.iter().any(|event| {
+            event.title == "final_response"
+                && event.output_summary.as_deref() == Some("读到了日志目录。")
+        }));
+    }
+
+    #[test]
     fn run_agent_openai_loop_executes_parallel_readonly_tool_calls_in_order() {
         let root = test_workspace();
         fs::write(root.join("first.txt"), "first\n").unwrap();
@@ -4359,6 +5421,7 @@ mod tests {
         let input = AgentRunInput {
             project_id: project.id.clone(),
             session_id: None,
+            task_id: None,
             user_prompt: "请读取两个文件".to_string(),
             messages: None,
             provider_id: Some("provider".to_string()),
@@ -4369,6 +5432,11 @@ mod tests {
             assume_yes: false,
             cli_mode: false,
             goal: None,
+            parent_task_id: None,
+            agent_name: None,
+            task_name: None,
+            read_only: false,
+            subagent_depth: 0,
             goal_slot: None,
         };
 
@@ -4428,6 +5496,7 @@ mod tests {
         let input = AgentRunInput {
             project_id: project.id.clone(),
             session_id: None,
+            task_id: None,
             user_prompt: "请查一下项目".to_string(),
             messages: None,
             provider_id: Some("provider".to_string()),
@@ -4438,6 +5507,11 @@ mod tests {
             assume_yes: false,
             cli_mode: false,
             goal: None,
+            parent_task_id: None,
+            agent_name: None,
+            task_name: None,
+            read_only: false,
+            subagent_depth: 0,
             goal_slot: None,
         };
 
@@ -4497,6 +5571,7 @@ mod tests {
         let input = AgentRunInput {
             project_id: project.id.clone(),
             session_id: None,
+            task_id: None,
             user_prompt: "请查一下项目".to_string(),
             messages: None,
             provider_id: Some("provider".to_string()),
@@ -4507,6 +5582,11 @@ mod tests {
             assume_yes: false,
             cli_mode: false,
             goal: None,
+            parent_task_id: None,
+            agent_name: None,
+            task_name: None,
+            read_only: false,
+            subagent_depth: 0,
             goal_slot: None,
         };
 
@@ -4566,6 +5646,7 @@ mod tests {
         let input = AgentRunInput {
             project_id: project.id.clone(),
             session_id: None,
+            task_id: None,
             user_prompt: "hello".to_string(),
             messages: None,
             provider_id: Some("provider".to_string()),
@@ -4576,6 +5657,11 @@ mod tests {
             assume_yes: false,
             cli_mode: false,
             goal: None,
+            parent_task_id: None,
+            agent_name: None,
+            task_name: None,
+            read_only: false,
+            subagent_depth: 0,
             goal_slot: None,
         };
         let mut streamed_titles = Vec::new();
@@ -4641,6 +5727,7 @@ mod tests {
         let input = AgentRunInput {
             project_id: project.id.clone(),
             session_id: None,
+            task_id: None,
             user_prompt: "请调用 missing.tool".to_string(),
             messages: None,
             provider_id: Some("provider".to_string()),
@@ -4651,6 +5738,11 @@ mod tests {
             assume_yes: false,
             cli_mode: false,
             goal: None,
+            parent_task_id: None,
+            agent_name: None,
+            task_name: None,
+            read_only: false,
+            subagent_depth: 0,
             goal_slot: None,
         };
 
@@ -4807,6 +5899,18 @@ mod tests {
             },
             arguments: json!({}),
         }
+    }
+
+    fn tool_definition_names(tools: &[Value]) -> Vec<String> {
+        tools
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
     }
 
     fn empty_tool_call_finish_response() -> Value {

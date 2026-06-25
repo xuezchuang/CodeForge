@@ -37,6 +37,16 @@ pub enum TraceStatus {
 pub struct ToolTraceEvent {
     pub id: String,
     pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_depth: Option<u32>,
     pub step_index: u32,
     #[serde(rename = "type")]
     pub event_type: TraceEventType,
@@ -56,8 +66,24 @@ pub struct ToolTraceEvent {
 pub struct MockAgentRun {
     pub task_id: String,
     pub traces: Vec<ToolTraceEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagent_runs: Vec<SubagentTraceRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_compaction: Option<ContextCompactionResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTraceRun {
+    pub task_id: String,
+    pub parent_task_id: String,
+    pub agent_name: String,
+    pub task_name: String,
+    pub read_only: bool,
+    pub subagent_depth: u32,
+    pub status: String,
+    pub summary: Option<String>,
+    pub traces: Vec<ToolTraceEvent>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -179,6 +205,7 @@ pub fn create_mock_agent_run(project: &ProjectSession, user_prompt: &str) -> Moc
     MockAgentRun {
         task_id,
         traces,
+        subagent_runs: Vec::new(),
         context_compaction: None,
     }
 }
@@ -325,6 +352,11 @@ pub fn tool_event(
     ToolTraceEvent {
         id: Uuid::new_v4().to_string(),
         task_id: task_id.to_string(),
+        parent_task_id: None,
+        agent_name: None,
+        task_name: None,
+        read_only: None,
+        subagent_depth: None,
         step_index,
         event_type,
         tool_name,

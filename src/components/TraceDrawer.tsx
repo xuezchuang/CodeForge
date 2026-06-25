@@ -18,6 +18,7 @@ import {
   Zap,
 } from 'lucide-react'
 import type { ToolTraceEvent, TraceStatus } from '../types/trace'
+import { listTraces } from '../api/tauriApi'
 import { JsonTree } from './TraceEventRow'
 
 interface TraceDrawerProps {
@@ -103,8 +104,26 @@ type TraceToolDetailDialogState =
   | { kind: 'call'; toolCall: TraceToolCall }
   | { kind: 'result'; toolResult: TraceToolResult }
 
+interface TraceChildTraceDialogState {
+  taskId: string
+  label: string
+  events: ToolTraceEvent[]
+  loading: boolean
+  error: string | null
+}
+
+interface TraceSubagentSummary {
+  childTaskId: string
+  agentName: string
+  taskName: string
+  status: string
+  summary: string
+  traceCount: number | null
+}
+
 type OpenTraceRawJson = (round: TraceRound, kind: TraceRawKind) => void
 type OpenTraceToolDetail = (detail: TraceToolDetailDialogState) => void
+type OpenChildTrace = (subagent: TraceSubagentSummary) => void
 
 interface TraceRunSummary {
   totalDurationMs: number | null
@@ -138,6 +157,7 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
   const [selectedToolId, setSelectedToolId] = useState<string | null>(null)
   const [rawDialog, setRawDialog] = useState<TraceRawDialogState | null>(null)
   const [toolDetailDialog, setToolDetailDialog] = useState<TraceToolDetailDialogState | null>(null)
+  const [childTraceDialog, setChildTraceDialog] = useState<TraceChildTraceDialogState | null>(null)
   const rounds = useMemo(() => createTraceRounds(traceEvents), [traceEvents])
   const tokenSummary = useMemo(() => createTraceTokenSummary(traceEvents), [traceEvents])
   const runSummary = useMemo(() => createTraceRunSummary(traceEvents, rounds), [rounds, traceEvents])
@@ -149,7 +169,9 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        if (toolDetailDialog) {
+        if (childTraceDialog) {
+          setChildTraceDialog(null)
+        } else if (toolDetailDialog) {
           setToolDetailDialog(null)
         } else if (rawDialog) {
           setRawDialog(null)
@@ -161,12 +183,13 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [onClose, open, rawDialog, toolDetailDialog])
+  }, [childTraceDialog, onClose, open, rawDialog, toolDetailDialog])
 
   useEffect(() => {
     if (!open) {
       setRawDialog(null)
       setToolDetailDialog(null)
+      setChildTraceDialog(null)
       return
     }
 
@@ -203,6 +226,33 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
 
   const openToolDetailDialog: OpenTraceToolDetail = (detail) => {
     setToolDetailDialog(detail)
+  }
+
+  const openChildTrace: OpenChildTrace = (subagent) => {
+    const label = subagent.taskName || subagent.agentName || subagent.childTaskId
+    setChildTraceDialog({
+      taskId: subagent.childTaskId,
+      label,
+      events: [],
+      loading: true,
+      error: null,
+    })
+    void listTraces(subagent.childTaskId)
+      .then((events) => {
+        setChildTraceDialog((current) =>
+          current?.taskId === subagent.childTaskId ?
+            { ...current, events, loading: false, error: null }
+          : current,
+        )
+      })
+      .catch((caught) => {
+        const message = caught instanceof Error ? caught.message : String(caught)
+        setChildTraceDialog((current) =>
+          current?.taskId === subagent.childTaskId ?
+            { ...current, loading: false, error: message }
+          : current,
+        )
+      })
   }
 
   return (
@@ -272,7 +322,14 @@ function TraceDrawer({ open, taskId, traceEvents, onClose }: TraceDrawerProps) {
       {toolDetailDialog ? (
         <TraceToolDetailDialog
           detail={toolDetailDialog}
+          onOpenChildTrace={openChildTrace}
           onClose={() => setToolDetailDialog(null)}
+        />
+      ) : null}
+      {childTraceDialog ? (
+        <TraceChildTraceDialog
+          childTrace={childTraceDialog}
+          onClose={() => setChildTraceDialog(null)}
         />
       ) : null}
     </div>
@@ -873,9 +930,11 @@ function TraceRawJsonDialog({
 
 function TraceToolDetailDialog({
   detail,
+  onOpenChildTrace,
   onClose,
 }: {
   detail: TraceToolDetailDialogState
+  onOpenChildTrace: OpenChildTrace
   onClose: () => void
 }) {
   const title =
@@ -883,6 +942,8 @@ function TraceToolDetailDialog({
       `Tool Call #${detail.toolCall.index}: ${detail.toolCall.name}`
     : `Tool Result #${detail.toolResult.index}: ${detail.toolResult.name}`
   const subtitle = detail.kind === 'call' ? 'Tool Call' : 'Tool Result'
+  const subagents =
+    detail.kind === 'result' ? extractSubagentSummaries(detail.toolResult.rawOutput) : []
   const handleBackdropMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (event.target === event.currentTarget) {
       onClose()
@@ -947,6 +1008,14 @@ function TraceToolDetailDialog({
               <TraceToolDetailBlock title="输出">
                 <TraceToolResultPreview result={detail.toolResult} />
               </TraceToolDetailBlock>
+              {subagents.length > 0 ? (
+                <TraceToolDetailBlock title="Subagents">
+                  <TraceSubagentList
+                    subagents={subagents}
+                    onOpenChildTrace={onOpenChildTrace}
+                  />
+                </TraceToolDetailBlock>
+              ) : null}
             </>
           )}
         </div>
@@ -970,6 +1039,94 @@ function TraceToolResultPreview({ result }: { result: TraceToolResult }) {
       allowLineWrapToggle={false}
       quoteStrings={false}
     />
+  )
+}
+
+function TraceSubagentList({
+  subagents,
+  onOpenChildTrace,
+}: {
+  subagents: TraceSubagentSummary[]
+  onOpenChildTrace: OpenChildTrace
+}) {
+  return (
+    <div className="trace-tool-result-grid">
+      {subagents.map((subagent) => (
+        <button
+          type="button"
+          className="trace-tool-result-card"
+          key={subagent.childTaskId}
+          onClick={() => onOpenChildTrace(subagent)}
+        >
+          <span>
+            <strong>{subagent.taskName || subagent.agentName || subagent.childTaskId}</strong>
+            <small>{subagent.status || 'unknown'}</small>
+          </span>
+          <dl>
+            <dt>Child</dt>
+            <dd>{subagent.childTaskId}</dd>
+            <dt>Summary</dt>
+            <dd>{subagent.summary || '-'}</dd>
+            <dt>Trace</dt>
+            <dd>
+              {subagent.traceCount === null ? 'Open child trace' : `${subagent.traceCount} events`}
+            </dd>
+          </dl>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function TraceChildTraceDialog({
+  childTrace,
+  onClose,
+}: {
+  childTrace: TraceChildTraceDialogState
+  onClose: () => void
+}) {
+  const handleBackdropMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.target === event.currentTarget) {
+      onClose()
+    }
+  }
+
+  return (
+    <div className="trace-raw-dialog-backdrop" onMouseDown={handleBackdropMouseDown}>
+      <section
+        className="trace-raw-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Child trace ${childTrace.label}`}
+      >
+        <header>
+          <div className="trace-raw-dialog-heading">
+            <div className="trace-raw-dialog-title">
+              <strong>{childTrace.label}</strong>
+              <span>{childTrace.taskId}</span>
+            </div>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Close child trace">
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+        {childTrace.loading ? (
+          <div className="trace-card-empty">Loading child trace...</div>
+        ) : childTrace.error ? (
+          <div className="trace-card-empty">{childTrace.error}</div>
+        ) : (
+          <JsonTree
+            value={maskSecrets({
+              taskId: childTrace.taskId,
+              traceEvents: childTrace.events,
+            })}
+            defaultExpandAll
+            defaultCollapsedKeys={traceRawDefaultCollapsedKeys}
+            allowLineWrapToggle={false}
+          />
+        )}
+      </section>
+    </div>
   )
 }
 
@@ -1454,6 +1611,37 @@ function toolResultDisplayOutput(result: TraceToolResult): unknown {
     return parseJsonMaybeDeep(result.outputSummary)
   }
   return parseJsonMaybeDeep(result.rawOutput)
+}
+
+function extractSubagentSummaries(rawOutput: unknown): TraceSubagentSummary[] {
+  const output = asRecord(rawOutput)
+  const payload = asRecord(output.output)
+  const records =
+    Array.isArray(payload.subagents) ? payload.subagents
+    : payload.childTaskId ? [payload]
+    : []
+
+  return records
+    .map((value) => {
+      const record = asRecord(value)
+      const childTaskId = firstText([record.childTaskId, record.childRunId])
+      if (!childTaskId) {
+        return null
+      }
+      const traceCount =
+        typeof record.traceCount === 'number' && Number.isFinite(record.traceCount) ?
+          record.traceCount
+        : null
+      return {
+        childTaskId,
+        agentName: firstText([record.agentName]),
+        taskName: firstText([record.taskName]),
+        status: firstText([record.status]),
+        summary: firstText([record.summary]),
+        traceCount,
+      }
+    })
+    .filter((value): value is TraceSubagentSummary => value !== null)
 }
 
 function readableToolText(value: unknown): string {

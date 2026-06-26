@@ -12,6 +12,7 @@ const MAX_SUFFIX_SCAN_MATCHES: usize = 64;
 const IGNORED_SUFFIX_SCAN_DIRS: &[&str] = &[
     ".git",
     ".vs",
+    ".claude",
     "bin",
     "obj",
     "build",
@@ -61,7 +62,8 @@ pub fn parse_code_link_with_context(
 ) -> Result<OpenFilePayload, String> {
     let cleaned = clean_raw_link(raw_link);
     let (path_part, line, column) = split_code_link(cleaned)?;
-    let path = resolve_path(&project.repo_root, path_part, context_links)?;
+    let decoded_path_part = decode_percent_encoded_path(path_part);
+    let path = resolve_path(&project.repo_root, &decoded_path_part, context_links)?;
 
     Ok(OpenFilePayload { path, line, column })
 }
@@ -154,6 +156,44 @@ fn split_numeric_suffix(value: &str) -> Option<(&str, u32)> {
         .parse::<u32>()
         .ok()
         .map(|number| (&value[..index], number))
+}
+
+fn decode_percent_encoded_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut changed = false;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                decoded.push(high << 4 | low);
+                index += 3;
+                changed = true;
+                continue;
+            }
+        }
+
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    if changed {
+        String::from_utf8(decoded).unwrap_or_else(|_| path.to_string())
+    } else {
+        path.to_string()
+    }
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn resolve_path(
@@ -288,6 +328,8 @@ fn select_suffix_match_by_context(
 fn context_link_path(repo_root: &Path, raw_link: &str) -> Option<PathBuf> {
     let cleaned = clean_raw_link(raw_link);
     let (path_part, _, _) = split_code_link(cleaned).ok()?;
+    let decoded_path_part = decode_percent_encoded_path(path_part);
+    let path_part = decoded_path_part.as_str();
     let has_path_segments = path_part.contains('\\') || path_part.contains('/');
     let normalized = path_part.trim().replace('/', "\\");
     let path = Path::new(&normalized);
@@ -511,6 +553,63 @@ mod tests {
 
         assert_eq!(payload.line, 77);
         assert!(payload.path.ends_with("src\\core\\wzFigureBrep.cpp"));
+    }
+
+    #[test]
+    fn resolves_bare_filename_link_ignores_claude_worktrees() {
+        let root = create_temp_project();
+        let source = root
+            .join("src")
+            .join("core")
+            .join("wz_3D")
+            .join("05 render")
+            .join("wzFigureGLDrawer.cpp");
+        let worktree = root
+            .join(".claude")
+            .join("worktrees")
+            .join("copy")
+            .join("src")
+            .join("core")
+            .join("wz_3D")
+            .join("05 render")
+            .join("wzFigureGLDrawer.cpp");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        fs::write(&source, "int source;\n").unwrap();
+        fs::write(&worktree, "int worktree;\n").unwrap();
+
+        let project = test_project(root.to_string_lossy().to_string());
+        let payload = parse_code_link(&project, "wzFigureGLDrawer.cpp:1106").unwrap();
+
+        assert_eq!(payload.line, 1106);
+        assert!(payload
+            .path
+            .ends_with("src\\core\\wz_3D\\05 render\\wzFigureGLDrawer.cpp"));
+    }
+
+    #[test]
+    fn resolves_percent_encoded_space_in_link_path() {
+        let root = create_temp_project();
+        let file = root
+            .join("src")
+            .join("core")
+            .join("wz_render_core")
+            .join("05 render")
+            .join("wzModelRenderer.cpp");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "int main() {}\n").unwrap();
+
+        let project = test_project(root.to_string_lossy().to_string());
+        let payload = parse_code_link(
+            &project,
+            "src/core/wz_render_core/05%20render/wzModelRenderer.cpp:1819",
+        )
+        .unwrap();
+
+        assert_eq!(payload.line, 1819);
+        assert!(payload
+            .path
+            .ends_with("src\\core\\wz_render_core\\05 render\\wzModelRenderer.cpp"));
     }
 
     #[test]

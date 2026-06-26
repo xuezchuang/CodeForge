@@ -1,6 +1,9 @@
-import { MoreHorizontal } from 'lucide-react'
+import { LoaderCircle, MoreHorizontal } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { AgentTask } from '../types/task'
+
+const INITIAL_VISIBLE_TASK_COUNT = 5
+const HISTORY_SHOW_MORE_INCREMENT = 10
 
 interface WorkspaceHistoryListProps {
   tasks: AgentTask[]
@@ -19,12 +22,19 @@ function WorkspaceHistoryList({
   onSelectTask,
   onNotice,
 }: WorkspaceHistoryListProps) {
-  const [showFullHistory, setShowFullHistory] = useState(false)
+  const [visibleTaskCount, setVisibleTaskCount] = useState(INITIAL_VISIBLE_TASK_COUNT)
   const [sessionMenu, setSessionMenu] = useState<SessionMenuState | null>(null)
   const sessionMenuRef = useRef<HTMLDivElement>(null)
-  const recentTasks = tasks.filter((task) => isWithinRecentDays(task, historyDays))
-  const visibleTasks = showFullHistory ? tasks : recentTasks
-  const hiddenCount = Math.max(0, tasks.length - visibleTasks.length)
+  const taskListKey = tasks.map((task) => task.id).join('|')
+  const taskPool = showHeader ?
+    tasks.filter((task) => isWithinRecentDays(task, historyDays))
+  : tasks
+  const visibleTasks = taskPool.slice(0, visibleTaskCount)
+  const hiddenCount = Math.max(0, taskPool.length - visibleTasks.length)
+
+  useEffect(() => {
+    setVisibleTaskCount(INITIAL_VISIBLE_TASK_COUNT)
+  }, [historyDays, showHeader, taskListKey])
 
   useEffect(() => {
     if (!sessionMenu) {
@@ -99,7 +109,7 @@ function WorkspaceHistoryList({
       {showHeader ? (
         <div className="workspace-history-header">
           <span>History</span>
-          <small>{showFullHistory ? 'All' : `Last ${historyDays}d`}</small>
+          <small>{`Last ${historyDays}d`}</small>
         </div>
       ) : null}
       <div className="workspace-history-list">
@@ -129,7 +139,17 @@ function WorkspaceHistoryList({
               >
                 <span className="workspace-history-title">{title}</span>
               </button>
-              <span className="workspace-history-time">{formatHistoryTime(task)}</span>
+              {task.status === 'running' ? (
+                <span
+                  className="workspace-history-running"
+                  aria-label="Running"
+                  title="Running"
+                >
+                  <LoaderCircle size={13} aria-hidden="true" />
+                </span>
+              ) : (
+                <span className="workspace-history-time">{formatHistoryTime(task)}</span>
+              )}
               <button
                 type="button"
                 className="workspace-history-menu-button"
@@ -165,11 +185,15 @@ function WorkspaceHistoryList({
             </button>
           </div>
         ) : null}
-        {!showFullHistory && hiddenCount > 0 ? (
+        {hiddenCount > 0 ? (
           <button
             type="button"
             className="workspace-history-show-more"
-            onClick={() => setShowFullHistory(true)}
+            onClick={() =>
+              setVisibleTaskCount((current) =>
+                Math.min(current + HISTORY_SHOW_MORE_INCREMENT, taskPool.length),
+              )
+            }
           >
             Show more
           </button>

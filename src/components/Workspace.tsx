@@ -99,7 +99,7 @@ function Workspace({
 }: WorkspaceProps) {
   const workspaceRef = useRef<HTMLElement>(null)
   const [busy, setBusy] = useState(false)
-  const [composerDraft, setComposerDraft] = useState('')
+  const [composerDraftsByKey, setComposerDraftsByKey] = useState<Record<string, string>>({})
   const [workspaceToast, setWorkspaceToast] = useState<ToastState | null>(null)
   const [headerDivided, setHeaderDivided] = useState(false)
   const [selectedTrace, setSelectedTrace] = useState<SelectedTrace | null>(null)
@@ -123,6 +123,8 @@ function Workspace({
     state.currentWorkspaceTaskId ?
       state.tasksById[state.currentWorkspaceTaskId] ?? null
     : null
+  const composerDraftKey = activeProjectId ? currentTask?.id ?? `new:${activeProjectId}` : ''
+  const composerDraft = composerDraftKey ? composerDraftsByKey[composerDraftKey] ?? '' : ''
   const progressSnapshot = useMemo(
     () => createTaskProgressSnapshot(currentTask),
     [currentTask],
@@ -130,7 +132,6 @@ function Workspace({
   const currentTaskIsRunning = Boolean(
     currentTask && runningSessionIds.has(currentTask.id),
   )
-  const hasOtherRunningSession = runningSessionIds.size > 0 && !currentTaskIsRunning
   const selectedTraceEvents = selectedTrace?.events ?? []
   const currentTaskPersistenceKey =
     currentTask && currentTask.messagesLoaded !== false && currentTask.status !== 'running' ?
@@ -154,6 +155,17 @@ function Workspace({
   useEffect(() => {
     currentWorkspaceTaskIdRef.current = state.currentWorkspaceTaskId
   }, [state.currentWorkspaceTaskId])
+
+  const setComposerDraft = useCallback((value: string) => {
+    if (!composerDraftKey) {
+      return
+    }
+    setComposerDraftsByKey((current) => updateComposerDraft(current, composerDraftKey, value))
+  }, [composerDraftKey])
+
+  const clearComposerDraftForKey = useCallback((key: string) => {
+    setComposerDraftsByKey((current) => updateComposerDraft(current, key, ''))
+  }, [])
 
   const setSessionRunning = useCallback((sessionTaskId: string, running: boolean) => {
     const next = new Set(runningSessionIdsRef.current)
@@ -361,6 +373,12 @@ function Workspace({
             ...model,
             defaultReasoning:
               selection.reasoningEffort as NonNullable<typeof model.defaultReasoning>,
+            reasoning: model.reasoning ?
+              {
+                ...model.reasoning,
+                default: selection.reasoningEffort,
+              }
+            : model.reasoning,
           }
         })
 
@@ -501,13 +519,10 @@ function Workspace({
       selection: AgentRunSelection
     } | null = null
 
-    if (
-      runningSessionIdsRef.current.size > 0 &&
-      !runningSessionIdsRef.current.has(sessionTaskId)
-    ) {
+    if (runningSessionIdsRef.current.has(sessionTaskId)) {
       showWorkspaceToast(
         'notice',
-        'Another chat is still running. Wait for it to finish before sending.',
+        'This chat is still running. Wait for it to finish before sending again.',
       )
       return false
     }
@@ -813,7 +828,7 @@ function Workspace({
 
     currentWorkspaceTaskIdRef.current = forkedTask.id
     setEditingUserMessageId(null)
-    setComposerDraft('')
+    clearComposerDraftForKey(forkedTask.id)
     setSelectedTrace(null)
     setState((current) => addOrReplaceSessionTask(current, activeProject.id, forkedTask))
     showWorkspaceToast('notice', 'Forked chat.')
@@ -835,7 +850,7 @@ function Workspace({
     }
 
     lastRunSelectionRef.current = selection
-    setComposerDraft('')
+    clearComposerDraftForKey(retryDraft.baseTask.id)
     const runTaskId = crypto.randomUUID()
     const pendingAssistantMessage = createPendingAssistantMessage(
       runTaskId,
@@ -903,7 +918,6 @@ function Workspace({
     }
 
     lastRunSelectionRef.current = selection
-    setComposerDraft('')
     const runTaskId = crypto.randomUUID()
     const pendingAssistantMessage = createPendingAssistantMessage(
       runTaskId,
@@ -998,7 +1012,9 @@ function Workspace({
       })
     }
     setSelectedTrace(null)
-    setComposerDraft('')
+    setComposerDraftsByKey((current) =>
+      clearProjectComposerDrafts(current, activeProject.id, taskIds),
+    )
     showWorkspaceToast('notice', 'Workspace cleared.')
   }
 
@@ -1062,8 +1078,6 @@ function Workspace({
             <Composer
               providers={state.providers}
               busy={busy || currentTaskIsRunning || currentTask?.messagesLoaded === false}
-              sendBlocked={hasOtherRunningSession}
-              sendBlockTitle="Wait for the running chat to finish"
               value={composerDraft}
               onChange={setComposerDraft}
               onSend={runTask}
@@ -1112,6 +1126,48 @@ function addOrReplaceSessionTask(
       [projectId]: taskIds,
     },
   }
+}
+
+function updateComposerDraft(
+  draftsByKey: Record<string, string>,
+  key: string,
+  value: string,
+): Record<string, string> {
+  if (!key) {
+    return draftsByKey
+  }
+  if (!value) {
+    if (!(key in draftsByKey)) {
+      return draftsByKey
+    }
+    const nextDrafts = { ...draftsByKey }
+    delete nextDrafts[key]
+    return nextDrafts
+  }
+  if (draftsByKey[key] === value) {
+    return draftsByKey
+  }
+  return {
+    ...draftsByKey,
+    [key]: value,
+  }
+}
+
+function clearProjectComposerDrafts(
+  draftsByKey: Record<string, string>,
+  projectId: string,
+  taskIds: string[],
+): Record<string, string> {
+  const keysToClear = new Set([`new:${projectId}`, ...taskIds])
+  let changed = false
+  const nextDrafts = { ...draftsByKey }
+  for (const key of keysToClear) {
+    if (key in nextDrafts) {
+      delete nextDrafts[key]
+      changed = true
+    }
+  }
+  return changed ? nextDrafts : draftsByKey
 }
 
 function appendMessagesToSession(
@@ -1742,7 +1798,74 @@ function createTaskProgressSnapshot(task: AgentTask | null): ProgressSnapshot | 
     .reverse()
     .find((message) => message.role === 'assistant')
 
-  return createProgressSnapshot(latestAssistantMessage?.traceEvents ?? [])
+  const traceEvents = latestAssistantMessage?.traceEvents ?? task.traceEvents
+  const snapshot = createProgressSnapshot(traceEvents)
+  if (!snapshot) {
+    return null
+  }
+
+  const terminalStatus = progressTerminalStatus(task, latestAssistantMessage, traceEvents)
+  return terminalStatus ? finalizeProgressSnapshot(snapshot, terminalStatus) : snapshot
+}
+
+type ProgressTerminalStatus = 'completed' | 'failed'
+
+function progressTerminalStatus(
+  task: AgentTask,
+  latestAssistantMessage: ChatMessage | undefined,
+  traceEvents: ToolTraceEvent[],
+): ProgressTerminalStatus | null {
+  if (hasSuccessfulFinalResponse(traceEvents)) {
+    return 'completed'
+  }
+  if (task.status === 'running') {
+    return null
+  }
+  if (
+    task.status === 'failed' ||
+    latestAssistantMessage?.status === 'failed' ||
+    hasFailedTrace(traceEvents)
+  ) {
+    return 'failed'
+  }
+  if (task.status === 'completed' || latestAssistantMessage?.status === 'completed') {
+    return 'completed'
+  }
+  return null
+}
+
+function hasSuccessfulFinalResponse(traceEvents: ToolTraceEvent[]): boolean {
+  return traceEvents.some(
+    (event) => event.type === 'final_response' && event.status === 'success',
+  )
+}
+
+function finalizeProgressSnapshot(
+  snapshot: ProgressSnapshot,
+  terminalStatus: ProgressTerminalStatus,
+): ProgressSnapshot {
+  const steps = snapshot.steps.map((step) => {
+    if (terminalStatus === 'completed') {
+      if (step.status === 'pending' || step.status === 'in_progress') {
+        return { ...step, status: 'completed' as const }
+      }
+      return step
+    }
+
+    if (step.status === 'in_progress') {
+      return { ...step, status: 'blocked' as const }
+    }
+    if (step.status === 'pending') {
+      return { ...step, status: 'skipped' as const }
+    }
+    return step
+  })
+  return {
+    ...snapshot,
+    steps,
+    completedCount: steps.filter((step) => step.status === 'completed').length,
+    totalCount: Math.max(snapshot.totalCount, steps.length),
+  }
 }
 
 function runningToolLabel(toolName: string | null): string {
@@ -1902,13 +2025,7 @@ function parseCodeReviewRun(run: MockAgentRun): {
 }
 
 function finalTraceText(traces: ToolTraceEvent[]): string {
-  return (
-    traces.find((event) => event.type === 'final_response')?.outputSummary ??
-    traces.find((event) => event.type === 'model_message')?.outputSummary ??
-    traces.find((event) => event.status === 'warning')?.outputSummary ??
-    traces.find((event) => event.status === 'failed')?.outputSummary ??
-    ''
-  )
+  return preferredTraceSummary(traces) ?? ''
 }
 
 function parseReviewJson(text: string): { summary?: string; findings: ReviewFinding[] } | null {
@@ -1990,12 +2107,7 @@ function createAssistantMessage(
   messageId?: string,
 ): ChatMessage {
   const failed = hasFailedTrace(traces)
-  const summary =
-    traces.find((event) => event.type === 'final_response')?.outputSummary ??
-    traces.find((event) => event.type === 'model_message')?.outputSummary ??
-    traces.find((event) => event.status === 'failed')?.outputSummary ??
-    traces.find((event) => event.status === 'warning')?.outputSummary ??
-    `Agent produced ${traces.length} trace events.`
+  const summary = preferredTraceSummary(traces) ?? `Agent produced ${traces.length} trace events.`
   const content = sanitizeModelMessage(summary)
   const links = extractCodeLinksFromText(content).map((rawLink) => ({ rawLink }))
 
@@ -2078,6 +2190,33 @@ function hasFailedTrace(traces: ToolTraceEvent[]): boolean {
     return false
   }
   return traces.some((event) => event.status === 'failed')
+}
+
+function preferredTraceSummary(traces: ToolTraceEvent[]): string | null {
+  return (
+    lastTraceSummary(
+      traces,
+      (event) => event.type === 'final_response' && event.status === 'success',
+    ) ??
+    lastTraceSummary(traces, (event) => event.type === 'final_response') ??
+    lastTraceSummary(traces, (event) => event.type === 'model_message') ??
+    lastTraceSummary(traces, (event) => event.status === 'failed') ??
+    lastTraceSummary(traces, (event) => event.status === 'warning')
+  )
+}
+
+function lastTraceSummary(
+  traces: ToolTraceEvent[],
+  predicate: (event: ToolTraceEvent) => boolean,
+): string | null {
+  for (let index = traces.length - 1; index >= 0; index -= 1) {
+    const event = traces[index]
+    const summary = event.outputSummary?.trim()
+    if (predicate(event) && summary) {
+      return summary
+    }
+  }
+  return null
 }
 
 function hasTaskFailedTrace(traces: ToolTraceEvent[]): boolean {

@@ -23,8 +23,8 @@ function CodeLink({
   onError,
   onTraceChanged,
 }: CodeLinkProps) {
-  const displayLink = displayText ?? compactCodeLinkDisplay(rawLink)
-  const normalizedRawLink = normalizeDisplayPath(rawLink)
+  const displayLink = displayText ? decodeCodeLinkDisplay(displayText) : compactCodeLinkDisplay(rawLink)
+  const normalizedRawLink = normalizeDisplayPath(decodeCodeLinkDisplay(rawLink))
 
   const handleClick = async () => {
     try {
@@ -45,15 +45,23 @@ function CodeLink({
       title={`Open ${normalizedRawLink} in Visual Studio`}
     >
       <FileCode size={14} aria-hidden="true" />
-      {normalizeDisplayPath(displayLink)}
+      <span className="code-link-label">{normalizeDisplayPath(displayLink)}</span>
     </button>
   )
 }
 
 function compactCodeLinkDisplay(rawLink: string): string {
-  const normalized = normalizeDisplayPath(rawLink).replace(/\\/g, '/')
+  const normalized = normalizeDisplayPath(decodeCodeLinkDisplay(rawLink)).replace(/\\/g, '/')
   const match = normalized.match(/([^/:]+?\.(?:c|cc|cpp|cxx|h|hh|hpp|cs|ts|tsx|rs|ini|uplugin|uproject):\d+(?:-\d+)?(?::\d+)?)$/i)
   return match?.[1] ?? normalized
+}
+
+function decodeCodeLinkDisplay(value: string): string {
+  try {
+    return decodeURI(value)
+  } catch {
+    return value
+  }
 }
 
 export default CodeLink

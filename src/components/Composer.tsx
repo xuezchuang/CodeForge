@@ -2,6 +2,7 @@ import {
   ArrowUp,
   Check,
   ChevronDown,
+  ChevronRight,
   Mic,
   Plus,
   X,
@@ -9,8 +10,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, ClipboardEvent, KeyboardEvent } from 'react'
-import type { ProviderConfig } from '../types/provider'
-import type { ModelReasoningMode } from '../types/provider'
+import type { ModelReasoningMode, ProviderConfig, ProviderModel } from '../types/provider'
 import type { MessageAttachment } from '../types/task'
 import {
   getDefaultSelectableModel,
@@ -79,6 +79,7 @@ function Composer({
   const [selectedModelId, setSelectedModelId] = useState('')
   const [selectedReasoning, setSelectedReasoning] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [reasoningSubmenuOpen, setReasoningSubmenuOpen] = useState(false)
   const [attachments, setAttachments] = useState<MessageAttachment[]>([])
   const [attachmentError, setAttachmentError] = useState('')
   const [composerFocused, setComposerFocused] = useState(false)
@@ -92,17 +93,21 @@ function Composer({
     selectableModels.find((model) => model.id === selectedModelId) ??
     defaultSelectableModel ??
     null
-  const selectedModelReasoningMode = useMemo(
-    () => resolveReasoningMode(selectedModel, providers),
+  const selectedProviderModel = useMemo(
+    () => resolveProviderModel(selectedModel, providers),
     [selectedModel, providers],
+  )
+  const selectedModelReasoningMode = useMemo(
+    () => resolveReasoningMode(selectedModel, providers, selectedProviderModel),
+    [selectedModel, providers, selectedProviderModel],
   )
   const selectedModelDefaultReasoning = useMemo(
-    () => resolveDefaultReasoning(selectedModel, providers),
-    [selectedModel, providers],
+    () => resolveDefaultReasoning(selectedModel, providers, selectedProviderModel),
+    [selectedModel, providers, selectedProviderModel],
   )
   const reasoningChoices = useMemo(
-    () => buildReasoningChoices(selectedModelReasoningMode),
-    [selectedModelReasoningMode],
+    () => buildReasoningChoices(selectedModelReasoningMode, selectedProviderModel),
+    [selectedModelReasoningMode, selectedProviderModel],
   )
   const slashMatches = useMemo(() => matchingSlashCommands(value), [value])
   const showSlashMenu =
@@ -115,6 +120,9 @@ function Composer({
     if (reasoningChoices.length === 0) {
       if (selectedReasoning !== '') {
         setSelectedReasoning('')
+      }
+      if (reasoningSubmenuOpen) {
+        setReasoningSubmenuOpen(false)
       }
       return
     }
@@ -131,7 +139,12 @@ function Composer({
       const initial = fromConfig?.value ?? reasoningChoices[0]?.value ?? ''
       setSelectedReasoning(initial)
     }
-  }, [reasoningChoices, selectedReasoning, selectedModelDefaultReasoning])
+  }, [
+    reasoningChoices,
+    selectedReasoning,
+    selectedModelDefaultReasoning,
+    reasoningSubmenuOpen,
+  ])
 
   useEffect(() => {
     const textarea = textareaRef.current
@@ -155,6 +168,7 @@ function Composer({
         !pickerRef.current.contains(event.target)
       ) {
         setPickerOpen(false)
+        setReasoningSubmenuOpen(false)
       }
     }
 
@@ -175,6 +189,16 @@ function Composer({
     }
     return `${selectedModel.modelName} ${triggerReasoningLabel}`
   }, [selectedModel, triggerReasoningLabel])
+
+  const openPicker = () => {
+    setPickerOpen((open) => {
+      const nextOpen = !open
+      if (nextOpen) {
+        setReasoningSubmenuOpen(false)
+      }
+      return nextOpen
+    })
+  }
 
   const canSend =
     (value.trim().length > 0 || attachments.length > 0) &&
@@ -364,7 +388,7 @@ function Composer({
                 className="composer-model-trigger"
                 aria-haspopup="dialog"
                 aria-expanded={pickerOpen}
-                onClick={() => setPickerOpen((open) => !open)}
+                onClick={openPicker}
                 disabled={selectableModels.length === 0}
                 title={selectedModel ? triggerTitle : 'Enable a provider in Settings'}
               >
@@ -384,11 +408,12 @@ function Composer({
                 <div
                   className={
                     reasoningChoices.length > 0 ?
-                      'composer-model-menu with-reasoning'
+                      'composer-model-menu with-submenu'
                     : 'composer-model-menu'
                   }
                   role="dialog"
                   aria-label="Model and reasoning"
+                  onMouseLeave={() => setReasoningSubmenuOpen(false)}
                 >
                   <div className="composer-picker-column" aria-label="Model">
                     <div className="composer-picker-header">Model</div>
@@ -405,10 +430,21 @@ function Composer({
                           role="option"
                           aria-selected={model.id === selectedModel?.id}
                           onClick={() => {
-                            const nextReasoningMode = resolveReasoningMode(model, providers)
-                            const nextReasoningChoices =
-                              buildReasoningChoices(nextReasoningMode)
-                            const nextDefaultReasoning = resolveDefaultReasoning(model, providers)
+                            const nextProviderModel = resolveProviderModel(model, providers)
+                            const nextReasoningMode = resolveReasoningMode(
+                              model,
+                              providers,
+                              nextProviderModel,
+                            )
+                            const nextReasoningChoices = buildReasoningChoices(
+                              nextReasoningMode,
+                              nextProviderModel,
+                            )
+                            const nextDefaultReasoning = resolveDefaultReasoning(
+                              model,
+                              providers,
+                              nextProviderModel,
+                            )
                             const nextReasoning =
                               nextReasoningChoices.find(
                                 (choice) => choice.value === nextDefaultReasoning,
@@ -424,7 +460,6 @@ function Composer({
                               reasoningEffort:
                                 nextReasoningChoices.length > 0 ? nextReasoning : null,
                             })
-                            setPickerOpen(false)
                           }}
                         >
                           <span>{model.label}</span>
@@ -434,9 +469,32 @@ function Composer({
                         </button>
                       ))}
                     </div>
+                    {reasoningChoices.length > 0 ? (
+                      <>
+                        <div className="composer-picker-divider" />
+                        <button
+                          type="button"
+                          className={
+                            reasoningSubmenuOpen ?
+                              'composer-model-option composer-reasoning-entry selected'
+                            : 'composer-model-option composer-reasoning-entry'
+                          }
+                          aria-haspopup="menu"
+                          aria-expanded={reasoningSubmenuOpen}
+                          onMouseEnter={() => setReasoningSubmenuOpen(true)}
+                          onClick={() => setReasoningSubmenuOpen((open) => !open)}
+                        >
+                          <span className="composer-model-option-copy">
+                            <span>Reasoning</span>
+                            <small>{triggerReasoningLabel}</small>
+                          </span>
+                          <ChevronRight size={15} aria-hidden="true" />
+                        </button>
+                      </>
+                    ) : null}
                   </div>
-                  {reasoningChoices.length > 0 ? (
-                    <div className="composer-picker-column" aria-label="Reasoning">
+                  {reasoningSubmenuOpen && reasoningChoices.length > 0 ? (
+                    <div className="composer-reasoning-submenu" role="menu" aria-label="Reasoning">
                       <div className="composer-picker-header">Reasoning</div>
                       <div className="composer-picker-list">
                         {reasoningChoices.map((choice) => (
@@ -448,8 +506,8 @@ function Composer({
                                 'composer-model-option selected'
                               : 'composer-model-option'
                             }
-                            role="option"
-                            aria-selected={choice.value === selectedReasoning}
+                            role="menuitemradio"
+                            aria-checked={choice.value === selectedReasoning}
                             onClick={() => {
                               setSelectedReasoning(choice.value)
                               if (selectedModel) {
@@ -461,10 +519,14 @@ function Composer({
                                 })
                               }
                               setPickerOpen(false)
+                              setReasoningSubmenuOpen(false)
                             }}
                             title={choice.description}
                           >
-                            <span>{choice.label}</span>
+                            <span className="composer-model-option-copy">
+                              <span>{choice.label}</span>
+                              {choice.description ? <small>{choice.description}</small> : null}
+                            </span>
                             {choice.value === selectedReasoning ? (
                               <Check size={15} aria-hidden="true" />
                             ) : null}
@@ -556,20 +618,16 @@ function matchingSlashCommands(value: string): SlashCommand[] {
 function resolveReasoningMode(
   model: SelectableModel | null,
   providers: ProviderConfig[],
+  providerModel = resolveProviderModel(model, providers),
 ): ModelReasoningMode {
-  if (!model) {
+  if (!model || !providerModel) {
     return 'none'
   }
-  const provider = providers.find((item) => item.id === model.providerId)
-  if (!provider) {
-    return 'none'
-  }
-  const providerModel = provider.models.find((item) => item.id === model.modelId)
-  if (!providerModel) {
-    return 'none'
+  if (providerModel.reasoning?.levels?.length) {
+    return 'custom'
   }
   const raw = (providerModel.reasoningMode ?? '').toString().trim().toLowerCase()
-  if (raw === 'toggle' || raw === 'effort' || raw === 'none') {
+  if (raw === 'toggle' || raw === 'effort' || raw === 'none' || raw === 'custom') {
     return raw
   }
   // Mirror the inference used in src/state/appState.ts so the picker stays
@@ -584,17 +642,17 @@ function resolveReasoningMode(
 function resolveDefaultReasoning(
   model: SelectableModel | null,
   providers: ProviderConfig[],
+  providerModel = resolveProviderModel(model, providers),
 ): string {
-  if (!model) {
+  if (!model || !providerModel) {
     return ''
   }
-  const provider = providers.find((item) => item.id === model.providerId)
-  if (!provider) {
-    return ''
-  }
-  const providerModel = provider.models.find((item) => item.id === model.modelId)
-  if (!providerModel) {
-    return ''
+  if (providerModel.reasoning?.levels?.length) {
+    return (
+      matchingReasoningValue(providerModel.defaultReasoning, providerModel) ??
+      matchingReasoningValue(providerModel.reasoning.default, providerModel) ??
+      providerModel.reasoning.levels[0].level
+    )
   }
   const mode = resolveReasoningMode(model, providers)
   const raw = (providerModel.defaultReasoning ?? '').toString().trim().toLowerCase()
@@ -608,7 +666,25 @@ function resolveDefaultReasoning(
   return raw
 }
 
-function buildReasoningChoices(mode: ModelReasoningMode): ReasoningChoice[] {
+function resolveProviderModel(
+  model: SelectableModel | null,
+  providers: ProviderConfig[],
+): ProviderModel | null {
+  if (!model) {
+    return null
+  }
+  const provider = providers.find((item) => item.id === model.providerId)
+  return provider?.models.find((item) => item.id === model.modelId) ?? null
+}
+
+function buildReasoningChoices(
+  mode: ModelReasoningMode,
+  providerModel?: ProviderModel | null,
+): ReasoningChoice[] {
+  const customChoices = buildCustomReasoningChoices(providerModel)
+  if (customChoices.length > 0) {
+    return customChoices
+  }
   if (mode === 'toggle') {
     // Thinking-only models: the same Low/Medium/High/Extra High ladder as
     // effort-mode is shown so the desktop and CLI share the same labels.
@@ -642,6 +718,57 @@ function buildReasoningChoices(mode: ModelReasoningMode): ReasoningChoice[] {
     ]
   }
   return []
+}
+
+function buildCustomReasoningChoices(providerModel?: ProviderModel | null): ReasoningChoice[] {
+  return (providerModel?.reasoning?.levels ?? [])
+    .map((level) => {
+      const value = level.level.trim()
+      return {
+        value,
+        label: level.label?.trim() || reasoningLevelLabel(value),
+        description: level.description?.trim() || value,
+      }
+    })
+    .filter((choice) => choice.value.length > 0)
+}
+
+function matchingReasoningValue(
+  value: string | undefined,
+  providerModel: ProviderModel,
+): string | undefined {
+  const requested = value?.trim()
+  if (!requested) {
+    return undefined
+  }
+  return providerModel.reasoning?.levels.find(
+    (level) => level.level.toLowerCase() === requested.toLowerCase(),
+  )?.level
+}
+
+function reasoningLevelLabel(level: string): string {
+  switch (level.trim().toLowerCase()) {
+    case 'xhigh':
+      return 'Extra High'
+    case 'minimal':
+      return 'Minimal'
+    case 'low':
+      return 'Low'
+    case 'medium':
+      return 'Medium'
+    case 'high':
+      return 'High'
+    case 'enabled':
+      return 'Enabled'
+    case 'disabled':
+      return 'Disabled'
+    case 'on':
+      return 'On'
+    case 'off':
+      return 'Off'
+    default:
+      return level.trim()
+  }
 }
 
 export type { ReasoningChoice }

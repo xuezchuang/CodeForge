@@ -32,6 +32,7 @@ const DEFAULT_MAX_TOOL_ROUNDS: usize = 32;
 const EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT: usize = 1;
 const MODEL_REQUEST_TIMEOUT_SECONDS: u64 = 360;
 const STREAMING_TRACE_INTERVAL_MS: u64 = 750;
+const MODEL_RATE_LIMIT_RETRY_DELAYS_MS: [u64; 3] = [3_000, 10_000, 30_000];
 const PPTX_IMAGE_ANALYSIS_BATCH_SIZE: usize = 16;
 const PARALLEL_READONLY_TOOL_LIMIT: usize = 4;
 const CONTEXT_COMPACTION_ESTIMATED_TOKEN_LIMIT: usize = 96_000;
@@ -236,12 +237,14 @@ struct StreamingTraceSink<'a> {
 #[derive(Clone, Debug)]
 struct ParsedToolCall {
     tool_call: OpenAiToolCall,
+    tool_name: String,
     arguments: Value,
 }
 
 #[derive(Clone, Debug)]
 struct CompletedToolCall {
     tool_call: OpenAiToolCall,
+    tool_name: String,
     arguments: Value,
     result: ToolOutput,
 }
@@ -253,6 +256,11 @@ struct ParallelToolExecutionContext {
     allow_shell: bool,
     assume_yes: bool,
     cli_mode: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToolNameMap {
+    pairs: Vec<(String, String)>,
 }
 
 struct AppliedContextCompaction {
@@ -274,11 +282,103 @@ struct OpenAiFunctionCall {
     arguments: String,
 }
 
-fn tool_call_names(tool_calls: &[OpenAiToolCall]) -> Vec<String> {
-    tool_calls
-        .iter()
-        .map(|tool_call| tool_call.function.name.clone())
-        .collect()
+impl ToolNameMap {
+    fn from_tools(tools: &[Value]) -> Self {
+        let mut pairs = Vec::new();
+        let mut used_model_names: Vec<String> = Vec::new();
+
+        for tool in tools {
+            let Some(original_name) = tool
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let model_name = unique_model_tool_name(original_name, &used_model_names);
+            used_model_names.push(model_name.clone());
+            pairs.push((model_name, original_name.to_string()));
+        }
+
+        Self { pairs }
+    }
+
+    fn tools_for_model(&self, tools: &[Value]) -> Vec<Value> {
+        tools
+            .iter()
+            .map(|tool| {
+                let mut tool = tool.clone();
+                if let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) {
+                    let original_name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if let Some(original_name) = original_name {
+                        if let Some(model_name) = self.model_name(&original_name) {
+                            function.insert("name".to_string(), Value::String(model_name));
+                        }
+                    }
+                }
+                tool
+            })
+            .collect()
+    }
+
+    fn original_name(&self, model_name: &str) -> String {
+        self.pairs
+            .iter()
+            .find(|(name, _)| name == model_name)
+            .map(|(_, original)| original.clone())
+            .unwrap_or_else(|| model_name.to_string())
+    }
+
+    fn model_name(&self, original_name: &str) -> Option<String> {
+        self.pairs
+            .iter()
+            .find(|(_, original)| original == original_name)
+            .map(|(name, _)| name.clone())
+    }
+
+    fn tool_call_names(&self, tool_calls: &[OpenAiToolCall]) -> Vec<String> {
+        tool_calls
+            .iter()
+            .map(|tool_call| self.original_name(&tool_call.function.name))
+            .collect()
+    }
+}
+
+fn unique_model_tool_name(original_name: &str, used_model_names: &[String]) -> String {
+    let base = safe_model_tool_name(original_name);
+    if !used_model_names.iter().any(|name| name == &base) {
+        return base;
+    }
+
+    let mut index = 2usize;
+    loop {
+        let candidate = format!("{base}_{index}");
+        if !used_model_names.iter().any(|name| name == &candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn safe_model_tool_name(original_name: &str) -> String {
+    let safe = original_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.trim_matches('_').is_empty() {
+        "tool".to_string()
+    } else {
+        safe
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -667,6 +767,13 @@ pub async fn run_agent(
     } else {
         Vec::new()
     };
+    push_subagent_fallback_final_response(
+        &task_id,
+        &subagent_runs,
+        &mut traces,
+        &mut step_index,
+        &mut on_trace,
+    );
     Ok(mock_agent_run(
         task_id,
         traces,
@@ -1091,12 +1198,14 @@ async fn run_openai_tool_agent_loop(
     let mut empty_tool_call_response_retries = 0usize;
     let mut required_tool_call_response_retries = 0usize;
     let mut next_tool_choice: Option<Value> = require_tool_call.then(|| json!("required"));
+    let tool_name_map = ToolNameMap::from_tools(&tools);
+    let model_tools = tool_name_map.tools_for_model(&tools);
 
     for round_index in 0..=max_tool_rounds {
         let request = build_chat_completion_request_with_tool_choice(
             selected,
             messages.clone(),
-            Some(tools.clone()),
+            Some(model_tools.clone()),
             next_tool_choice.take(),
         );
         let request_title = format!("llm_request:{}", round_index + 1);
@@ -1225,8 +1334,9 @@ async fn run_openai_tool_agent_loop(
                 let can_retry = empty_tool_call_response_retries
                     < EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT
                     && round_index < max_tool_rounds;
-                let retry_tool_choice = can_retry
-                    .then(|| empty_tool_call_retry_tool_choice(&completion.response_body, &tools));
+                let retry_tool_choice = can_retry.then(|| {
+                    empty_tool_call_retry_tool_choice(&completion.response_body, &model_tools)
+                });
 
                 push_empty_tool_call_response_trace(
                     task_id,
@@ -1278,7 +1388,7 @@ async fn run_openai_tool_agent_loop(
         }
 
         if round_index >= max_tool_rounds {
-            let requested_tool_names = tool_call_names(&tool_calls);
+            let requested_tool_names = tool_name_map.tool_call_names(&tool_calls);
             let requested_tool_names_text = requested_tool_names.join(", ");
             let requested_tool_count = tool_calls.len();
             push_trace(
@@ -1419,6 +1529,7 @@ async fn run_openai_tool_agent_loop(
         let mut parsed_tool_calls = Vec::new();
 
         for tool_call in tool_calls {
+            let original_tool_name = tool_name_map.original_name(&tool_call.function.name);
             let arguments = match parse_tool_arguments(&tool_call.function.arguments) {
                 Ok(arguments) => arguments,
                 Err(error) => {
@@ -1429,7 +1540,7 @@ async fn run_openai_tool_agent_loop(
                             task_id,
                             *step_index,
                             TraceEventType::Error,
-                            Some(&tool_call.function.name),
+                            Some(&original_tool_name),
                             "tool_arguments parse failed",
                             Some(json!({ "toolCall": tool_call.clone() })),
                             Some(tool_result.clone()),
@@ -1451,11 +1562,15 @@ async fn run_openai_tool_agent_loop(
                     task_id,
                     *step_index,
                     TraceEventType::ToolCall,
-                    Some(&tool_call.function.name),
+                    Some(&original_tool_name),
                     "tool_call",
-                    Some(json!({ "toolCall": tool_call.clone(), "arguments": arguments.clone() })),
+                    Some(json!({
+                        "toolCall": tool_call.clone(),
+                        "toolName": original_tool_name.clone(),
+                        "arguments": arguments.clone(),
+                    })),
                     None,
-                    Some(tool_call_summary(&tool_call.function.name, &arguments)),
+                    Some(tool_call_summary(&original_tool_name, &arguments)),
                     TraceStatus::Success,
                     0,
                 ),
@@ -1465,6 +1580,7 @@ async fn run_openai_tool_agent_loop(
 
             parsed_tool_calls.push(ParsedToolCall {
                 tool_call,
+                tool_name: original_tool_name,
                 arguments,
             });
         }
@@ -1495,10 +1611,11 @@ async fn run_openai_tool_agent_loop(
                     task_id,
                     *step_index,
                     event_type,
-                    Some(&completed.tool_call.function.name),
+                    Some(&completed.tool_name),
                     "tool_result",
                     Some(json!({
-                        "toolName": completed.tool_call.function.name.clone(),
+                        "toolName": completed.tool_name.clone(),
+                        "modelToolName": completed.tool_call.function.name.clone(),
                         "arguments": completed.arguments.clone(),
                     })),
                     Some(tool_result.clone()),
@@ -1527,7 +1644,7 @@ async fn run_openai_tool_agent_loop(
                 traces,
                 step_index,
                 on_trace,
-                &completed.tool_call.function.name,
+                &completed.tool_name,
                 &completed.result,
                 &mut post_tool_messages,
             )
@@ -1556,7 +1673,7 @@ fn should_execute_tool_calls_in_parallel(parsed_tool_calls: &[ParsedToolCall]) -
     parsed_tool_calls.len() > 1
         && parsed_tool_calls
             .iter()
-            .all(|call| is_parallel_readonly_tool(&call.tool_call.function.name))
+            .all(|call| is_parallel_readonly_tool(&call.tool_name))
 }
 
 async fn execute_tool_calls_sequentially(
@@ -1568,28 +1685,25 @@ async fn execute_tool_calls_sequentially(
     for parsed in parsed_tool_calls {
         let result = if let Some(manager) = subagent_manager.as_deref_mut() {
             if let Some(result) = manager
-                .execute_tool(&parsed.tool_call.function.name, &parsed.arguments)
+                .execute_tool(&parsed.tool_name, &parsed.arguments)
                 .await
             {
                 result
             } else {
                 tool_registry::execute_tool_result(
                     tool_context,
-                    &parsed.tool_call.function.name,
+                    &parsed.tool_name,
                     &parsed.arguments,
                 )
                 .await
             }
         } else {
-            tool_registry::execute_tool_result(
-                tool_context,
-                &parsed.tool_call.function.name,
-                &parsed.arguments,
-            )
-            .await
+            tool_registry::execute_tool_result(tool_context, &parsed.tool_name, &parsed.arguments)
+                .await
         };
         completed.push(CompletedToolCall {
             tool_call: parsed.tool_call,
+            tool_name: parsed.tool_name,
             arguments: parsed.arguments,
             result,
         });
@@ -1612,20 +1726,27 @@ async fn execute_parallel_readonly_tool_calls(
         for parsed in batch {
             let task_context = parallel_context.clone();
             let fallback_tool_call = parsed.tool_call.clone();
+            let fallback_tool_name = parsed.tool_name.clone();
             let fallback_arguments = parsed.arguments.clone();
             let handle = tauri::async_runtime::spawn(async move {
                 task_context
-                    .execute_readonly(parsed.tool_call, parsed.arguments)
+                    .execute_readonly(parsed.tool_call, parsed.tool_name, parsed.arguments)
                     .await
             });
-            handles.push((fallback_tool_call, fallback_arguments, handle));
+            handles.push((
+                fallback_tool_call,
+                fallback_tool_name,
+                fallback_arguments,
+                handle,
+            ));
         }
 
-        for (fallback_tool_call, fallback_arguments, handle) in handles {
+        for (fallback_tool_call, fallback_tool_name, fallback_arguments, handle) in handles {
             let completed_tool_call = match handle.await {
                 Ok(completed_tool_call) => completed_tool_call,
                 Err(error) => CompletedToolCall {
                     tool_call: fallback_tool_call,
+                    tool_name: fallback_tool_name,
                     arguments: fallback_arguments,
                     result: ToolOutput::error(format!("parallel_tool_join_failed: {error}"), 0),
                 },
@@ -1651,6 +1772,7 @@ impl ParallelToolExecutionContext {
     async fn execute_readonly(
         self,
         tool_call: OpenAiToolCall,
+        tool_name: String,
         arguments: Value,
     ) -> CompletedToolCall {
         let mut context = ToolExecutionContext {
@@ -1661,12 +1783,11 @@ impl ParallelToolExecutionContext {
             cli_mode: self.cli_mode,
             goal: None,
         };
-        let result =
-            tool_registry::execute_tool_result(&mut context, &tool_call.function.name, &arguments)
-                .await;
+        let result = tool_registry::execute_tool_result(&mut context, &tool_name, &arguments).await;
 
         CompletedToolCall {
             tool_call,
+            tool_name,
             arguments,
             result,
         }
@@ -2449,6 +2570,96 @@ fn push_final_response_trace(
     *step_index += 1;
 }
 
+fn push_subagent_fallback_final_response(
+    task_id: &str,
+    subagent_runs: &[SubagentTraceRun],
+    traces: &mut Vec<ToolTraceEvent>,
+    step_index: &mut u32,
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
+) {
+    if !needs_subagent_fallback_final_response(traces) {
+        return;
+    }
+    let Some(message) = build_subagent_fallback_message(subagent_runs) else {
+        return;
+    };
+
+    push_trace(
+        traces,
+        trace(
+            task_id,
+            *step_index,
+            TraceEventType::FinalResponse,
+            None,
+            "final_response",
+            Some(json!({
+                "source": "subagent_fallback",
+                "reason": "parent_final_response_empty",
+                "subagentCount": subagent_runs.len(),
+            })),
+            Some(json!({
+                "message": message,
+                "source": "subagent_fallback",
+            })),
+            Some(message),
+            TraceStatus::Success,
+            0,
+        ),
+        on_trace,
+    );
+    *step_index += 1;
+}
+
+fn needs_subagent_fallback_final_response(traces: &[ToolTraceEvent]) -> bool {
+    let final_responses = traces
+        .iter()
+        .filter(|event| matches!(event.event_type, TraceEventType::FinalResponse))
+        .collect::<Vec<_>>();
+    if final_responses.iter().any(|event| {
+        matches!(event.status, TraceStatus::Success)
+            && event
+                .output_summary
+                .as_deref()
+                .is_some_and(|summary| !summary.trim().is_empty())
+    }) {
+        return false;
+    }
+
+    final_responses.last().is_some_and(|event| {
+        matches!(event.status, TraceStatus::Warning)
+            && event.output_summary.as_deref() == Some("Final response was empty")
+    })
+}
+
+fn build_subagent_fallback_message(subagent_runs: &[SubagentTraceRun]) -> Option<String> {
+    let summaries = subagent_runs
+        .iter()
+        .filter(|run| run.status == "completed")
+        .filter_map(|run| {
+            let summary = run.summary.as_deref()?.trim();
+            if summary.is_empty() || summary == "Final response was empty" {
+                return None;
+            }
+            Some((run, summary))
+        })
+        .collect::<Vec<_>>();
+
+    if summaries.is_empty() {
+        return None;
+    }
+    let mut sections = Vec::new();
+    sections.push("父级模型返回了空最终回答；下面是已完成子任务的汇总结果。".to_string());
+    for (run, summary) in summaries {
+        let title = if run.task_name.trim().is_empty() {
+            run.agent_name.trim()
+        } else {
+            run.task_name.trim()
+        };
+        sections.push(format!("## {title}\n\n{summary}"));
+    }
+    Some(sections.join("\n\n"))
+}
+
 async fn record_plain_provider_completion(
     project: &ProjectSession,
     selected: &SelectedModel,
@@ -2839,7 +3050,7 @@ fn normalize_reasoning_effort(reasoning_effort: Option<&str>) -> Option<String> 
     if value.is_empty() || value.eq_ignore_ascii_case("default") {
         return None;
     }
-    Some(value.to_ascii_lowercase())
+    Some(value.to_string())
 }
 
 fn normalize_model_reasoning_effort(
@@ -2850,6 +3061,15 @@ fn normalize_model_reasoning_effort(
     let Some(model) = model else {
         return explicit;
     };
+    if let Some(reasoning) = model.reasoning.as_ref().filter(|config| !config.levels.is_empty()) {
+        let requested = explicit.as_deref().or_else(|| {
+            let default = model.default_reasoning.trim();
+            (!default.is_empty()).then_some(default)
+        });
+        return matching_model_reasoning_level(reasoning, requested)
+            .or_else(|| matching_model_reasoning_level(reasoning, Some(&reasoning.default)))
+            .or_else(|| reasoning.levels.first().map(|level| level.level.clone()));
+    }
     let value = explicit
         .as_deref()
         .or_else(|| {
@@ -2874,6 +3094,21 @@ fn normalize_model_reasoning_effort(
         },
         _ => None,
     }
+}
+
+fn matching_model_reasoning_level(
+    reasoning: &crate::vs_registry::ModelReasoningConfig,
+    requested: Option<&str>,
+) -> Option<String> {
+    let requested = requested?.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    reasoning
+        .levels
+        .iter()
+        .find(|level| level.level.eq_ignore_ascii_case(requested))
+        .map(|level| level.level.clone())
 }
 
 fn default_model_without_model_list(provider: &ProviderConfig) -> Option<String> {
@@ -3031,41 +3266,45 @@ fn build_chat_completion_request_with_tool_choice(
     let mut request_body = json!({
         "model": selected.model_id,
         "messages": messages,
-        "temperature": selected.provider.temperature,
         "stream": uses_streaming,
     });
 
-    let is_toggle_mode =
-        selected.model.as_ref().map(resolved_model_reasoning_mode) == Some("toggle");
+    if !apply_custom_model_reasoning_request(&mut request_body, selected) {
+        let is_toggle_mode =
+            selected.model.as_ref().map(resolved_model_reasoning_mode) == Some("toggle");
 
-    if is_toggle_mode {
-        // MiniMax-M3 via /v1/chat/completions:
-        // - `thinking` is a top-level object, not `reasoning.effort`
-        //   (that shape belongs to /v1/responses and is silently dropped
-        //   on this endpoint).
-        // - Valid `type` values are `adaptive` and `disabled`. `enabled`
-        //   returns HTTP 400.
-        // - Default is `adaptive` (thinking on); only flip to `disabled`
-        //   when the user explicitly asks for off via --reasoning off|none.
-        // - `reasoning_split: true` surfaces the thinking into a separate
-        //   `reasoning_content` field in the response; without it the
-        //   thinking stays embedded inside `content` as a `<think>` tag,
-        //   which the streaming parser does not extract.
-        request_body["reasoning_split"] = json!(true);
-        let thinking_type = match selected.reasoning_effort.as_deref() {
-            Some("off") | Some("none") => "disabled",
-            _ => "adaptive",
-        };
-        request_body["thinking"] = json!({ "type": thinking_type });
-    } else if let Some(reasoning_effort) = selected.reasoning_effort.as_deref() {
-        // Other providers (e.g. OpenAI o1/o3) accept top-level
-        // `reasoning_effort`.
-        request_body["reasoning_effort"] = json!(reasoning_effort);
+        if is_toggle_mode {
+            // MiniMax-M3 via /v1/chat/completions:
+            // - `thinking` is a top-level object, not `reasoning.effort`
+            //   (that shape belongs to /v1/responses and is silently dropped
+            //   on this endpoint).
+            // - Valid `type` values are `adaptive` and `disabled`. `enabled`
+            //   returns HTTP 400.
+            // - Default is `adaptive` (thinking on); only flip to `disabled`
+            //   when the user explicitly asks for off via --reasoning off|none.
+            // - `reasoning_split: true` surfaces the thinking into a separate
+            //   `reasoning_content` field in the response; without it the
+            //   thinking stays embedded inside `content` as a `<think>` tag,
+            //   which the streaming parser does not extract.
+            request_body["reasoning_split"] = json!(true);
+            let thinking_type = match selected.reasoning_effort.as_deref() {
+                Some("off") | Some("none") => "disabled",
+                _ => "adaptive",
+            };
+            request_body["thinking"] = json!({ "type": thinking_type });
+        } else if let Some(reasoning_effort) = selected.reasoning_effort.as_deref() {
+            // Other providers (e.g. OpenAI o1/o3) accept top-level
+            // `reasoning_effort`.
+            request_body["reasoning_effort"] = json!(reasoning_effort);
+        }
     }
 
     if let Some(tools) = tools {
         request_body["tools"] = json!(tools);
-        request_body["tool_choice"] = tool_choice.unwrap_or_else(|| json!("auto"));
+        request_body["tool_choice"] = normalize_tool_choice_for_provider(
+            selected,
+            tool_choice.unwrap_or_else(|| json!("auto")),
+        );
     }
 
     if uses_streaming {
@@ -3073,6 +3312,92 @@ fn build_chat_completion_request_with_tool_choice(
     }
 
     request_body
+}
+
+fn apply_custom_model_reasoning_request(request_body: &mut Value, selected: &SelectedModel) -> bool {
+    let Some(level) = selected_custom_reasoning_level(selected) else {
+        return false;
+    };
+    if let Some(request) = level.request.as_ref() {
+        merge_request_fragment(request_body, request);
+    }
+    true
+}
+
+fn selected_custom_reasoning_level(
+    selected: &SelectedModel,
+) -> Option<&crate::vs_registry::ModelReasoningLevel> {
+    let reasoning = selected
+        .model
+        .as_ref()?
+        .reasoning
+        .as_ref()
+        .filter(|config| !config.levels.is_empty())?;
+    let requested = selected
+        .reasoning_effort
+        .as_deref()
+        .or_else(|| Some(reasoning.default.as_str()));
+    let requested = requested?.trim();
+    if requested.is_empty() {
+        return reasoning.levels.first();
+    }
+    reasoning
+        .levels
+        .iter()
+        .find(|level| level.level.eq_ignore_ascii_case(requested))
+        .or_else(|| reasoning.levels.first())
+}
+
+fn merge_request_fragment(target: &mut Value, fragment: &Value) {
+    let (Some(target_object), Some(fragment_object)) = (target.as_object_mut(), fragment.as_object())
+    else {
+        return;
+    };
+    for (key, value) in fragment_object {
+        merge_request_value(target_object.entry(key.clone()).or_insert(Value::Null), value);
+    }
+}
+
+fn merge_request_value(target: &mut Value, value: &Value) {
+    match (target.as_object_mut(), value.as_object()) {
+        (Some(target_object), Some(value_object)) => {
+            for (key, nested_value) in value_object {
+                merge_request_value(
+                    target_object.entry(key.clone()).or_insert(Value::Null),
+                    nested_value,
+                );
+            }
+        }
+        _ => {
+            *target = value.clone();
+        }
+    }
+}
+
+fn normalize_tool_choice_for_provider(selected: &SelectedModel, tool_choice: Value) -> Value {
+    if provider_supports_forced_tool_choice(selected) || !is_forced_tool_choice(&tool_choice) {
+        return tool_choice;
+    }
+    json!("auto")
+}
+
+fn is_forced_tool_choice(tool_choice: &Value) -> bool {
+    match tool_choice {
+        Value::String(value) => value != "auto" && value != "none",
+        Value::Object(_) => true,
+        _ => false,
+    }
+}
+
+fn provider_supports_forced_tool_choice(selected: &SelectedModel) -> bool {
+    let mut names = vec![selected.model_id.as_str()];
+    if let Some(model) = selected.model.as_ref() {
+        names.push(model.id.as_str());
+        names.push(model.name.as_str());
+    }
+    !names
+        .iter()
+        .any(|name| name.to_ascii_lowercase().contains("kimi"))
 }
 
 fn resolved_model_reasoning_mode(model: &ProviderModel) -> &str {
@@ -3088,6 +3413,29 @@ async fn send_chat_completion(
     selected: &SelectedModel,
     request_body: &Value,
     streaming_trace: Option<StreamingTraceSink<'_>>,
+) -> Result<ChatCompletionResult, String> {
+    let mut streaming_trace = streaming_trace;
+    let mut last_error = String::new();
+    for attempt in 0..=MODEL_RATE_LIMIT_RETRY_DELAYS_MS.len() {
+        match send_chat_completion_once(selected, request_body, streaming_trace.as_mut()).await {
+            Ok(completion) => return Ok(completion),
+            Err(error) => {
+                if !is_rate_limit_error(&error) || attempt >= MODEL_RATE_LIMIT_RETRY_DELAYS_MS.len()
+                {
+                    return Err(error);
+                }
+                last_error = error;
+                sleep_rate_limit_retry(MODEL_RATE_LIMIT_RETRY_DELAYS_MS[attempt]).await;
+            }
+        }
+    }
+    Err(last_error)
+}
+
+async fn send_chat_completion_once(
+    selected: &SelectedModel,
+    request_body: &Value,
+    streaming_trace: Option<&mut StreamingTraceSink<'_>>,
 ) -> Result<ChatCompletionResult, String> {
     let base_url = selected.provider.base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
@@ -3162,6 +3510,21 @@ async fn send_chat_completion(
     })
 }
 
+fn is_rate_limit_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("accountratelimitexceeded")
+        || lower.contains("toomanyrequests")
+        || lower.contains("too many requests")
+        || lower.contains("requests are too frequent")
+        || lower.contains("status=429")
+        || lower.contains("\"type\":\"toomanyrequests\"")
+}
+
+async fn sleep_rate_limit_retry(delay_ms: u64) {
+    let delay = Duration::from_millis(delay_ms);
+    let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(delay)).await;
+}
+
 fn is_codebuddy_provider(selected: &SelectedModel) -> bool {
     selected.provider.id == "codebuddy" || selected.provider.provider_type == "codebuddy"
 }
@@ -3223,7 +3586,7 @@ fn add_codebuddy_vscode_headers(headers: &mut HeaderMap) {
 async fn read_streaming_chat_completion(
     response: &mut reqwest::Response,
     request_body: &Value,
-    mut streaming_trace: Option<StreamingTraceSink<'_>>,
+    mut streaming_trace: Option<&mut StreamingTraceSink<'_>>,
     request_started: Instant,
 ) -> Result<Value, String> {
     let mut accumulator = StreamingChatCompletionAccumulator::default();
@@ -3252,7 +3615,7 @@ async fn read_streaming_chat_completion(
         }
 
         maybe_emit_streaming_thinking(
-            streaming_trace.as_mut(),
+            streaming_trace.as_deref_mut(),
             request_body,
             &accumulator,
             &stream_event_id,
@@ -3269,7 +3632,7 @@ async fn read_streaming_chat_completion(
     }
 
     maybe_emit_streaming_thinking(
-        streaming_trace.as_mut(),
+        streaming_trace.as_deref_mut(),
         request_body,
         &accumulator,
         &stream_event_id,
@@ -3463,7 +3826,6 @@ async fn call_claude_for_mode(
     let request_body = json!({
         "model": selected.model_id,
         "max_tokens": 4096,
-        "temperature": selected.provider.temperature,
         "system": merged_system_prompt(&layers),
         "messages": build_conversation_with_user_context(&layers, conversation_messages),
     });
@@ -3564,9 +3926,6 @@ async fn call_ollama_for_mode(
             .map(|mode| build_messages_for_mode(project, conversation_messages, cli_mode, mode))
             .unwrap_or_else(|| build_messages(project, conversation_messages, cli_mode)),
         "stream": false,
-        "options": {
-            "temperature": selected.provider.temperature,
-        },
     });
 
     let started = Instant::now();
@@ -4469,13 +4828,34 @@ fn provider_supports_developer_role(selected: &SelectedModel) -> bool {
 }
 
 fn code_navigation_response_guidance() -> &'static str {
-    "For code-location answers, do not paste C/C++ source code blocks unless the user explicitly asks for source text. Prefer concise Markdown tables with a short description column and a location column. Use compact visible labels but unique link targets, for example [Foo.cpp:123](src/module/Foo.cpp:123). Link targets are local file paths, not URLs: preserve the exact workspace-relative or absolute local path returned by tools, keep literal spaces in directory names, and do not URL-encode or percent-encode them. For example write [wzShaderProgram.cpp:163](src/core/wz_render_core/09 shader/wzShaderProgram.cpp:163), not [wzShaderProgram.cpp:163](src/core/wz_render_core/09%20shader/wzShaderProgram.cpp:163). Use single-backtick inline code only for short identifiers, paths, or commands; use fenced code blocks for long snippets, pseudocode, loops, or code with comments. The UI displays the short label while opening the unique target in Visual Studio."
+    concat!(
+        "For code-location answers, do not paste C/C++ source code blocks unless the user explicitly asks for source text. ",
+        "For code-flow, inheritance, dispatch, or multi-category analysis, prefer grouped bullet/list sections over wide Markdown tables. ",
+        "Use Markdown tables only for small comparisons with at most 3 columns and short cell content. ",
+        "Every user-facing code location must be a standalone Markdown link with a compact visible label and a unique local-file target, for example [Foo.cpp:123](src/module/Foo.cpp:123). ",
+        "For files under the repo root, convert absolute tool-returned paths to workspace-relative link targets; use absolute targets only for files outside the repo. ",
+        "Link targets are local file paths, not URLs: keep literal spaces in directory names, and do not URL-encode or percent-encode them. ",
+        "Use one concrete start line in each link target and label; do not write line ranges such as `:7-49` as links. ",
+        "If a span matters, link the start line and describe the span in text, for example [Foo.cpp:7](src/module/Foo.cpp:7) covers lines 7-49. ",
+        "Do not use shorthand such as \"same file\", \"same as above\", or \"同上 :11\" for locations; repeat a complete link instead. ",
+        "Do not rely on bare filename links like `Foo.cpp:123` unless the target also appears in the Markdown link target. ",
+        "Use single-backtick inline code only for short identifiers or commands, not as the primary way to cite code locations. ",
+        "The UI displays the short label while opening the unique target in Visual Studio."
+    )
 }
 
 fn intent_mode_guidance(intent_mode: AgentIntentMode) -> &'static str {
     match intent_mode {
         AgentIntentMode::Research => {
-            "Internal mode: research. The user is asking to understand the current code or behavior, not to change it. Work read-only. For non-trivial research, call progress/update_steps early with task-specific investigation steps, then update those steps as evidence is gathered; do not use a fixed template. Inspect fresh code, definitions, call sites, configuration, docs, and VS context before concluding. Prefer concrete evidence over guesses, and distinguish verified facts, inferences, and unknowns. If the scope is unclear, ask a concise clarification question instead of editing or inventing."
+            concat!(
+                "Internal mode: research. The user is asking to understand the current code or behavior, not to change it. Work read-only. ",
+                "For non-trivial research, call progress/update_steps early with task-specific investigation steps, then update those steps as evidence is gathered; do not use a fixed template. ",
+                "Inspect fresh code, definitions, dispatch or call sites, implementations, configuration, docs, and VS context before concluding. ",
+                "For code-flow or architecture questions, name-search results are only starting points: inspect the entry point, core data structures, implementations that create or mutate the behavior, and each user-named category before final answer. ",
+                "Ambiguous domain wording is not by itself a blocker for read-only research; state the working interpretation, continue with the most likely verifiable path, and separate verified facts, inferences, and unknowns. ",
+                "Ask a concise clarification question only when no useful evidence can be gathered or the ambiguity would make a requested edit or unsafe action guesswork. ",
+                "After successful read/search tools, do not finish with only a clarification question; provide the best verified partial answer and the exact remaining question."
+            )
         }
         AgentIntentMode::Debug => {
             "Internal mode: debug. The user is reporting or investigating wrong behavior. For non-trivial debugging, call progress/update_steps early with task-specific diagnosis steps, then update those steps as evidence is gathered; do not use a fixed template. Start read-only: define expected versus actual behavior, gather evidence from code, diagnostics, logs available through tools, and VS context, then identify the most likely cause. Do not edit files unless the user explicitly asked for a fix and the requested change is clear."
@@ -4807,6 +5187,7 @@ mod tests {
         assert_eq!(request["stream"], json!(true));
         assert_eq!(request["stream_options"]["include_usage"], json!(true));
         assert_eq!(request["tool_choice"], json!("auto"));
+        assert!(request.get("temperature").is_none());
         let names = request_tool_names(&request);
         assert!(names.contains(&tool_registry::WORKSPACE_LIST_DIR_TOOL_NAME.to_string()));
         assert!(names.contains(&tool_registry::WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
@@ -4814,6 +5195,147 @@ mod tests {
         assert!(names.contains(&tool_registry::WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&tool_registry::WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&CALCULATOR_ADD_TOOL_NAME.to_string()));
+    }
+
+    #[test]
+    fn kimi_chat_completion_request_downgrades_forced_tool_choice() {
+        let mut selected = test_selected_model("openai-compatible");
+        selected.model_id = "V-Kimi-K2.7-Code".to_string();
+        let request = build_chat_completion_request_with_tool_choice(
+            &selected,
+            vec![json!({ "role": "user", "content": "hello" })],
+            Some(tool_registry::tool_definitions()),
+            Some(json!("required")),
+        );
+
+        assert_eq!(request["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn kimi_chat_completion_request_downgrades_specific_tool_choice() {
+        let mut selected = test_selected_model("openai-compatible");
+        selected.model_id = "V-Kimi-K2.6".to_string();
+        let request = build_chat_completion_request_with_tool_choice(
+            &selected,
+            vec![json!({ "role": "user", "content": "hello" })],
+            Some(tool_registry::tool_definitions()),
+            Some(json!({
+                "type": "function",
+                "function": { "name": "workspace_read_file" },
+            })),
+        );
+
+        assert_eq!(request["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn non_kimi_chat_completion_request_keeps_forced_tool_choice() {
+        let selected = test_selected_model("openai-compatible");
+        let request = build_chat_completion_request_with_tool_choice(
+            &selected,
+            vec![json!({ "role": "user", "content": "hello" })],
+            Some(tool_registry::tool_definitions()),
+            Some(json!("required")),
+        );
+
+        assert_eq!(request["tool_choice"], json!("required"));
+    }
+
+    #[test]
+    fn custom_reasoning_request_is_merged_into_chat_completion_body() {
+        let mut selected = test_selected_model("openai-compatible");
+        let mut model = selected.provider.models[0].clone();
+        model.reasoning_mode = "custom".to_string();
+        model.default_reasoning = "enabled".to_string();
+        model.reasoning = Some(crate::vs_registry::ModelReasoningConfig {
+            request_field: "thinking".to_string(),
+            default: "enabled".to_string(),
+            levels: vec![
+                crate::vs_registry::ModelReasoningLevel {
+                    level: "enabled".to_string(),
+                    label: "Enabled".to_string(),
+                    description: String::new(),
+                    request: Some(json!({ "thinking": { "type": "enabled" } })),
+                },
+                crate::vs_registry::ModelReasoningLevel {
+                    level: "disabled".to_string(),
+                    label: "Disabled".to_string(),
+                    description: String::new(),
+                    request: Some(json!({ "thinking": { "type": "disabled" } })),
+                },
+            ],
+        });
+        selected.model = Some(model);
+        selected.reasoning_effort = Some("enabled".to_string());
+
+        let request = build_chat_completion_request(
+            &selected,
+            vec![json!({ "role": "user", "content": "hello" })],
+            None,
+        );
+
+        assert_eq!(request["thinking"]["type"], json!("enabled"));
+        assert!(request.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn rate_limit_errors_are_retryable() {
+        assert!(is_rate_limit_error(
+            r#"{"error":{"code":"AccountRateLimitExceeded","type":"TooManyRequests"}}"#
+        ));
+        assert!(is_rate_limit_error(
+            "Model request failed. status=429; body=too many requests"
+        ));
+        assert!(!is_rate_limit_error(
+            r#"{"error":{"code":"InvalidParameter","type":"BadRequest"}}"#
+        ));
+    }
+
+    #[test]
+    fn tool_name_map_rewrites_provider_unsafe_names() {
+        let tools = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "workspace/read_file",
+                    "parameters": { "type": "object", "properties": {} },
+                },
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "vs.current_document",
+                    "parameters": { "type": "object", "properties": {} },
+                },
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "workspace_read_file",
+                    "parameters": { "type": "object", "properties": {} },
+                },
+            }),
+        ];
+
+        let name_map = ToolNameMap::from_tools(&tools);
+        let model_tools = name_map.tools_for_model(&tools);
+        let names = tool_definition_names(&model_tools);
+
+        assert_eq!(names[0], "workspace_read_file");
+        assert_eq!(names[1], "vs_current_document");
+        assert_eq!(names[2], "workspace_read_file_2");
+        assert_eq!(
+            name_map.original_name("workspace_read_file"),
+            "workspace/read_file"
+        );
+        assert_eq!(
+            name_map.original_name("workspace_read_file_2"),
+            "workspace_read_file"
+        );
+        assert_eq!(
+            name_map.original_name("vs_current_document"),
+            "vs.current_document"
+        );
     }
 
     #[test]
@@ -5069,6 +5591,9 @@ mod tests {
         assert!(developer.contains("Internal mode: research"));
         assert!(developer.contains("Work read-only"));
         assert!(developer.contains("Inspect fresh code"));
+        assert!(developer.contains("working interpretation"));
+        assert!(developer.contains("each user-named category"));
+        assert!(developer.contains("do not finish with only a clarification question"));
     }
 
     #[test]
@@ -5079,6 +5604,8 @@ mod tests {
         assert!(prompt.contains("fresh current-filesystem evidence"));
         assert!(prompt.contains("do not dismiss it as a stale snapshot"));
         assert!(prompt.contains("do not ask the user to open VS Code or run git"));
+        assert!(prompt.contains("prefer grouped bullet/list sections over wide Markdown tables"));
+        assert!(prompt.contains("at most 3 columns"));
         assert!(local_read_tool_required_message().contains("not stale snapshots"));
     }
 
@@ -5181,6 +5708,93 @@ mod tests {
     }
 
     #[test]
+    fn subagent_fallback_final_response_replaces_empty_parent_final() {
+        let mut traces = vec![trace(
+            "parent",
+            1,
+            TraceEventType::FinalResponse,
+            None,
+            "final_response",
+            None,
+            Some(json!({ "message": "" })),
+            Some("Final response was empty".to_string()),
+            TraceStatus::Warning,
+            0,
+        )];
+        let subagent_runs = vec![SubagentTraceRun {
+            task_id: "child".to_string(),
+            parent_task_id: "parent".to_string(),
+            agent_name: "explorer".to_string(),
+            task_name: "edge-buffer-map".to_string(),
+            read_only: true,
+            subagent_depth: 1,
+            status: "completed".to_string(),
+            summary: Some("子任务已经完成分析。".to_string()),
+            traces: Vec::new(),
+        }];
+        let mut step_index = 2;
+        let mut emitted = Vec::new();
+
+        push_subagent_fallback_final_response(
+            "parent",
+            &subagent_runs,
+            &mut traces,
+            &mut step_index,
+            &mut |event| emitted.push(event.clone()),
+        );
+
+        let final_response = traces.last().unwrap();
+        assert_eq!(step_index, 3);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(final_response.title, "final_response");
+        assert!(matches!(final_response.status, TraceStatus::Success));
+        assert!(final_response
+            .output_summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("子任务已经完成分析。")));
+    }
+
+    #[test]
+    fn subagent_fallback_final_response_keeps_successful_parent_final() {
+        let mut traces = vec![trace(
+            "parent",
+            1,
+            TraceEventType::FinalResponse,
+            None,
+            "final_response",
+            None,
+            Some(json!({ "message": "父级回答。" })),
+            Some("父级回答。".to_string()),
+            TraceStatus::Success,
+            0,
+        )];
+        let subagent_runs = vec![SubagentTraceRun {
+            task_id: "child".to_string(),
+            parent_task_id: "parent".to_string(),
+            agent_name: "explorer".to_string(),
+            task_name: "edge-buffer-map".to_string(),
+            read_only: true,
+            subagent_depth: 1,
+            status: "completed".to_string(),
+            summary: Some("子任务摘要。".to_string()),
+            traces: Vec::new(),
+        }];
+        let mut step_index = 2;
+
+        push_subagent_fallback_final_response(
+            "parent",
+            &subagent_runs,
+            &mut traces,
+            &mut step_index,
+            &mut |_event| {},
+        );
+
+        assert_eq!(step_index, 2);
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].output_summary.as_deref(), Some("父级回答。"));
+    }
+
+    #[test]
     fn final_response_trace_can_warn_when_required_tool_was_not_called() {
         let completion = ChatCompletionResult {
             duration_ms: 8,
@@ -5220,11 +5834,9 @@ mod tests {
     fn run_agent_openai_loop_executes_workspace_read_file_tool() {
         let root = test_workspace();
         fs::write(root.join("sample.txt"), "alpha\nbeta\n").unwrap();
+        let model_tool_name = safe_model_tool_name(tool_registry::WORKSPACE_READ_FILE_TOOL_NAME);
         let (base_url, server_thread) = start_mock_openai_server(vec![
-            tool_call_response_with_args(
-                tool_registry::WORKSPACE_READ_FILE_TOOL_NAME,
-                json!({ "path": "sample.txt" }),
-            ),
+            tool_call_response_with_args(&model_tool_name, json!({ "path": "sample.txt" })),
             final_message_response("Read sample.txt."),
         ]);
         let project = test_project_with_root(root.to_str().unwrap());
@@ -5259,7 +5871,8 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["tool_choice"], json!("required"));
         let names = request_tool_names(&requests[0]);
-        assert!(names.contains(&tool_registry::WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&model_tool_name));
+        assert!(!names.contains(&tool_registry::WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&CALCULATOR_ADD_TOOL_NAME.to_string()));
         assert!(requests[1]["messages"]
             .as_array()
@@ -5268,8 +5881,7 @@ mod tests {
             .any(|message| {
                 message["role"].as_str() == Some("tool")
                     && message["tool_call_id"].as_str() == Some("call_1")
-                    && message["name"].as_str()
-                        == Some(tool_registry::WORKSPACE_READ_FILE_TOOL_NAME)
+                    && message["name"].as_str() == Some(model_tool_name.as_str())
                     && message["content"].as_str().is_some_and(|content| {
                         content.contains("\"file\":\"sample.txt\"")
                             && content.contains("\"text\":\"alpha\"")
@@ -5908,6 +6520,7 @@ mod tests {
                     arguments: "{}".to_string(),
                 },
             },
+            tool_name: tool_name.to_string(),
             arguments: json!({}),
         }
     }
@@ -5987,6 +6600,7 @@ mod tests {
                     credential_id: String::new(),
                     reasoning_mode: String::new(),
                     default_reasoning: String::new(),
+                    reasoning: None,
                     supports_vision: Some(true),
                     supports_developer_role: None,
                     owned_by: None,

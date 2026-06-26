@@ -119,6 +119,8 @@ pub struct ProviderModel {
     pub reasoning_mode: String,
     #[serde(default = "default_model_default_reasoning")]
     pub default_reasoning: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ModelReasoningConfig>,
     #[serde(default)]
     pub supports_vision: Option<bool>,
     #[serde(default)]
@@ -127,6 +129,29 @@ pub struct ProviderModel {
     pub owned_by: Option<String>,
     #[serde(default)]
     pub created: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelReasoningConfig {
+    #[serde(default, alias = "request_field", skip_serializing_if = "String::is_empty")]
+    pub request_field: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default: String,
+    #[serde(default)]
+    pub levels: Vec<ModelReasoningLevel>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelReasoningLevel {
+    pub level: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<serde_json::Value>,
 }
 
 pub struct SettingsStore {
@@ -604,14 +629,18 @@ struct ModelCatalogEntry {
     display_name: String,
     #[serde(default)]
     supports_vision: Option<bool>,
-    #[serde(default, alias = "supportsDeveloperRole")]
+    #[serde(default)]
     supports_developer_role: Option<bool>,
+    #[serde(default, rename = "supportsDeveloperRole")]
+    supports_developer_role_camel: Option<bool>,
     #[serde(default, alias = "inputModalities")]
     input_modalities: Vec<String>,
     #[serde(default)]
     default_reasoning_level: Option<String>,
     #[serde(default)]
     supported_reasoning_levels: Vec<serde_json::Value>,
+    #[serde(default)]
+    reasoning: Option<ModelReasoningConfig>,
 }
 
 fn read_model_catalog(config_path: &Path, catalog_path: Option<String>) -> Vec<ProviderModel> {
@@ -644,14 +673,25 @@ fn read_model_catalog(config_path: &Path, catalog_path: Option<String>) -> Vec<P
             } else {
                 model.display_name.trim().to_string()
             };
-            let reasoning_mode = if model.supported_reasoning_levels.is_empty() {
-                normalize_model_reasoning_mode("", id, &name)
-            } else {
-                "effort".to_string()
-            };
-            let default_reasoning = normalize_model_default_reasoning(
+            let supports_vision = catalog_model_supports_vision(&model, id, &name);
+            let supports_developer_role = model
+                .supports_developer_role
+                .or(model.supports_developer_role_camel);
+            let reasoning = normalize_model_reasoning_config(
+                model.reasoning,
+                &model.supported_reasoning_levels,
+                model.default_reasoning_level.as_deref(),
+            );
+            let reasoning_mode = normalize_model_reasoning_mode_with_config(
+                "",
+                id,
+                &name,
+                reasoning.as_ref(),
+            );
+            let default_reasoning = normalize_model_default_reasoning_with_config(
                 &reasoning_mode,
                 model.default_reasoning_level.as_deref().unwrap_or(""),
+                reasoning.as_ref(),
             );
             Some(ProviderModel {
                 id: id.to_string(),
@@ -660,8 +700,9 @@ fn read_model_catalog(config_path: &Path, catalog_path: Option<String>) -> Vec<P
                 credential_id: String::new(),
                 reasoning_mode,
                 default_reasoning,
-                supports_vision: Some(catalog_model_supports_vision(&model, id, &name)),
-                supports_developer_role: model.supports_developer_role,
+                reasoning,
+                supports_vision: Some(supports_vision),
+                supports_developer_role,
                 owned_by: None,
                 created: None,
             })
@@ -760,6 +801,7 @@ fn import_codebuddy_models(path: &Path) -> Option<Vec<ProviderConfig>> {
                     &normalize_model_reasoning_mode("", &model.id, &model.id),
                     "",
                 ),
+                reasoning: None,
                 supports_vision: model
                     .supports_vision
                     .or_else(|| Some(infer_model_supports_vision(&model.id, &model.id))),
@@ -916,7 +958,185 @@ fn normalize_wire_api(value: &str) -> String {
     }
 }
 
+fn normalized_model_reasoning_fields(
+    model: &ProviderModel,
+    model_id: &str,
+    model_name: &str,
+) -> (String, String, Option<ModelReasoningConfig>) {
+    let reasoning = normalize_model_reasoning_config(model.reasoning.clone(), &[], None);
+    let reasoning_mode = normalize_model_reasoning_mode_with_config(
+        &model.reasoning_mode,
+        model_id,
+        model_name,
+        reasoning.as_ref(),
+    );
+    let default_reasoning = normalize_model_default_reasoning_with_config(
+        &reasoning_mode,
+        &model.default_reasoning,
+        reasoning.as_ref(),
+    );
+    (reasoning_mode, default_reasoning, reasoning)
+}
+
+fn normalize_model_reasoning_config(
+    reasoning: Option<ModelReasoningConfig>,
+    supported_levels: &[serde_json::Value],
+    default_level: Option<&str>,
+) -> Option<ModelReasoningConfig> {
+    let mut config = reasoning.unwrap_or_else(|| ModelReasoningConfig {
+        request_field: String::new(),
+        default: String::new(),
+        levels: supported_levels
+            .iter()
+            .filter_map(supported_reasoning_level)
+            .map(|level| ModelReasoningLevel {
+                request: Some(serde_json::json!({ "reasoning_effort": level.level })),
+                ..level
+            })
+            .collect(),
+    });
+
+    config.request_field = config.request_field.trim().to_string();
+    let request_field = config.request_field.clone();
+    config.levels = config
+        .levels
+        .into_iter()
+        .filter_map(|mut level| {
+            level.level = level.level.trim().to_string();
+            if level.level.is_empty() {
+                return None;
+            }
+            level.label = level.label.trim().to_string();
+            level.description = level.description.trim().to_string();
+            if let Some(summary) = supported_levels
+                .iter()
+                .filter_map(supported_reasoning_level)
+                .find(|summary| summary.level.eq_ignore_ascii_case(&level.level))
+            {
+                if level.label.is_empty() {
+                    level.label = summary.label;
+                }
+                if level.description.is_empty() {
+                    level.description = summary.description;
+                }
+            }
+            if level.label.is_empty() {
+                level.label = reasoning_level_label(&level.level);
+            }
+            if level.request.is_none() && !request_field.is_empty() {
+                level.request =
+                    Some(serde_json::json!({ request_field.clone(): level.level.clone() }));
+            }
+            Some(level)
+        })
+        .collect();
+
+    if config.levels.is_empty() {
+        return None;
+    }
+
+    let requested_default = config
+        .default
+        .trim()
+        .to_string()
+        .or_non_empty()
+        .or_else(|| default_level.and_then(|value| value.trim().to_string().or_non_empty()));
+    config.default = matching_reasoning_level(requested_default.as_deref(), &config.levels)
+        .or_else(|| config.levels.first().map(|level| level.level.clone()))
+        .unwrap_or_default();
+
+    Some(config)
+}
+
+trait NonEmptyString {
+    fn or_non_empty(self) -> Option<String>;
+}
+
+impl NonEmptyString for String {
+    fn or_non_empty(self) -> Option<String> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
+fn supported_reasoning_level(value: &serde_json::Value) -> Option<ModelReasoningLevel> {
+    if let Some(level) = value.as_str().and_then(|value| value.trim().to_string().or_non_empty()) {
+        return Some(ModelReasoningLevel {
+            label: reasoning_level_label(&level),
+            description: String::new(),
+            level,
+            request: None,
+        });
+    }
+    let object = value.as_object()?;
+    let level = ["level", "effort", "value", "name"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .and_then(|value| value.trim().to_string().or_non_empty())?;
+    let label = object
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| reasoning_level_label(&level));
+    let description = object
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    Some(ModelReasoningLevel {
+        level,
+        label,
+        description,
+        request: None,
+    })
+}
+
+fn reasoning_level_label(level: &str) -> String {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "xhigh" => "Extra High".to_string(),
+        "minimal" => "Minimal".to_string(),
+        "low" => "Low".to_string(),
+        "medium" => "Medium".to_string(),
+        "high" => "High".to_string(),
+        "enabled" => "Enabled".to_string(),
+        "disabled" => "Disabled".to_string(),
+        "on" => "On".to_string(),
+        "off" => "Off".to_string(),
+        _ => level.trim().to_string(),
+    }
+}
+
+fn matching_reasoning_level(
+    requested: Option<&str>,
+    levels: &[ModelReasoningLevel],
+) -> Option<String> {
+    let requested = requested?.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    levels
+        .iter()
+        .find(|level| level.level.eq_ignore_ascii_case(requested))
+        .map(|level| level.level.clone())
+}
+
 fn normalize_model_reasoning_mode(value: &str, model_id: &str, model_name: &str) -> String {
+    normalize_model_reasoning_mode_with_config(value, model_id, model_name, None)
+}
+
+fn normalize_model_reasoning_mode_with_config(
+    value: &str,
+    model_id: &str,
+    model_name: &str,
+    reasoning: Option<&ModelReasoningConfig>,
+) -> String {
+    if reasoning.is_some_and(|config| !config.levels.is_empty()) {
+        return "custom".to_string();
+    }
     let inferred = infer_model_reasoning_mode(model_id, model_name);
     if inferred != "none" && value.trim().is_empty() {
         return inferred.to_string();
@@ -924,6 +1144,7 @@ fn normalize_model_reasoning_mode(value: &str, model_id: &str, model_name: &str)
     match value.trim().to_ascii_lowercase().as_str() {
         "toggle" => "toggle".to_string(),
         "effort" => "effort".to_string(),
+        "custom" => "custom".to_string(),
         "none" if inferred == "none" => "none".to_string(),
         "none" => inferred.to_string(),
         _ => inferred.to_string(),
@@ -931,6 +1152,20 @@ fn normalize_model_reasoning_mode(value: &str, model_id: &str, model_name: &str)
 }
 
 fn normalize_model_default_reasoning(reasoning_mode: &str, value: &str) -> String {
+    normalize_model_default_reasoning_with_config(reasoning_mode, value, None)
+}
+
+fn normalize_model_default_reasoning_with_config(
+    reasoning_mode: &str,
+    value: &str,
+    reasoning: Option<&ModelReasoningConfig>,
+) -> String {
+    if let Some(reasoning) = reasoning.filter(|config| !config.levels.is_empty()) {
+        return matching_reasoning_level(Some(value), &reasoning.levels)
+            .or_else(|| matching_reasoning_level(Some(&reasoning.default), &reasoning.levels))
+            .or_else(|| reasoning.levels.first().map(|level| level.level.clone()))
+            .unwrap_or_default();
+    }
     match reasoning_mode {
         "toggle" => {
             if value.eq_ignore_ascii_case("on") {
@@ -943,6 +1178,7 @@ fn normalize_model_default_reasoning(reasoning_mode: &str, value: &str) -> Strin
             "minimal" => "minimal".to_string(),
             "low" => "low".to_string(),
             "high" => "high".to_string(),
+            "xhigh" => "xhigh".to_string(),
             _ => "medium".to_string(),
         },
         _ => "off".to_string(),
@@ -1114,6 +1350,7 @@ fn provider_model(id: &str, name: &str) -> ProviderModel {
             &normalize_model_reasoning_mode("", id, name),
             "",
         ),
+        reasoning: None,
         supports_vision: Some(infer_model_supports_vision(id, name)),
         supports_developer_role: None,
         owned_by: None,
@@ -1168,38 +1405,34 @@ fn normalize_config_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderCon
             let models = provider
                 .models
                 .into_iter()
-                .map(|model| ProviderModel {
-                    id: model.id.trim().to_string(),
-                    name: if model.name.trim().is_empty() {
-                        model.id.trim().to_string()
+                .map(|model| {
+                    let id = model.id.trim().to_string();
+                    let name = if model.name.trim().is_empty() {
+                        id.clone()
                     } else {
                         model.name.trim().to_string()
-                    },
-                    enabled: model.enabled,
-                    credential_id: normalize_model_credential_id(
-                        &model.credential_id,
-                        &default_credential_id,
-                        &credentials,
-                    ),
-                    reasoning_mode: normalize_model_reasoning_mode(
-                        &model.reasoning_mode,
-                        &model.id,
-                        &model.name,
-                    ),
-                    default_reasoning: normalize_model_default_reasoning(
-                        &normalize_model_reasoning_mode(
-                            &model.reasoning_mode,
-                            &model.id,
-                            &model.name,
+                    };
+                    let (reasoning_mode, default_reasoning, reasoning) =
+                        normalized_model_reasoning_fields(&model, &id, &name);
+                    ProviderModel {
+                        id: id.clone(),
+                        name: name.clone(),
+                        enabled: model.enabled,
+                        credential_id: normalize_model_credential_id(
+                            &model.credential_id,
+                            &default_credential_id,
+                            &credentials,
                         ),
-                        &model.default_reasoning,
-                    ),
-                    supports_vision: model
-                        .supports_vision
-                        .or_else(|| Some(infer_model_supports_vision(&model.id, &model.name))),
-                    supports_developer_role: model.supports_developer_role,
-                    owned_by: model.owned_by,
-                    created: model.created,
+                        reasoning_mode,
+                        default_reasoning,
+                        reasoning,
+                        supports_vision: model
+                            .supports_vision
+                            .or_else(|| Some(infer_model_supports_vision(&id, &name))),
+                        supports_developer_role: model.supports_developer_role,
+                        owned_by: model.owned_by,
+                        created: model.created,
+                    }
                 })
                 .filter(|model| !model.id.is_empty())
                 .collect::<Vec<_>>();
@@ -1276,34 +1509,30 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
                     models: provider
                         .models
                         .into_iter()
-                        .map(|model| ProviderModel {
-                            id: model.id.trim().to_string(),
-                            name: if model.name.trim().is_empty() {
-                                model.id.trim().to_string()
+                        .map(|model| {
+                            let id = model.id.trim().to_string();
+                            let name = if model.name.trim().is_empty() {
+                                id.clone()
                             } else {
                                 model.name.trim().to_string()
-                            },
-                            enabled: model.enabled,
-                            credential_id: String::new(),
-                            reasoning_mode: normalize_model_reasoning_mode(
-                                &model.reasoning_mode,
-                                &model.id,
-                                &model.name,
-                            ),
-                            default_reasoning: normalize_model_default_reasoning(
-                                &normalize_model_reasoning_mode(
-                                    &model.reasoning_mode,
-                                    &model.id,
-                                    &model.name,
-                                ),
-                                &model.default_reasoning,
-                            ),
-                            supports_vision: model.supports_vision.or_else(|| {
-                                Some(infer_model_supports_vision(&model.id, &model.name))
-                            }),
-                            supports_developer_role: model.supports_developer_role,
-                            owned_by: model.owned_by,
-                            created: model.created,
+                            };
+                            let (reasoning_mode, default_reasoning, reasoning) =
+                                normalized_model_reasoning_fields(&model, &id, &name);
+                            ProviderModel {
+                                id: id.clone(),
+                                name: name.clone(),
+                                enabled: model.enabled,
+                                credential_id: String::new(),
+                                reasoning_mode,
+                                default_reasoning,
+                                reasoning,
+                                supports_vision: model
+                                    .supports_vision
+                                    .or_else(|| Some(infer_model_supports_vision(&id, &name))),
+                                supports_developer_role: model.supports_developer_role,
+                                owned_by: model.owned_by,
+                                created: model.created,
+                            }
                         })
                         .filter(|model| !model.id.is_empty())
                         .collect(),
@@ -1316,38 +1545,34 @@ fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig> {
             let models = provider
                 .models
                 .into_iter()
-                .map(|model| ProviderModel {
-                    id: model.id.trim().to_string(),
-                    name: if model.name.trim().is_empty() {
-                        model.id.trim().to_string()
+                .map(|model| {
+                    let id = model.id.trim().to_string();
+                    let name = if model.name.trim().is_empty() {
+                        id.clone()
                     } else {
                         model.name.trim().to_string()
-                    },
-                    enabled: model.enabled,
-                    credential_id: normalize_model_credential_id(
-                        &model.credential_id,
-                        &default_credential_id,
-                        &credentials,
-                    ),
-                    reasoning_mode: normalize_model_reasoning_mode(
-                        &model.reasoning_mode,
-                        &model.id,
-                        &model.name,
-                    ),
-                    default_reasoning: normalize_model_default_reasoning(
-                        &normalize_model_reasoning_mode(
-                            &model.reasoning_mode,
-                            &model.id,
-                            &model.name,
+                    };
+                    let (reasoning_mode, default_reasoning, reasoning) =
+                        normalized_model_reasoning_fields(&model, &id, &name);
+                    ProviderModel {
+                        id: id.clone(),
+                        name: name.clone(),
+                        enabled: model.enabled,
+                        credential_id: normalize_model_credential_id(
+                            &model.credential_id,
+                            &default_credential_id,
+                            &credentials,
                         ),
-                        &model.default_reasoning,
-                    ),
-                    supports_vision: model
-                        .supports_vision
-                        .or_else(|| Some(infer_model_supports_vision(&model.id, &model.name))),
-                    supports_developer_role: model.supports_developer_role,
-                    owned_by: model.owned_by,
-                    created: model.created,
+                        reasoning_mode,
+                        default_reasoning,
+                        reasoning,
+                        supports_vision: model
+                            .supports_vision
+                            .or_else(|| Some(infer_model_supports_vision(&id, &name))),
+                        supports_developer_role: model.supports_developer_role,
+                        owned_by: model.owned_by,
+                        created: model.created,
+                    }
                 })
                 .filter(|model| !model.id.is_empty())
                 .collect();
@@ -1651,6 +1876,53 @@ requires_openai_auth = false
 
         assert_eq!(model.supports_vision, Some(true));
         assert_eq!(model.supports_developer_role, Some(true));
+    }
+
+    #[test]
+    fn model_catalog_accepts_both_developer_role_field_names() {
+        let root = create_temp_settings_dir();
+        let config_path = root.join("config.toml");
+        let catalog_path = root.join("models.json");
+        fs::write(
+            &catalog_path,
+            r#"{"models":[{"slug":"MiniMax-M3","display_name":"MiniMax-M3","supportsDeveloperRole":true,"supports_developer_role":true}]}"#,
+        )
+        .unwrap();
+
+        let models = read_model_catalog(&config_path, Some(catalog_path.to_string_lossy().into()));
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].supports_developer_role, Some(true));
+    }
+
+    #[test]
+    fn model_catalog_loads_custom_reasoning_requests() {
+        let root = create_temp_settings_dir();
+        let config_path = root.join("config.toml");
+        let catalog_path = root.join("models.json");
+        fs::write(
+            &catalog_path,
+            r#"{"models":[{"slug":"kimi-k2.7-code","display_name":"Kimi K2.7 Code","default_reasoning_level":"enabled","supported_reasoning_levels":[{"effort":"enabled","description":"Kimi thinking enabled"},{"effort":"disabled","description":"Kimi thinking disabled"}],"reasoning":{"request_field":"thinking","default":"enabled","levels":[{"level":"enabled","request":{"thinking":{"type":"enabled"}}},{"level":"disabled","request":{"thinking":{"type":"disabled"}}}]}}]}"#,
+        )
+        .unwrap();
+
+        let models = read_model_catalog(&config_path, Some(catalog_path.to_string_lossy().into()));
+        let model = models
+            .iter()
+            .find(|model| model.id == "kimi-k2.7-code")
+            .expect("Kimi model should be loaded from catalog");
+        let reasoning = model.reasoning.as_ref().expect("reasoning config");
+
+        assert_eq!(model.reasoning_mode, "custom");
+        assert_eq!(model.default_reasoning, "enabled");
+        assert_eq!(reasoning.request_field, "thinking");
+        assert_eq!(reasoning.default, "enabled");
+        assert_eq!(reasoning.levels.len(), 2);
+        assert_eq!(reasoning.levels[0].description, "Kimi thinking enabled");
+        assert_eq!(
+            reasoning.levels[0].request.as_ref().unwrap()["thinking"]["type"],
+            "enabled"
+        );
     }
 
     #[test]

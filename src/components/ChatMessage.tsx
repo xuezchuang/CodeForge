@@ -11,6 +11,7 @@ import {
   Eye,
   GitFork,
   ListTree,
+  LoaderCircle,
   PanelRightOpen,
   Pencil,
   RotateCcw,
@@ -1150,79 +1151,64 @@ export function ProgressStepsPanel({
   snapshot: ProgressSnapshot
   compact?: boolean
 }) {
-  const [collapsed, setCollapsed] = useState(compact)
   const currentStep = currentProgressStep(snapshot)
-  const collapsedTitle = currentStep?.step.title ?? snapshot.title
-  const isCollapsed = compact && collapsed
+  const totalCount = Math.max(snapshot.totalCount, snapshot.steps.length)
+  const currentStepNumber =
+    totalCount === 0 ?
+      0
+    : Math.min(
+        totalCount,
+        Math.max(1, currentStep ? currentStep.index + 1 : snapshot.completedCount),
+      )
+  const pillStatus =
+    currentStep?.step.status ??
+    (snapshot.completedCount >= totalCount ? 'completed' : 'pending')
+
+  if (compact) {
+    return (
+      <section className="progress-steps-card compact floating" aria-label={snapshot.title}>
+        <div className="progress-steps-popover">
+          <ol className="progress-steps-list">
+            {snapshot.steps.map((step, index) => (
+              <li className={`progress-step ${step.status}`} key={step.id}>
+                <ProgressStepMarker status={step.status} index={index} />
+                <span className="progress-step-body">
+                  <strong>{step.title}</strong>
+                </span>
+              </li>
+            ))}
+          </ol>
+        </div>
+        <div className="progress-steps-pill" aria-label={`Step ${currentStepNumber} of ${totalCount}`}>
+          <ProgressStepMarker status={pillStatus} index={currentStepNumber - 1} />
+          <span>
+            Step {currentStepNumber} / {totalCount}
+          </span>
+        </div>
+      </section>
+    )
+  }
 
   return (
-    <section
-      className={
-        [
-          'progress-steps-card',
-          compact ? 'compact' : '',
-          isCollapsed ? 'collapsed' : '',
-        ]
-          .filter(Boolean)
-          .join(' ')
-      }
-      aria-label={snapshot.title}
-    >
+    <section className="progress-steps-card" aria-label={snapshot.title}>
       <header className="progress-steps-header">
-        {compact ? (
-          <button
-            type="button"
-            className="progress-steps-toggle"
-            aria-expanded={!collapsed}
-            onClick={() => setCollapsed((current) => !current)}
-          >
-            <span className="progress-steps-current">
-              {currentStep ? (
-                <ProgressStepMarker status={currentStep.step.status} index={currentStep.index} />
-              ) : null}
-              <span>
-                <strong>{isCollapsed ? collapsedTitle : 'Steps'}</strong>
-                {isCollapsed && currentStep?.step.detail ? (
-                  <small>{currentStep.step.detail}</small>
-                ) : null}
-              </span>
-            </span>
-            <span className="progress-steps-meta">
-              <span className="progress-steps-count">
-                {snapshot.completedCount} / {snapshot.totalCount} done
-              </span>
-              {collapsed ? (
-                <ChevronRight size={14} aria-hidden="true" />
-              ) : (
-                <ChevronDown size={14} aria-hidden="true" />
-              )}
-            </span>
-          </button>
-        ) : (
-          <>
-            <strong>{snapshot.title}</strong>
-            <span className="progress-steps-count">
-              {snapshot.completedCount} / {snapshot.totalCount} done
-            </span>
-          </>
-        )}
+        <strong>{snapshot.title}</strong>
+        <span className="progress-steps-count">
+          {snapshot.completedCount} / {snapshot.totalCount} done
+        </span>
       </header>
-      {!isCollapsed ? (
-        <ol className="progress-steps-list">
-          {snapshot.steps.map((step, index) => (
-            <li className={`progress-step ${step.status}`} key={step.id}>
-              {compact ?
-                <ProgressStepMarker status={step.status} index={index} />
-              : <ProgressStepIcon status={step.status} />}
-              <span className="progress-step-body">
-                <strong>{step.title}</strong>
-                {!compact && step.detail ? <small>{step.detail}</small> : null}
-              </span>
-            </li>
-          ))}
-        </ol>
-      ) : null}
-      {!compact && (snapshot.mode || snapshot.summary) ? (
+      <ol className="progress-steps-list">
+        {snapshot.steps.map((step) => (
+          <li className={`progress-step ${step.status}`} key={step.id}>
+            <ProgressStepIcon status={step.status} />
+            <span className="progress-step-body">
+              <strong>{step.title}</strong>
+              {step.detail ? <small>{step.detail}</small> : null}
+            </span>
+          </li>
+        ))}
+      </ol>
+      {snapshot.mode || snapshot.summary ? (
         <footer className="progress-steps-footer">
           {snapshot.mode ? <span>Mode: {snapshot.mode}</span> : null}
           {snapshot.summary ? <span>{snapshot.summary}</span> : null}
@@ -1264,7 +1250,11 @@ function ProgressStepMarker({
 }) {
   return (
     <span className={`progress-step-marker ${status}`}>
-      {status === 'completed' ? <Check size={11} aria-hidden="true" /> : index + 1}
+      {status === 'completed' ? <Check size={11} aria-hidden="true" /> : null}
+      {status === 'blocked' ? <CircleAlert size={11} aria-hidden="true" /> : null}
+      {status === 'skipped' ? <X size={11} aria-hidden="true" /> : null}
+      {status === 'in_progress' ? <LoaderCircle size={12} aria-hidden="true" /> : null}
+      {status === 'pending' ? index + 1 : null}
     </span>
   )
 }

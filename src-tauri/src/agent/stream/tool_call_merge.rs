@@ -19,7 +19,10 @@ pub fn merge_streaming_tool_call(tool_calls: &mut Vec<StreamingToolCall>, delta_
 
     let tool_call = &mut tool_calls[index];
     if let Some(id) = delta_tool_call.get("id").and_then(Value::as_str) {
-        tool_call.id = Some(id.to_string());
+        let id = id.trim();
+        if !id.is_empty() {
+            tool_call.id = Some(id.to_string());
+        }
     }
     if let Some(call_type) = delta_tool_call.get("type").and_then(Value::as_str) {
         tool_call.call_type = Some(call_type.to_string());
@@ -42,6 +45,7 @@ pub fn merge_streaming_tool_call(tool_calls: &mut Vec<StreamingToolCall>, delta_
 }
 
 pub fn streaming_tool_calls_json(tool_calls: &[StreamingToolCall]) -> Vec<Value> {
+    let mut used_ids: Vec<String> = Vec::new();
     tool_calls
         .iter()
         .enumerate()
@@ -52,11 +56,10 @@ pub fn streaming_tool_calls_json(tool_calls: &[StreamingToolCall]) -> Vec<Value>
                 .is_some_and(|name| !name.is_empty())
         })
         .map(|(index, tool_call)| {
+            let id = unique_tool_call_id(tool_call.id.as_deref(), index, &used_ids);
+            used_ids.push(id.clone());
             json!({
-                "id": tool_call
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("call_{}", index + 1)),
+                "id": id,
                 "type": tool_call
                     .call_type
                     .clone()
@@ -68,6 +71,23 @@ pub fn streaming_tool_calls_json(tool_calls: &[StreamingToolCall]) -> Vec<Value>
             })
         })
         .collect()
+}
+
+fn unique_tool_call_id(preferred: Option<&str>, index: usize, used_ids: &[String]) -> String {
+    if let Some(id) = preferred.map(str::trim).filter(|id| !id.is_empty()) {
+        if !used_ids.iter().any(|used| used == id) {
+            return id.to_string();
+        }
+    }
+
+    let mut next = index + 1;
+    loop {
+        let candidate = format!("call_{next}");
+        if !used_ids.iter().any(|used| used == &candidate) {
+            return candidate;
+        }
+        next += 1;
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +165,60 @@ mod tests {
             serialized[0]["function"]["arguments"],
             json!("{\"path\":\"sample.txt\"}")
         );
+    }
+
+    #[test]
+    fn empty_tool_call_ids_are_serialized_as_unique_ids() {
+        let mut calls = Vec::new();
+        merge_streaming_tool_call(
+            &mut calls,
+            &json!({
+                "index": 0,
+                "id": "",
+                "type": "function",
+                "function": { "name": "workspace/search", "arguments": "{\"query\":\"a\"}" }
+            }),
+        );
+        merge_streaming_tool_call(
+            &mut calls,
+            &json!({
+                "index": 1,
+                "id": "",
+                "type": "function",
+                "function": { "name": "workspace/search", "arguments": "{\"query\":\"b\"}" }
+            }),
+        );
+
+        let serialized = streaming_tool_calls_json(&calls);
+        assert_eq!(serialized[0]["id"], json!("call_1"));
+        assert_eq!(serialized[1]["id"], json!("call_2"));
+    }
+
+    #[test]
+    fn duplicate_tool_call_ids_are_serialized_as_unique_ids() {
+        let mut calls = Vec::new();
+        merge_streaming_tool_call(
+            &mut calls,
+            &json!({
+                "index": 0,
+                "id": "same",
+                "type": "function",
+                "function": { "name": "workspace/search", "arguments": "{\"query\":\"a\"}" }
+            }),
+        );
+        merge_streaming_tool_call(
+            &mut calls,
+            &json!({
+                "index": 1,
+                "id": "same",
+                "type": "function",
+                "function": { "name": "workspace/search", "arguments": "{\"query\":\"b\"}" }
+            }),
+        );
+
+        let serialized = streaming_tool_calls_json(&calls);
+        assert_eq!(serialized[0]["id"], json!("same"));
+        assert_eq!(serialized[1]["id"], json!("call_2"));
     }
 
     #[test]

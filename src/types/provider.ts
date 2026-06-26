@@ -8,8 +8,21 @@ export type ProviderType =
   | 'ollama'
   | 'local-gateway'
 
-export type ModelReasoningMode = 'none' | 'toggle' | 'effort'
-export type ModelDefaultReasoning = 'off' | 'on' | 'minimal' | 'low' | 'medium' | 'high'
+export type ModelReasoningMode = 'none' | 'toggle' | 'effort' | 'custom'
+export type ModelDefaultReasoning = string
+
+export interface ModelReasoningLevel {
+  level: string
+  label?: string
+  description?: string
+  request?: Record<string, unknown> | null
+}
+
+export interface ModelReasoningConfig {
+  requestField?: string
+  default?: string
+  levels: ModelReasoningLevel[]
+}
 
 export interface ProviderConfig {
   id: string
@@ -45,6 +58,7 @@ export interface ProviderModel {
   credentialId?: string
   reasoningMode?: ModelReasoningMode
   defaultReasoning?: ModelDefaultReasoning
+  reasoning?: ModelReasoningConfig | null
   supportsVision?: boolean | null
   supportsDeveloperRole?: boolean | null
   ownedBy?: string | null

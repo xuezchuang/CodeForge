@@ -86,24 +86,36 @@ function collectCodeLinkMatches(text: string): CodeLinkMatch[] {
 
   codeLinkPattern.lastIndex = 0
   for (const match of text.matchAll(codeLinkPattern)) {
-    const rawLink = match[0]
+    const matchedLink = match[0]
+    const rawLink = normalizeCodeLinkTarget(matchedLink)
     const start = match.index ?? 0
-    const end = start + rawLink.length
+    const end = start + matchedLink.length
     if (matches.some((existing) => rangesOverlap(start, end, existing.start, existing.end))) {
       continue
     }
-    matches.push({ rawLink, start, end })
+    matches.push({
+      rawLink,
+      displayText: rawLink === matchedLink ? undefined : matchedLink,
+      start,
+      end,
+    })
   }
 
   bareCodeLinkPattern.lastIndex = 0
   for (const match of text.matchAll(bareCodeLinkPattern)) {
-    const rawLink = match[2]
+    const matchedLink = match[2]
+    const rawLink = normalizeCodeLinkTarget(matchedLink)
     const start = (match.index ?? 0) + match[1].length
-    const end = start + rawLink.length
+    const end = start + matchedLink.length
     if (matches.some((existing) => rangesOverlap(start, end, existing.start, existing.end))) {
       continue
     }
-    matches.push({ rawLink, start, end })
+    matches.push({
+      rawLink,
+      displayText: rawLink === matchedLink ? undefined : matchedLink,
+      start,
+      end,
+    })
   }
 
   return matches.sort((left, right) => left.start - right.start)
@@ -116,12 +128,12 @@ function firstCodeLinkInText(text: string | undefined): string | null {
   codeLinkPattern.lastIndex = 0
   const direct = codeLinkPattern.exec(text)?.[0]
   if (direct) {
-    return direct
+    return normalizeCodeLinkTarget(direct)
   }
 
   bareCodeLinkPattern.lastIndex = 0
   const bare = bareCodeLinkPattern.exec(text)
-  return bare?.[2] ?? null
+  return bare?.[2] ? normalizeCodeLinkTarget(bare[2]) : null
 }
 
 function codeLinkFromMarkdownTarget(target: string | undefined): string | null {
@@ -144,6 +156,18 @@ function codeLinkFromMarkdownTarget(target: string | undefined): string | null {
   return lineTarget[3] ?
       `${lineTarget[1]}:${lineTarget[2]}:${lineTarget[3]}`
     : `${lineTarget[1]}:${lineTarget[2]}`
+}
+
+function normalizeCodeLinkTarget(rawLink: string): string {
+  return decodeCodeLinkTarget(rawLink).replace(/:(\d+)-\d+(?=(:\d+)?$)/, ':$1')
+}
+
+function decodeCodeLinkTarget(rawLink: string): string {
+  try {
+    return decodeURI(rawLink)
+  } catch {
+    return rawLink
+  }
 }
 
 function rangesOverlap(

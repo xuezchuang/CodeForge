@@ -1053,14 +1053,14 @@ button:focus-visible {
 }
 
 .sidebar-project-group .workspace-history {
-  max-height: min(50vh, 470px);
+  max-height: none;
   padding-left: 20px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .sidebar-project-group .workspace-history-list {
-  overflow-y: auto;
-  padding-right: 6px;
+  overflow: visible;
+  padding-right: 0;
 }
 
 .workspace-history-header {
@@ -1159,6 +1159,21 @@ button:focus-visible {
   color: #667085;
   font-size: 11px;
   padding-right: 2px;
+}
+
+.workspace-history-running {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  color: #667085;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.workspace-history-running svg {
+  stroke-width: 1.9;
+  animation: spin 0.8s linear infinite;
 }
 
 .workspace-history-status {
@@ -1828,11 +1843,13 @@ button:focus-visible {
 }
 
 .markdown-table-wrap {
+  max-width: 100%;
   overflow-x: auto;
 }
 
 .markdown-table {
-  width: 100%;
+  width: max-content;
+  min-width: 100%;
   border-collapse: collapse;
   font-size: 13px;
   line-height: 1.5;
@@ -1844,12 +1861,22 @@ button:focus-visible {
   padding: 6px 8px;
   text-align: left;
   vertical-align: top;
+  min-width: 140px;
+  max-width: 460px;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: keep-all;
 }
 
 .markdown-table th {
   background: #f7f9fc;
   color: #344054;
   font-weight: 700;
+}
+
+.markdown-table th:first-child,
+.markdown-table td:first-child {
+  min-width: 96px;
 }
 
 .markdown-inline-code {
@@ -2090,9 +2117,12 @@ button:focus-visible {
 }
 
 .composer-progress {
-  border-top: 1px solid #d8dde7;
-  padding: 7px 16px 4px;
-  background: #f8fafc;
+  border-top: 0;
+  padding: 0 16px 8px;
+  background: transparent;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
 }
 
 .composer-progress + .composer {
@@ -2104,98 +2134,101 @@ button:focus-visible {
   margin: 0;
 }
 
-.progress-steps-card.compact {
-  background: #ffffff;
-}
-
-.progress-steps-card.compact.collapsed {
-  border-radius: 10px;
-}
-
-.progress-steps-card.compact .progress-steps-header {
-  min-height: 30px;
-  padding: 0;
-}
-
-.progress-steps-card.compact .progress-steps-header strong {
-  font-size: 12px;
-}
-
-.progress-steps-card.compact .progress-steps-count {
-  min-height: 18px;
-  padding: 0 7px;
-  font-size: 10px;
-}
-
-.progress-steps-toggle {
-  width: 100%;
-  min-width: 0;
-  min-height: 32px;
+.progress-steps-card.compact.floating {
+  width: min(340px, calc(100% - 32px));
   border: 0;
-  padding: 0 10px;
+  border-radius: 0;
   background: transparent;
-  color: inherit;
+  color: #344054;
+  overflow: visible;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  cursor: pointer;
-  text-align: left;
+  justify-items: center;
+  gap: 4px;
+  pointer-events: auto;
 }
 
-.progress-steps-toggle:hover {
-  background: rgb(15 23 42 / 3%);
+.progress-steps-popover {
+  width: 100%;
+  max-height: min(224px, 34vh);
+  border: 1px solid rgb(16 24 40 / 10%);
+  border-radius: 10px;
+  background: rgb(255 255 255 / 92%);
+  box-shadow: 0 18px 42px rgb(15 23 42 / 18%);
+  overflow-y: auto;
+  backdrop-filter: blur(16px);
 }
 
-.progress-steps-current {
-  min-width: 0;
-  display: grid;
+.progress-steps-card.compact.floating .progress-steps-list {
+  padding: 6px 0;
+}
+
+.progress-steps-card.compact.floating .progress-step {
   grid-template-columns: 18px minmax(0, 1fr);
-  align-items: center;
   gap: 8px;
+  align-items: center;
+  min-height: 32px;
+  padding: 5px 11px;
+  background: transparent;
 }
 
-.progress-steps-current > span:last-child {
-  min-width: 0;
-  display: grid;
-  gap: 1px;
+.progress-steps-card.compact.floating .progress-step svg {
+  margin-top: 0;
 }
 
-.progress-steps-current strong,
-.progress-steps-current small {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.progress-steps-card.compact.floating .progress-step strong {
+  color: #344054;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.3;
 }
 
-.progress-steps-current small {
+.progress-steps-card.compact.floating .progress-step.completed strong,
+.progress-steps-card.compact.floating .progress-step.skipped strong {
   color: #667085;
-  font-size: 11px;
 }
 
-.progress-steps-meta {
+.progress-steps-card.compact.floating .progress-step.completed svg,
+.progress-steps-card.compact.floating .progress-step.skipped svg {
+  color: #667085;
+}
+
+.progress-steps-card.compact.floating .progress-step.in_progress strong {
+  color: #20242c;
+}
+
+.progress-steps-card.compact.floating .progress-step.in_progress svg {
+  color: #1769d3;
+}
+
+.progress-step-marker svg {
+  stroke-width: 2;
+}
+
+.progress-step-marker.in_progress svg {
+  animation: spin 0.8s linear infinite;
+}
+
+.progress-steps-pill {
+  min-height: 32px;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  color: #667085;
-}
-
-.progress-steps-card.compact .progress-steps-list {
-  padding: 3px 0;
-}
-
-.progress-steps-card.compact .progress-step {
-  grid-template-columns: 18px minmax(0, 1fr);
-  gap: 8px;
-  align-items: center;
-  min-height: 30px;
-  padding: 5px 10px;
-}
-
-.progress-steps-card.compact .progress-step strong {
+  gap: 7px;
+  border: 1px solid rgb(16 24 40 / 10%);
+  border-radius: 999px;
+  background: rgb(255 255 255 / 88%);
+  box-shadow: 0 10px 28px rgb(15 23 42 / 14%);
+  color: #344054;
+  padding: 0 12px;
   font-size: 12px;
-  line-height: 1.25;
+  font-weight: 600;
+  backdrop-filter: blur(16px);
+}
+
+.progress-steps-pill .progress-step-marker {
+  width: 14px;
+  height: 14px;
+  margin-top: 0;
+  background: transparent;
 }
 
 .thinking-toggle {
@@ -2837,9 +2870,10 @@ button.thinking-item:focus-visible {
   box-shadow: 0 14px 32px rgb(15 23 42 / 16%);
 }
 
-.composer-model-menu.with-reasoning {
-  width: min(410px, calc(100vw - 48px));
-  grid-template-columns: minmax(190px, 1fr) minmax(126px, 0.68fr);
+.composer-model-menu.with-submenu {
+  right: 236px;
+  width: min(250px, calc(100vw - 48px));
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .composer-picker-column {
@@ -2854,6 +2888,23 @@ button.thinking-item:focus-visible {
   border-left: 1px solid #e4e7ec;
   padding-left: 8px;
   margin-left: 4px;
+}
+
+.composer-reasoning-submenu {
+  position: absolute;
+  left: 100%;
+  bottom: 0;
+  z-index: 13;
+  width: 236px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid #d8dde7;
+  border-radius: 10px;
+  padding: 6px;
+  background: #ffffff;
+  box-shadow: 0 14px 32px rgb(15 23 42 / 16%);
 }
 
 .composer-picker-header {
@@ -2871,6 +2922,12 @@ button.thinking-item:focus-visible {
   gap: 2px;
   max-height: min(292px, calc(100vh - 170px));
   overflow-y: auto;
+}
+
+.composer-picker-divider {
+  height: 1px;
+  margin: 5px 4px;
+  background: #e4e7ec;
 }
 
 .composer-model-option {
@@ -2900,6 +2957,21 @@ button.thinking-item:focus-visible {
 .composer-model-option span {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.composer-model-option-copy {
+  display: grid;
+  gap: 1px;
+}
+
+.composer-model-option-copy small {
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.composer-reasoning-submenu .composer-model-option {
+  min-height: 38px;
 }
 
 .composer-model-option svg {
@@ -3519,6 +3591,7 @@ pre {
 }
 
 .code-link {
+  max-width: 100%;
   min-height: 22px;
   padding: 0 6px;
   color: #075985;
@@ -3531,7 +3604,20 @@ pre {
   vertical-align: middle;
 }
 
+.code-link-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.markdown-table .code-link {
+  max-width: min(100%, 42ch);
+  justify-content: flex-start;
+}
+
 .code-link svg {
+  flex: 0 0 auto;
   width: 12px;
   height: 12px;
 }
@@ -4502,15 +4588,6 @@ pre {
   color: #39d983;
 }
 
-.app-root.codex-style .progress-steps-toggle:hover {
-  background: rgb(255 255 255 / 4%);
-}
-
-.app-root.codex-style .progress-steps-current small,
-.app-root.codex-style .progress-steps-meta {
-  color: #8d979b;
-}
-
 .app-root.codex-style .progress-step {
   color: #879196;
 }
@@ -4576,23 +4653,69 @@ pre {
   box-shadow: 0 14px 34px rgb(0 0 0 / 18%);
 }
 
-.app-root.codex-style .progress-steps-card.compact .progress-steps-header {
-  min-height: 30px;
+.app-root.codex-style .composer-progress .progress-steps-card.compact.floating {
+  width: min(322px, calc(100% - 32px));
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.app-root.codex-style .progress-steps-popover {
+  border-color: rgb(255 255 255 / 8%);
+  background: rgb(44 44 44 / 88%);
+  box-shadow: 0 18px 42px rgb(0 0 0 / 36%);
+}
+
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step {
+  background: transparent;
+}
+
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step strong {
+  color: #ededed;
+}
+
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step.completed strong,
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step.skipped strong {
+  color: #9b9b9b;
+}
+
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step.completed svg,
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step.skipped svg {
+  color: #9b9b9b;
+}
+
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step.in_progress strong {
+  color: #f0f0f0;
+}
+
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step.in_progress svg {
+  color: #d6d6d6;
 }
 
 .app-root.codex-style .progress-step-marker {
-  background: #2b3032;
-  color: #aab3b7;
+  background: transparent;
+  color: #a6a6a6;
 }
 
 .app-root.codex-style .progress-step-marker.completed {
-  background: #113d29;
-  color: #39d983;
+  background: transparent;
+  color: #a6a6a6;
 }
 
 .app-root.codex-style .progress-step-marker.in_progress {
-  background: #1769d3;
-  color: #ffffff;
+  background: transparent;
+  color: #d6d6d6;
+}
+
+.app-root.codex-style .progress-steps-pill {
+  border-color: rgb(255 255 255 / 9%);
+  background: rgb(54 54 54 / 90%);
+  box-shadow: 0 10px 28px rgb(0 0 0 / 30%);
+  color: #e5e5e5;
+}
+
+.app-root.codex-style .progress-steps-pill .progress-step-marker.in_progress {
+  color: #2f9bff;
 }
 
 .app-root.codex-style .workspace-rail-card {
@@ -4943,11 +5066,23 @@ pre {
   border-radius: 11px;
   background: #2d2d2d;
   box-shadow: 0 18px 42px rgb(0 0 0 / 44%);
-  overflow: hidden;
+  overflow: visible;
+}
+
+.app-root.codex-style .composer-model-menu.with-submenu {
+  right: 236px;
+  width: min(250px, calc(100vw - 32px));
 }
 
 .app-root.codex-style .composer-picker-column + .composer-picker-column {
   border-left-color: #3b3b3b;
+}
+
+.app-root.codex-style .composer-reasoning-submenu {
+  border-color: #3d3d3d;
+  border-radius: 11px;
+  background: #2d2d2d;
+  box-shadow: 0 18px 42px rgb(0 0 0 / 44%);
 }
 
 .app-root.codex-style .composer-picker-header {
@@ -4975,12 +5110,20 @@ pre {
   background: #696969;
 }
 
+.app-root.codex-style .composer-picker-divider {
+  background: #3b3b3b;
+}
+
 .app-root.codex-style .composer-model-option {
   min-height: 29px;
   border-radius: 7px;
   padding: 5px 8px;
   color: #f1f1f1;
   font-size: 13px;
+}
+
+.app-root.codex-style .composer-model-option-copy small {
+  color: #aaa;
 }
 
 .app-root.codex-style .composer-model-option:hover,
@@ -5346,6 +5489,10 @@ pre {
 }
 
 .app-root.codex-style .workspace-history-time {
+  color: #a6a6a6;
+}
+
+.app-root.codex-style .workspace-history-running {
   color: #a6a6a6;
 }
 

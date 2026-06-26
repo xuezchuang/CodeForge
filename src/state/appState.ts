@@ -1,5 +1,6 @@
 import type {
   ModelDefaultReasoning,
+  ModelReasoningConfig,
   ModelReasoningMode,
   ProviderConfig,
   ProviderModel,
@@ -361,13 +362,19 @@ function normalizeProviderModels(models: ProviderModel[]): ProviderModel[] {
   return models.map((model) => {
     const id = model.id.trim()
     const name = (model.name ?? '').trim() || id
-    const reasoningMode = normalizeReasoningMode(model.reasoningMode, id, name)
+    const reasoning = normalizeReasoningConfig(model.reasoning)
+    const reasoningMode = normalizeReasoningMode(model.reasoningMode, id, name, reasoning)
     return {
       ...model,
       id,
       name,
+      reasoning,
       reasoningMode,
-      defaultReasoning: normalizeDefaultReasoning(reasoningMode, model.defaultReasoning),
+      defaultReasoning: normalizeDefaultReasoning(
+        reasoningMode,
+        model.defaultReasoning,
+        reasoning,
+      ),
     }
   })
 }
@@ -376,12 +383,16 @@ function normalizeReasoningMode(
   value: string | undefined,
   modelId: string,
   modelName: string,
+  reasoning?: ModelReasoningConfig | null,
 ): ModelReasoningMode {
+  if (reasoning?.levels.length) {
+    return 'custom'
+  }
   const inferred = inferReasoningMode(modelId, modelName)
   if (inferred !== 'none' && (!value || value === 'none')) {
     return inferred
   }
-  if (value === 'toggle' || value === 'effort' || value === 'none') {
+  if (value === 'toggle' || value === 'effort' || value === 'none' || value === 'custom') {
     return value
   }
   return inferred
@@ -390,7 +401,11 @@ function normalizeReasoningMode(
 function normalizeDefaultReasoning(
   mode: ModelReasoningMode,
   value: string | undefined,
+  reasoning?: ModelReasoningConfig | null,
 ): ModelDefaultReasoning {
+  if (reasoning?.levels.length) {
+    return matchingReasoningLevel(value, reasoning) ?? reasoning.default ?? reasoning.levels[0].level
+  }
   if (mode === 'toggle') {
     return value === 'on' ? 'on' : 'off'
   }
@@ -398,11 +413,47 @@ function normalizeDefaultReasoning(
     return value === 'minimal' ||
       value === 'low' ||
       value === 'medium' ||
-      value === 'high'
+      value === 'high' ||
+      value === 'xhigh'
       ? value
       : 'medium'
   }
   return 'off'
+}
+
+function normalizeReasoningConfig(
+  reasoning: ModelReasoningConfig | null | undefined,
+): ModelReasoningConfig | undefined {
+  const levels = (reasoning?.levels ?? [])
+    .map((level) => ({
+      ...level,
+      level: level.level.trim(),
+      label: level.label?.trim(),
+      description: level.description?.trim(),
+    }))
+    .filter((level) => level.level.length > 0)
+  if (levels.length === 0) {
+    return undefined
+  }
+  const normalized: ModelReasoningConfig = {
+    requestField: reasoning?.requestField?.trim(),
+    default: reasoning?.default?.trim(),
+    levels,
+  }
+  normalized.default = matchingReasoningLevel(reasoning?.default, normalized) ?? levels[0].level
+  return normalized
+}
+
+function matchingReasoningLevel(
+  value: string | undefined,
+  reasoning: ModelReasoningConfig,
+): string | undefined {
+  const requested = value?.trim()
+  if (!requested) {
+    return undefined
+  }
+  return reasoning.levels.find((level) => level.level.toLowerCase() === requested.toLowerCase())
+    ?.level
 }
 
 function inferReasoningMode(modelId: string, modelName: string): ModelReasoningMode {

@@ -1,14 +1,14 @@
 use std::cmp;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
@@ -26,6 +26,9 @@ const MAX_CONTEXT_LINES: usize = 200;
 const BINARY_SAMPLE_BYTES: usize = 8192;
 const SEARCH_CONTENT_SCAN_LIMIT: usize = 25_000;
 const SEARCH_SCAN_TIMEOUT_MS: u128 = 12_000;
+const READ_FILE_RECOVERY_SCAN_LIMIT: usize = 8_000;
+const READ_FILE_RECOVERY_MAX_CANDIDATES: usize = 8;
+const READ_FILE_RECOVERY_MAX_ROOTS: usize = 8;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -108,7 +111,20 @@ pub fn list_dir(workspace_root: &str, arguments: &Value) -> Result<Value, String
 pub fn read_file(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
     let workspace = canonical_workspace_root(workspace_root)?;
     let raw_path = required_string(arguments, "path")?;
-    let file = resolve_existing_read_path(&workspace, &raw_path)?;
+    let resolved = match resolve_existing_read_path(&workspace, &raw_path) {
+        Ok(file) => ResolvedReadFile {
+            file,
+            recovery: None,
+        },
+        Err(error) if error.starts_with("file_not_found:") => {
+            match recover_missing_read_file(&workspace, &raw_path)? {
+                Some(resolved) => resolved,
+                None => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    let file = resolved.file;
     ensure_regular_text_file(&workspace, &file)?;
 
     let start_line = optional_usize(arguments, "start_line", 1)?;
@@ -147,7 +163,7 @@ pub fn read_file(workspace_root: &str, arguments: &Value) -> Result<Value, Strin
         .collect::<Vec<_>>()
         .join("\n");
 
-    Ok(json!({
+    let mut result = json!({
         "file": relative_path(&workspace, &file),
         "totalLines": total_lines,
         "startLine": actual_start_line,
@@ -157,7 +173,12 @@ pub fn read_file(workspace_root: &str, arguments: &Value) -> Result<Value, Strin
         "message": message,
         "text": text,
         "lines": lines,
-    }))
+    });
+    if let Some(recovery) = resolved.recovery {
+        result["recovered"] = json!(true);
+        result["recovery"] = recovery.to_json(&workspace, &file);
+    }
+    Ok(result)
 }
 
 pub fn search_file(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
@@ -885,6 +906,184 @@ fn resolve_existing_read_path(base: &Path, raw_path: &str) -> Result<PathBuf, St
         .map_err(|_| format!("file_not_found: {}", display_input_path(raw_path)))
 }
 
+struct ResolvedReadFile {
+    file: PathBuf,
+    recovery: Option<ReadFileRecovery>,
+}
+
+struct ReadFileRecovery {
+    requested_path: String,
+    search_root: PathBuf,
+    candidate_count: usize,
+    candidates: Vec<PathBuf>,
+}
+
+impl ReadFileRecovery {
+    fn to_json(&self, workspace: &Path, resolved_file: &Path) -> Value {
+        json!({
+            "reason": "file_not_found",
+            "requestedPath": self.requested_path,
+            "resolvedPath": relative_or_display(workspace, resolved_file),
+            "searchRoot": relative_or_display(workspace, &self.search_root),
+            "candidateCount": self.candidate_count,
+            "candidates": self
+                .candidates
+                .iter()
+                .map(|candidate| relative_or_display(workspace, candidate))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+fn recover_missing_read_file(
+    workspace: &Path,
+    raw_path: &str,
+) -> Result<Option<ResolvedReadFile>, String> {
+    let Some(file_name) = requested_file_name(raw_path) else {
+        return Ok(None);
+    };
+    let requested_path = display_input_path(raw_path);
+    for root in recovery_search_roots(workspace, raw_path) {
+        let search = find_same_named_files(workspace, &root, &file_name)?;
+        match search.matches.len() {
+            0 => {
+                if search.scan_limited {
+                    return Err(format!(
+                        "file_not_found: {requested_path}; recovery_search_limited: scanned {} files under {} while looking for {file_name}",
+                        search.scanned_files,
+                        relative_or_display(workspace, &root)
+                    ));
+                }
+            }
+            1 => {
+                let file = search.matches[0].clone();
+                return Ok(Some(ResolvedReadFile {
+                    file,
+                    recovery: Some(ReadFileRecovery {
+                        requested_path,
+                        search_root: root,
+                        candidate_count: search.matches.len(),
+                        candidates: search.matches,
+                    }),
+                }));
+            }
+            _ => {
+                let candidates = search
+                    .matches
+                    .iter()
+                    .map(|candidate| relative_or_display(workspace, candidate))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "file_not_found: {requested_path}; recovery_ambiguous: found {} candidates under {}: {candidates}",
+                    search.matches.len(),
+                    relative_or_display(workspace, &root)
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn requested_file_name(raw_path: &str) -> Option<String> {
+    let normalized = normalize_display_path(raw_path);
+    let trimmed = normalized
+        .trim()
+        .trim_end_matches(|ch| ch == '/' || ch == '\\');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn unresolved_read_candidate(workspace: &Path, raw_path: &str) -> PathBuf {
+    let normalized = normalize_display_path(raw_path);
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return workspace.to_path_buf();
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    }
+}
+
+fn recovery_search_roots(workspace: &Path, raw_path: &str) -> Vec<PathBuf> {
+    let normalized = normalize_display_path(raw_path);
+    let raw_is_absolute = PathBuf::from(normalized.trim()).is_absolute();
+    let candidate = unresolved_read_candidate(workspace, raw_path);
+    let mut roots = Vec::new();
+    let mut current = candidate.parent();
+
+    while let Some(parent) = current {
+        if let Ok(canonical) = canonicalize_path(parent) {
+            if canonical.is_dir()
+                && !is_filesystem_root(&canonical)
+                && !roots.iter().any(|root| root == &canonical)
+            {
+                roots.push(canonical.clone());
+            }
+            if !raw_is_absolute && canonical == workspace {
+                break;
+            }
+            if roots.len() >= READ_FILE_RECOVERY_MAX_ROOTS {
+                break;
+            }
+        }
+        current = parent.parent();
+    }
+
+    roots
+}
+
+struct SameNameSearch {
+    matches: Vec<PathBuf>,
+    scanned_files: usize,
+    scan_limited: bool,
+}
+
+fn find_same_named_files(
+    workspace: &Path,
+    root: &Path,
+    file_name: &str,
+) -> Result<SameNameSearch, String> {
+    let mut matches = Vec::new();
+    let mut scan_limited = false;
+    let scanned_files = walk_files_until(workspace, root, &mut |path, scanned| {
+        if scanned > READ_FILE_RECOVERY_SCAN_LIMIT {
+            scan_limited = true;
+            return Ok(WalkControl::Stop);
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(file_name))
+        {
+            matches.push(path.to_path_buf());
+            if matches.len() > READ_FILE_RECOVERY_MAX_CANDIDATES {
+                return Ok(WalkControl::Stop);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(SameNameSearch {
+        matches,
+        scanned_files,
+        scan_limited,
+    })
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    path.parent().is_none() || path.parent().is_some_and(|parent| parent == path)
+}
+
 fn resolve_search_root(workspace: &Path, arguments: &Value) -> Result<PathBuf, String> {
     let root = optional_string(arguments, "root")?.unwrap_or_else(|| ".".to_string());
     let path = resolve_existing_read_path(workspace, &root)?;
@@ -1333,7 +1532,8 @@ mod tests {
         }
 
         fn path(&self, relative: &str) -> PathBuf {
-            self.root.join(relative)
+            self.root
+                .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
         }
 
         fn write_text(&self, relative: &str, text: &str) {
@@ -1412,6 +1612,55 @@ mod tests {
         let error = read_file(&workspace.root_str(), &json!({ "path": "data.bin" })).unwrap_err();
 
         assert!(error.contains("binary_file"));
+    }
+
+    #[test]
+    fn read_file_recovers_unique_same_name_from_nearby_ancestor() {
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path("Plugin/Source/WrongModule/Public")).unwrap();
+        workspace.write_text(
+            "Plugin/Source/CorrectModule/Public/ModelContextProtocol.h",
+            "constexpr int Port = 8000;\n",
+        );
+
+        let result = read_file(
+            &workspace.root_str(),
+            &json!({
+                "path": "Plugin/Source/WrongModule/Public/ModelContextProtocol.h"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["file"],
+            json!("Plugin/Source/CorrectModule/Public/ModelContextProtocol.h")
+        );
+        assert_eq!(result["recovered"], json!(true));
+        assert_eq!(result["recovery"]["reason"], json!("file_not_found"));
+        assert_eq!(
+            result["recovery"]["requestedPath"],
+            json!("Plugin/Source/WrongModule/Public/ModelContextProtocol.h")
+        );
+        assert_eq!(result["recovery"]["searchRoot"], json!("Plugin/Source"));
+        assert_eq!(result["text"], json!("constexpr int Port = 8000;"));
+    }
+
+    #[test]
+    fn read_file_reports_ambiguous_recovery_candidates() {
+        let workspace = TestWorkspace::new();
+        fs::create_dir_all(workspace.path("Plugin/Source/WrongModule/Public")).unwrap();
+        workspace.write_text("Plugin/Source/First/Public/Target.h", "first\n");
+        workspace.write_text("Plugin/Source/Second/Public/Target.h", "second\n");
+
+        let error = read_file(
+            &workspace.root_str(),
+            &json!({ "path": "Plugin/Source/WrongModule/Public/Target.h" }),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("recovery_ambiguous"));
+        assert!(error.contains("Plugin/Source/First/Public/Target.h"));
+        assert!(error.contains("Plugin/Source/Second/Public/Target.h"));
     }
 
     #[test]

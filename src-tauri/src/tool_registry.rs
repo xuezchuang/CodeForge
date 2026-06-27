@@ -393,7 +393,14 @@ pub async fn execute_tool_result(
 
     let started = Instant::now();
     match execute_tool_inner(context, name, arguments).await {
-        Ok(output) => ToolOutput::ok(output, started.elapsed().as_millis() as u64),
+        Ok(output) => {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            if let Some(summary) = recovered_read_file_summary(name, &output) {
+                ToolOutput::ok_with_summary(output, elapsed_ms, summary)
+            } else {
+                ToolOutput::ok(output, elapsed_ms)
+            }
+        }
         Err(error) => {
             let elapsed_ms = started.elapsed().as_millis() as u64;
             if error.starts_with("rejected:") {
@@ -405,6 +412,28 @@ pub async fn execute_tool_result(
             }
         }
     }
+}
+
+fn recovered_read_file_summary(name: &str, output: &Value) -> Option<String> {
+    if !matches!(name, READ_FILE_TOOL_NAME | WORKSPACE_READ_FILE_TOOL_NAME) {
+        return None;
+    }
+    if output.get("recovered").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let recovery = output.get("recovery").and_then(Value::as_object)?;
+    let requested = recovery
+        .get("requestedPath")
+        .and_then(Value::as_str)
+        .unwrap_or("requested path");
+    let resolved = recovery
+        .get("resolvedPath")
+        .and_then(Value::as_str)
+        .or_else(|| output.get("file").and_then(Value::as_str))
+        .unwrap_or("matching file");
+    Some(format!(
+        "recovered file_not_found: read {resolved} after missing {requested}"
+    ))
 }
 
 fn tool_timeout(name: &str) -> Duration {
@@ -635,7 +664,7 @@ fn read_file_definition() -> Value {
         "type": "function",
         "function": {
             "name": READ_FILE_TOOL_NAME,
-            "description": "Read a local text file from the current filesystem with line numbers. Accepts workspace-relative paths and absolute local paths. Treat a successful result as current disk contents for this turn, not a stale cache or snapshot. Defaults to at most 300 lines; use start_line and end_line for large files. Binary files are rejected.",
+            "description": "Read a local text file from the current filesystem with line numbers. Accepts workspace-relative paths and absolute local paths. Treat a successful result as current disk contents for this turn, not a stale cache or snapshot. If the exact path was not already returned by a current tool result, prefer list_dir/search_file first to confirm path segments before reading; do not guess module directories from filenames or includes. If the requested file is missing, read_file may recover by reading a unique same-name file from a nearby existing ancestor and will mark the output as recovered. Defaults to at most 300 lines; use start_line and end_line for large files. Binary files are rejected.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1580,6 +1609,8 @@ mod tests {
         assert!(description.contains("current filesystem"));
         assert!(description.contains("current disk contents"));
         assert!(description.contains("not a stale cache or snapshot"));
+        assert!(description.contains("prefer list_dir/search_file first"));
+        assert!(description.contains("mark the output as recovered"));
     }
 
     #[test]

@@ -1305,16 +1305,30 @@ function traceResponsePayload(event: ToolTraceEvent): Record<string, unknown> {
 }
 
 function inferRoundStatus(events: ToolTraceEvent[], response: ToolTraceEvent | null): TraceStatus {
-  if (events.some((event) => event.status === 'failed')) {
+  const statuses = events.map(effectiveTraceStatus)
+  if (statuses.some((status) => status === 'failed')) {
     return 'failed'
   }
-  if (events.some((event) => event.status === 'warning')) {
+  if (statuses.some((status) => status === 'warning')) {
     return 'warning'
   }
-  if (!response || events.some((event) => event.status === 'running')) {
+  if (!response || statuses.some((status) => status === 'running')) {
     return 'running'
   }
   return 'success'
+}
+
+function effectiveTraceStatus(event: ToolTraceEvent): TraceStatus {
+  if (event.status === 'success' && traceOutputRecovered(event.output)) {
+    return 'warning'
+  }
+  return event.status
+}
+
+function traceOutputRecovered(value: unknown): boolean {
+  const output = asRecord(value)
+  const payload = asRecord(output.output)
+  return output.recovered === true || payload.recovered === true
 }
 
 function inferDurationMs(events: ToolTraceEvent[]): number | null {
@@ -1411,7 +1425,7 @@ function createToolResult(event: ToolTraceEvent, index: number): TraceToolResult
     id: event.id,
     index,
     name: event.toolName ?? firstText([input.toolName]) ?? `tool-${index}`,
-    status: event.status,
+    status: effectiveTraceStatus(event),
     startedAt: event.startedAt,
     durationMs: event.durationMs,
     argumentsValue: asRecord(input.arguments),

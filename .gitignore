@@ -28,6 +28,7 @@ projects.json
 .codeforge/
 !.codeforge/
 .codeforge/*
+!.codeforge/codeforge.md
 !.codeforge/skills/
 !.codeforge/skills/**
 .tmp-codebuddy-inspect/

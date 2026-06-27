@@ -56,7 +56,9 @@ const CODEFORGE_DEVELOPER_INSTRUCTION_FILES: [&str; 4] = [
 ];
 const AGENTS_USER_INSTRUCTION_FILES: [&str; 1] = ["AGENTS.md"];
 const AI_CONTEXT_INDEX_FILE: &str = "doc/ai-context/README.md";
+const CODEFORGE_PROJECT_INSTRUCTION_FILE: &str = ".codeforge/codeforge.md";
 const CODEFORGE_SKILLS_DIR: &str = ".codeforge/skills";
+const UNREAL_PROJECT_SKILL_FILE: &str = ".codeforge/skills/unreal-project/SKILL.md";
 const MAX_CODEFORGE_SKILLS: usize = 32;
 const MAX_ACTIVE_SKILLS: usize = 3;
 const MAX_ACTIVE_SKILL_CONTENT_CHARS: usize = 24_000;
@@ -211,6 +213,7 @@ pub struct CodeforgeSkillSummary {
 struct CodeforgeSkill {
     name: String,
     description: String,
+    triggers: Vec<String>,
     path: PathBuf,
     content: String,
 }
@@ -1754,7 +1757,11 @@ async fn run_openai_tool_agent_loop(
                 for completed in completed_tool_calls {
                     let tool_result = completed.result.to_model_value();
                     let trace_status = if completed.result.is_ok() {
-                        TraceStatus::Success
+                        if tool_output_should_warn(&completed.result) {
+                            TraceStatus::Warning
+                        } else {
+                            TraceStatus::Success
+                        }
                     } else {
                         TraceStatus::Failed
                     };
@@ -5006,12 +5013,13 @@ fn developer_prompt(project: &ProjectSession, cli_mode: bool) -> String {
         prompt.push_str("Use a plain terminal style: no emoji, no marketing copy, and no generic capability list. Do not advertise tools or demo capabilities unless the user asks about them. Never mention calculator or arithmetic demo tools unless directly relevant to the user's request. For a simple greeting, reply with one short sentence asking what task to work on; do not include examples or bullet lists.\n");
     }
     prompt.push_str("Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Use document/read_docx for .docx files and presentation/read_pptx for .pptx files; do not use text read_file for Office packages.\n");
-    prompt.push_str("Read-only file tools can inspect local absolute paths outside the workspace. When the user asks to read, inspect, search, or verify local files or logs, call list_dir/read_file/search_file/search_content (or their workspace/ aliases) before answering. If searching for a specific path, first run list_dir on the parent/starting directory to confirm exact path segments (for example, never assume `codex-config` vs `config`), then target search_file/search_content. Do not claim a read/search tool failed unless a tool_result in the current turn shows that failure. A successful read_file/search_content result is fresh current-filesystem evidence for that turn; do not dismiss it as a stale snapshot, do not ask the user to open VS Code or run git just to confirm the same file state, and do not treat \"verify against current source\" as a reason to avoid read/search tools.\n");
+    prompt.push_str("Read-only file tools can inspect local absolute paths outside the workspace. When the user asks to read, inspect, search, or verify local files or logs, call list_dir/read_file/search_file/search_content (or their workspace/ aliases) before answering. If a target path was not already returned by a current-turn tool result, treat it as unverified: first run list_dir on the parent/starting directory or search_file/search_content to confirm exact path segments (for example, never assume `codex-config` vs `config`, or a UE header's module directory from its include name), then read the confirmed path. If read_file returns a recovered result, explain that the requested path was missing and that a unique same-name file was read instead. Do not claim a read/search tool failed unless a tool_result in the current turn shows that failure. A successful read_file/search_content result is fresh current-filesystem evidence for that turn; do not dismiss it as a stale snapshot, do not ask the user to open VS Code or run git just to confirm the same file state, and do not treat \"verify against current source\" as a reason to avoid read/search tools.\n");
     prompt.push_str("Treat user statements about the code as hypotheses until they are verified against workspace code, tool output, logs, or diagnostics. For code-specific answers, gather enough concrete evidence before concluding. If you did not inspect fresh code in the current turn, say whether the answer is based on previous context or inference. Distinguish verified facts, reused prior evidence, and inference when the distinction matters.\n");
     prompt.push_str("Do not claim rg or text search is precise semantic analysis. Prefer exact definitions, call sites, implementations, and diagnostics over name-only search results. Keep edits surgical and cite concrete code locations when relevant.\n");
     prompt.push_str("If an AI context index is provided from doc/ai-context/README.md, treat it as a navigation map only. Do not read every linked doc by default. Read only the context docs that are directly relevant to the user's task, then verify any code-specific conclusion against current source code before answering or editing.\n");
     prompt.push_str("Answer concisely. ");
     prompt.push_str(code_navigation_response_guidance());
+    append_unreal_workspace_guidance(project, &mut prompt);
 
     if let Some(file) =
         read_first_instruction_file(&project.repo_root, &CODEFORGE_DEVELOPER_INSTRUCTION_FILES)
@@ -5026,6 +5034,204 @@ fn developer_prompt(project: &ProjectSession, cli_mode: bool) -> String {
     append_codeforge_skill_index(project, &mut prompt);
 
     prompt
+}
+
+fn append_unreal_workspace_guidance(project: &ProjectSession, prompt: &mut String) {
+    let Some(guidance) = unreal_workspace_guidance(project) else {
+        return;
+    };
+    prompt.push_str("\n\n");
+    prompt.push_str(&guidance);
+}
+
+fn unreal_workspace_guidance(project: &ProjectSession) -> Option<String> {
+    let root = Path::new(&project.repo_root);
+    let uproject = find_project_uproject(project, root)?;
+    let (engine_association, model_context_protocol_enabled) =
+        read_uproject_unreal_metadata(&uproject);
+    let engine_root = engine_association
+        .as_deref()
+        .and_then(|association| find_unreal_engine_root(root, association));
+    let project_source = if root.join("Source").is_dir() {
+        "project `Source/` exists"
+    } else {
+        "no top-level `Source/` directory detected"
+    };
+    let plugin_source = if has_unreal_plugin_source(root) {
+        "plugin C++ source exists under `Plugins/*/Source/`"
+    } else {
+        "no plugin `Source/` directory detected"
+    };
+    let content_dir = if root.join("Content").is_dir() {
+        "`Content/` exists; Blueprint assets are binary `*.uasset` files"
+    } else {
+        "`Content/` directory was not detected"
+    };
+
+    let mut guidance = String::new();
+    guidance.push_str("Unreal Engine workspace detected from `");
+    guidance.push_str(&display_instruction_path(project, &uproject).replace('\\', "/"));
+    guidance.push_str("`. For UE, Blueprint, or Unreal MCP questions, do not answer from generic assumptions. Establish this evidence chain first: `.uproject` -> `EngineAssociation` -> UE root/source -> project `Config/` and `Saved/Logs/` -> relevant project or engine plugin source -> MCP server/tool state when available. ");
+    guidance.push_str("Blueprint graph logic in `Content/**/*.uasset` is binary; inspect it through Unreal MCP/editor tools, generated dumps, or other current evidence instead of claiming to read it as text. ");
+    guidance.push_str("Project shape: ");
+    guidance.push_str(project_source);
+    guidance.push_str("; ");
+    guidance.push_str(plugin_source);
+    guidance.push_str("; ");
+    guidance.push_str(content_dir);
+    guidance.push('.');
+
+    if let Some(association) = engine_association {
+        guidance.push_str(" EngineAssociation: `");
+        guidance.push_str(&association);
+        guidance.push_str("`.");
+    } else {
+        guidance.push_str(" EngineAssociation was not parsed; verify in the `.uproject`.");
+    }
+
+    if let Some(engine_root) = engine_root {
+        guidance.push_str(" Detected UE root candidate: `");
+        guidance.push_str(&engine_root.display().to_string().replace('\\', "/"));
+        guidance.push_str("`; engine source is under `Engine/Source/` and engine plugins under `Engine/Plugins/**/Source/`.");
+    } else {
+        guidance.push_str(" No UE root was auto-detected; locate it from `EngineAssociation` before making engine/plugin claims.");
+    }
+
+    if model_context_protocol_enabled {
+        guidance.push_str(" `ModelContextProtocol` is enabled in the `.uproject`; for MCP transport/port answers, inspect the UE plugin source, project config, `Saved/Logs/*.log`, and CodeForge MCP config/current server state before concluding.");
+    }
+
+    Some(guidance)
+}
+
+fn find_project_uproject(project: &ProjectSession, root: &Path) -> Option<PathBuf> {
+    if let Some(uproject_path) = project.uproject_path.as_deref() {
+        let configured = Path::new(uproject_path);
+        let path = if configured.is_absolute() {
+            configured.to_path_buf()
+        } else {
+            root.join(configured)
+        };
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let mut candidates = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("uproject"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+fn read_uproject_unreal_metadata(uproject: &Path) -> (Option<String>, bool) {
+    let Ok(text) = std::fs::read_to_string(uproject) else {
+        return (None, false);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return (None, false);
+    };
+    let engine_association = value
+        .get("EngineAssociation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let model_context_protocol_enabled = value
+        .get("Plugins")
+        .and_then(Value::as_array)
+        .is_some_and(|plugins| {
+            plugins.iter().any(|plugin| {
+                plugin
+                    .get("Name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("ModelContextProtocol"))
+                    && plugin
+                        .get("Enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            })
+        });
+    (engine_association, model_context_protocol_enabled)
+}
+
+fn has_unreal_plugin_source(root: &Path) -> bool {
+    let plugins = root.join("Plugins");
+    let Ok(entries) = std::fs::read_dir(plugins) else {
+        return false;
+    };
+    entries
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().join("Source").is_dir())
+}
+
+fn find_unreal_engine_root(workspace_root: &Path, engine_association: &str) -> Option<PathBuf> {
+    let association = engine_association.trim();
+    if association.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    let association_path = PathBuf::from(association);
+    if association_path.is_absolute() {
+        candidates.push(association_path);
+    }
+
+    if is_unreal_version_association(association) {
+        let engine_dir = if association.to_ascii_uppercase().starts_with("UE_") {
+            association.to_string()
+        } else {
+            format!("UE_{association}")
+        };
+        if let Some(drive) = windows_drive_prefix(workspace_root) {
+            candidates.push(PathBuf::from(format!(r"{drive}\ue\{engine_dir}")));
+            candidates.push(PathBuf::from(format!(r"{drive}\Unreal\{engine_dir}")));
+        }
+        candidates.push(PathBuf::from(format!(
+            r"C:\Program Files\Epic Games\{engine_dir}"
+        )));
+        candidates.push(PathBuf::from(format!(r"D:\ue\{engine_dir}")));
+        candidates.push(PathBuf::from(format!(r"E:\ue\{engine_dir}")));
+    }
+
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("Engine").join("Source").is_dir())
+}
+
+fn is_unreal_version_association(value: &str) -> bool {
+    let trimmed = value.trim();
+    let version = trimmed
+        .strip_prefix("UE_")
+        .or_else(|| trimmed.strip_prefix("ue_"))
+        .unwrap_or(trimmed);
+    let mut parts = version.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    major.chars().all(|ch| ch.is_ascii_digit()) && minor.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn windows_drive_prefix(path: &Path) -> Option<String> {
+    let value = path.to_string_lossy();
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        Some(value[..2].to_string())
+    } else {
+        None
+    }
 }
 
 pub fn list_codeforge_skill_summaries(repo_root: &str) -> Vec<CodeforgeSkillSummary> {
@@ -5134,16 +5340,17 @@ fn read_codeforge_skill(skill_dir: PathBuf) -> Option<CodeforgeSkill> {
     if content.is_empty() {
         return None;
     }
-    let (name, description) = parse_skill_frontmatter(&content)?;
+    let (name, description, triggers) = parse_skill_frontmatter(&content)?;
     Some(CodeforgeSkill {
         name,
         description,
+        triggers,
         path,
         content,
     })
 }
 
-fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
+fn parse_skill_frontmatter(content: &str) -> Option<(String, String, Vec<String>)> {
     let rest = content.strip_prefix("---")?;
     let rest = rest
         .strip_prefix('\n')
@@ -5152,6 +5359,7 @@ fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
     let frontmatter = &rest[..end];
     let mut name = None;
     let mut description = None;
+    let mut triggers = Vec::new();
     for line in frontmatter.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
@@ -5160,10 +5368,11 @@ fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
         match key.trim() {
             "name" if !value.is_empty() => name = Some(value),
             "description" if !value.is_empty() => description = Some(value),
+            "triggers" => triggers = parse_frontmatter_list(&value),
             _ => {}
         }
     }
-    Some((name?, description.unwrap_or_default()))
+    Some((name?, description.unwrap_or_default(), triggers))
 }
 
 fn unquote_frontmatter_value(value: &str) -> String {
@@ -5177,6 +5386,20 @@ fn unquote_frontmatter_value(value: &str) -> String {
     value.to_string()
 }
 
+fn parse_frontmatter_list(value: &str) -> Vec<String> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(value);
+    value
+        .split(',')
+        .map(unquote_frontmatter_value)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 fn skill_invoked_by_prompt(skill: &CodeforgeSkill, prompt: &str) -> bool {
     let prompt = prompt.to_ascii_lowercase();
     let name = skill.name.to_ascii_lowercase();
@@ -5187,12 +5410,32 @@ fn skill_invoked_by_prompt(skill: &CodeforgeSkill, prompt: &str) -> bool {
     {
         return true;
     }
+    if skill
+        .triggers
+        .iter()
+        .any(|trigger| prompt_contains_skill_trigger(&prompt, trigger))
+    {
+        return true;
+    }
 
     let name_tokens = name
         .split('-')
         .filter(|token| token.len() >= 3)
         .collect::<Vec<_>>();
     !name_tokens.is_empty() && name_tokens.iter().all(|token| prompt.contains(token))
+}
+
+fn prompt_contains_skill_trigger(prompt: &str, trigger: &str) -> bool {
+    let trigger = trigger.trim().to_ascii_lowercase();
+    if trigger.is_empty() {
+        return false;
+    }
+    if trigger.chars().all(|ch| ch.is_ascii_alphanumeric()) && trigger.len() <= 3 {
+        return prompt
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|part| part == trigger);
+    }
+    prompt.contains(&trigger)
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -5269,11 +5512,11 @@ Workspace name: {workspace_name}
 Workspace root: {workspace_root}
 
 Goal:
-Create or update a retrieval-style AI context library under `doc/ai-context/`. This library is for future coding agents to navigate the project faster; it must not replace reading current code.
+Create or update a retrieval-style AI context library under `doc/ai-context/`. This library is for future coding agents to navigate the project faster; it must not replace reading current code. When the workspace is an Unreal Engine project, also create or update CodeForge project guidance and an Unreal skill so future turns know where UE C++ source, Blueprint evidence, logs, and MCP state must be inspected.
 
 Required behavior:
-1. Use workspace tools to inspect the project before writing. Start with `AGENTS.md` if present, existing `doc/ai-context/README.md` if present, the top-level tree, build/config files, and key source directories.
-2. Write only documentation files under `doc/ai-context/`.
+1. Use workspace tools to inspect the project before writing. Start with `AGENTS.md` if present, existing `doc/ai-context/README.md` if present, existing `{codeforge_project_instruction_file}` if present, existing `{unreal_project_skill_file}` if present, the top-level tree, build/config files, and key source directories.
+2. By default, write only documentation files under `doc/ai-context/`. Exception: if the workspace contains a `*.uproject` or the project metadata identifies an Unreal project, also create or update `{codeforge_project_instruction_file}` and `{unreal_project_skill_file}` with the Unreal guidance described below.
 3. Create or update `doc/ai-context/README.md` as the only default index. It must explicitly say:
    - it is an index only,
    - linked docs are not source of truth,
@@ -5285,21 +5528,37 @@ Required behavior:
    - `doc/ai-context/build-and-run.md`
    - `doc/ai-context/code-navigation.md`
    Add up to eight more focused docs only when the codebase clearly has matching areas.
-5. Each doc must include:
+5. For Unreal Engine workspaces, also create or update `doc/ai-context/unreal.md` and link it from the README. Inspect and document:
+   - the `.uproject` path and parsed `EngineAssociation`,
+   - project C++ paths: `Source/` and `Plugins/*/Source/` when present,
+   - Blueprint/content paths: `Content/`, with the note that `*.uasset` Blueprint assets are binary and need Unreal MCP/editor tooling, generated dumps, or other current evidence for graph logic,
+   - project config and logs: `Config/` and `Saved/Logs/*.log`,
+   - UE engine source root if discoverable from `EngineAssociation` using common install roots such as the workspace drive's `\ue\UE_<version>` and `C:\Program Files\Epic Games\UE_<version>`,
+   - relevant UE engine plugin source paths, especially `Engine/Plugins/**/ModelContextProtocol/**/Source/` when the project enables `ModelContextProtocol`,
+   - MCP transport/port evidence from UE plugin source, project config, latest logs, CodeForge MCP config, and current MCP server/tool state when available.
+6. For Unreal Engine workspaces, create or update `{codeforge_project_instruction_file}`. Preserve unrelated existing guidance. Add a concise Unreal section that requires this evidence chain before UE/MCP conclusions: `.uproject` -> `EngineAssociation` -> UE root/source -> project `Config/` and `Saved/Logs/` -> project/engine plugin source -> MCP server/tool state. Include concrete paths found during init and state unknowns as "unknown; verify in code/logs".
+7. For Unreal Engine workspaces, create or update `{unreal_project_skill_file}` with frontmatter:
+   - `name: unreal-project`
+   - a description mentioning UE, Unreal, Blueprint, 蓝图, C++, MCP, and ModelContextProtocol
+   - `triggers: [ue, unreal, blueprint, 蓝图, 虚幻, cpp, c++, mcp, ModelContextProtocol]`
+   The skill workflow must tell future agents to read the `.uproject`, locate UE source from `EngineAssociation`, inspect project and engine plugin source, use logs/config/MCP tools for port or transport claims, and avoid pretending binary Blueprint assets are text-readable.
+8. Each doc must include:
    - Purpose
    - When to read
    - Source scope with concrete paths
    - Key entry points or relationships
    - Verification notes, including that current code wins over this doc
    - Last verified date: {date}
-6. Keep docs concise and navigational. Prefer file paths, module ownership, call-flow hints, and search keywords over broad prose.
-7. Do not invent APIs, architecture, build commands, or module relationships. If unclear, write "unknown; verify in code" and cite the files that were inspected.
-8. Final answer should summarize which files were created or updated and what remains uncertain.
+9. Keep docs concise and navigational. Prefer file paths, module ownership, call-flow hints, and search keywords over broad prose.
+10. Do not invent APIs, architecture, build commands, ports, transports, engine paths, or module relationships. If unclear, write "unknown; verify in code/logs" and cite the files that were inspected.
+11. Final answer should summarize which files were created or updated and what remains uncertain.
 
 Use the available workspace read/search/write tools. Do not use shell commands."#,
         workspace_name = project.name,
         workspace_root = project.repo_root,
-        date = Utc::now().date_naive()
+        date = Utc::now().date_naive(),
+        codeforge_project_instruction_file = CODEFORGE_PROJECT_INSTRUCTION_FILE,
+        unreal_project_skill_file = UNREAL_PROJECT_SKILL_FILE
     )
 }
 
@@ -5614,6 +5873,15 @@ fn tool_result_summary(result: &Value) -> String {
         .get("result")
         .map(|value| format!("result={}", compact_json(value)))
         .unwrap_or_else(|| compact_json(result))
+}
+
+fn tool_output_should_warn(result: &ToolOutput) -> bool {
+    result
+        .output
+        .as_ref()
+        .and_then(|output| output.get("recovered"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
@@ -6080,6 +6348,47 @@ Inspect `git status --short` before writing the message.
     }
 
     #[test]
+    fn codeforge_skill_triggers_load_unreal_skill_for_ue_prompt() {
+        let root = test_workspace();
+        let skill_dir = root
+            .join(".codeforge")
+            .join("skills")
+            .join("unreal-project");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: unreal-project
+description: Work on UE Unreal Engine Blueprint 蓝图 MCP projects.
+triggers: [ue, unreal, blueprint, 蓝图, mcp, ModelContextProtocol]
+---
+
+# Unreal Project
+
+Read the `.uproject`, locate UE source, and verify MCP transport from source or logs.
+"#,
+        )
+        .unwrap();
+        let project = test_project_with_root(root.to_str().unwrap());
+        let selected = test_selected_model("openai");
+        let messages = build_openai_messages(
+            &project,
+            &[chat_message(
+                "user",
+                "这个 ue 蓝图 MCP 端口是多少?".to_string(),
+            )],
+            false,
+            &selected,
+            false,
+        );
+        let developer = messages[1]["content"].as_str().unwrap();
+
+        assert!(developer.contains("<codeforge_active_skills>"));
+        assert!(developer.contains("Read the `.uproject`"));
+        assert!(developer.contains("verify MCP transport"));
+    }
+
+    #[test]
     fn openai_messages_include_auto_readonly_subagent_policy_for_root_tool_runs() {
         let root = test_workspace();
         let project = test_project_with_root(root.to_str().unwrap());
@@ -6115,9 +6424,45 @@ Inspect `git status --short` before writing the message.
 
         assert!(is_init_command("/init"));
         assert!(prompt.contains("doc/ai-context/README.md"));
-        assert!(prompt.contains("Write only documentation files under `doc/ai-context/`"));
+        assert!(
+            prompt.contains("By default, write only documentation files under `doc/ai-context/`")
+        );
         assert!(prompt.contains("current code wins over this doc"));
+        assert!(prompt.contains("doc/ai-context/unreal.md"));
+        assert!(prompt.contains(CODEFORGE_PROJECT_INSTRUCTION_FILE));
+        assert!(prompt.contains(UNREAL_PROJECT_SKILL_FILE));
+        assert!(prompt.contains("EngineAssociation"));
+        assert!(prompt.contains("ModelContextProtocol"));
+        assert!(prompt.contains("Blueprint assets are binary"));
         assert!(prompt.contains("Do not use shell commands"));
+    }
+
+    #[test]
+    fn developer_prompt_includes_unreal_workspace_guidance() {
+        let root = test_workspace();
+        fs::create_dir_all(root.join("Content")).unwrap();
+        fs::create_dir_all(root.join("Plugins").join("ExamplePlugin").join("Source")).unwrap();
+        fs::write(
+            root.join("CropoutSampleProject.uproject"),
+            r#"{
+  "FileVersion": 3,
+  "EngineAssociation": "5.8",
+  "Plugins": [
+    { "Name": "ModelContextProtocol", "Enabled": true }
+  ]
+}"#,
+        )
+        .unwrap();
+        let project = test_project_with_root(root.to_str().unwrap());
+        let prompt = developer_prompt(&project, false);
+
+        assert!(prompt.contains("Unreal Engine workspace detected"));
+        assert!(prompt.contains("CropoutSampleProject.uproject"));
+        assert!(prompt.contains("EngineAssociation: `5.8`"));
+        assert!(prompt.contains("plugin C++ source exists"));
+        assert!(prompt.contains("Blueprint graph logic"));
+        assert!(prompt.contains("`ModelContextProtocol` is enabled"));
+        assert!(prompt.contains("MCP transport/port answers"));
     }
 
     #[test]

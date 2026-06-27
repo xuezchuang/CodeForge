@@ -311,7 +311,7 @@ function baseStep(
     index: event.stepIndex,
     title,
     shortSummary: event.outputSummary ? sanitizeModelMessage(event.outputSummary) : '',
-    status: event.status,
+    status: effectiveTraceStatus(event),
     eventType: event.type,
     toolName: event.toolName,
     startedAt: event.startedAt,
@@ -397,10 +397,23 @@ function toolStatusSummary(
   if (event.status === 'failed' || output.ok === false || output.error) {
     return 'failed'
   }
-  if (event.status === 'warning') {
+  if (event.status === 'warning' || traceOutputRecovered(event.output)) {
     return 'warning'
   }
   return 'success'
+}
+
+function effectiveTraceStatus(event: ToolTraceEvent): TraceStatus {
+  if (event.status === 'success' && traceOutputRecovered(event.output)) {
+    return 'warning'
+  }
+  return event.status
+}
+
+function traceOutputRecovered(value: unknown): boolean {
+  const output = asRecord(value)
+  const payload = asRecord(output.output)
+  return output.recovered === true || payload.recovered === true
 }
 
 function extractMessage(value: unknown): string | null {

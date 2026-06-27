@@ -6,6 +6,7 @@ pub mod codex_cli_runner;
 pub mod commands;
 pub mod desktop_http_server;
 pub mod history_store;
+pub mod mcp_runtime;
 pub mod path_utils;
 pub mod process_manager;
 pub mod project_registry;

@@ -4,6 +4,7 @@ use codeforge_core::office_tools;
 use serde_json::{json, Value};
 
 use crate::goal_state::GoalState;
+use crate::mcp_runtime::McpRuntime;
 use crate::tool_interface::ToolOutput;
 use crate::vs_bridge_client;
 use crate::workspace_tools;
@@ -50,6 +51,7 @@ pub struct ToolExecutionContext<'a> {
     pub assume_yes: bool,
     pub cli_mode: bool,
     pub goal: Option<&'a mut Option<GoalState>>,
+    pub mcp_runtime: Option<&'a McpRuntime>,
 }
 
 fn workspace_namespace_aliases() -> Vec<Value> {
@@ -214,6 +216,12 @@ pub async fn execute_tool_result(
     name: &str,
     arguments: &Value,
 ) -> ToolOutput {
+    if let Some(runtime) = context.mcp_runtime {
+        if runtime.is_mcp_tool(name) {
+            return runtime.call_tool(name, arguments).await;
+        }
+    }
+
     let started = Instant::now();
     match execute_tool_inner(context, name, arguments).await {
         Ok(output) => ToolOutput::ok(output, started.elapsed().as_millis() as u64),
@@ -1194,6 +1202,7 @@ mod tests {
             assume_yes: false,
             cli_mode: false,
             goal: None,
+            mcp_runtime: None,
         }
     }
 
@@ -1421,6 +1430,7 @@ mod cli_runtime_tests {
             assume_yes: true,
             cli_mode: true,
             goal: None,
+            mcp_runtime: None,
         }
     }
 
@@ -1534,6 +1544,7 @@ mod cli_runtime_tests {
             assume_yes: true,
             cli_mode: true,
             goal: None,
+            mcp_runtime: None,
         };
 
         let result = tauri::async_runtime::block_on(execute_tool_result(
@@ -1567,6 +1578,7 @@ mod cli_runtime_tests {
             assume_yes: true,
             cli_mode: true,
             goal: None,
+            mcp_runtime: None,
         };
 
         let result = tauri::async_runtime::block_on(execute_tool_result(

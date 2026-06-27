@@ -26,6 +26,36 @@ export interface ToolDefinitionSummary {
   description: string
 }
 
+export interface McpToolDefinitionSummary {
+  serverName: string
+  name: string
+  rawName: string
+  description: string
+}
+
+export interface McpServerSummary {
+  name: string
+  status: string
+  enabled: boolean
+  required: boolean
+  toolCount: number
+  error: string | null
+}
+
+export interface McpInventorySummary {
+  configPath: string | null
+  servers: McpServerSummary[]
+  tools: McpToolDefinitionSummary[]
+}
+
+export interface ToolOutput {
+  status: string
+  output?: unknown
+  error?: string
+  elapsedMs: number
+  summary?: string
+}
+
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: unknown
@@ -90,6 +120,26 @@ export function listVsInstances(): Promise<VSInstance[]> {
 
 export function listTools(): Promise<ToolDefinitionSummary[]> {
   return call<ToolDefinitionSummary[]>('list_tools')
+}
+
+export function listMcpTools(): Promise<McpToolDefinitionSummary[]> {
+  return call<McpToolDefinitionSummary[]>('list_mcp_tools')
+}
+
+export function inspectMcpInventory(): Promise<McpInventorySummary> {
+  return call<McpInventorySummary>('inspect_mcp_inventory')
+}
+
+export function callMcpTool(
+  toolName: string,
+  args: Record<string, unknown>,
+): Promise<ToolOutput> {
+  return call<ToolOutput>('call_mcp_tool', {
+    input: {
+      toolName,
+      arguments: args,
+    },
+  })
 }
 
 export function loadWorkspaceHistory(): Promise<WorkspaceHistoryState> {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Bot,
   Check,
@@ -80,8 +80,12 @@ function ConversationChatMessage({
     !isUser && message.status === 'running' && !hasTerminalTraceEvent(message.traceEvents ?? [])
   const hideAssistantActions = !isUser && message.status === 'running'
   const thinkingNowMs = useThinkingClock(isRunningAssistant)
+  const bufferedDisplayContent = useBufferedRunningAssistantText(
+    displayContent,
+    isRunningAssistant,
+  )
   const animateThinkingPrefix =
-    isRunningAssistant && displayContent.startsWith(THINKING_PREFIX)
+    isRunningAssistant && bufferedDisplayContent.startsWith(THINKING_PREFIX)
   const [copiedTarget, setCopiedTarget] = useState<'user' | 'assistant' | null>(null)
   const [activeToolTrace, setActiveToolTrace] = useState<ToolTraceEvent | null>(null)
   const [editDraft, setEditDraft] = useState(message.content)
@@ -208,16 +212,27 @@ function ConversationChatMessage({
               </button>
             </div>
           </div>
-        ) : !animateThinkingPrefix && (displayContent.trim().length > 0 || !message.attachments?.length) ? (
-          <div className="message-content">
-            <MarkdownMessage
-              text={displayContent}
-              projectId={projectId}
-              taskId={message.taskId}
-              onCodeLinkResult={onCodeLinkResult}
-              onCodeLinkError={onCodeLinkError}
-              onTraceChanged={() => onTraceChanged(message.taskId)}
-            />
+        ) : !animateThinkingPrefix && (bufferedDisplayContent.trim().length > 0 || !message.attachments?.length) ? (
+          <div className={isRunningAssistant ? 'message-content running-message-content' : 'message-content'}>
+            {isRunningAssistant ? (
+              <RunningStreamContent
+                text={bufferedDisplayContent}
+                projectId={projectId}
+                taskId={message.taskId}
+                onCodeLinkResult={onCodeLinkResult}
+                onCodeLinkError={onCodeLinkError}
+                onTraceChanged={() => onTraceChanged(message.taskId)}
+              />
+            ) : (
+              <MarkdownMessage
+                text={displayContent}
+                projectId={projectId}
+                taskId={message.taskId}
+                onCodeLinkResult={onCodeLinkResult}
+                onCodeLinkError={onCodeLinkError}
+                onTraceChanged={() => onTraceChanged(message.taskId)}
+              />
+            )}
           </div>
         ) : null}
         {isUser ? (
@@ -275,7 +290,7 @@ function ConversationChatMessage({
         {animateThinkingPrefix ? (
           <div className="message-content running-message-content">
             <RunningAssistantContent
-              text={displayContent}
+              text={bufferedDisplayContent}
               thinkingSummary={thinkingSummary}
               projectId={projectId}
               taskId={message.taskId}
@@ -479,6 +494,9 @@ interface MarkdownTableData {
 const THINKING_PREFIX = 'Thinking...\n\n'
 const THINKING_RUNNING_TEXT = 'Thinking...'
 const CONTEXT_COMPACTION_MESSAGE_PREFIX = '[CodeForge context compacted]'
+const RUNNING_STREAM_BUFFER_TICK_MS = 120
+const RUNNING_STREAM_BUFFER_MIN_CHARS_PER_TICK = 36
+const RUNNING_STREAM_BUFFER_MAX_CHARS_PER_TICK = 84
 
 function isContextCompactionMessage(message: ChatMessageModel): boolean {
   return message.role === 'system' &&
@@ -506,6 +524,99 @@ function useThinkingClock(enabled: boolean): number {
   return nowMs
 }
 
+function useBufferedRunningAssistantText(text: string, enabled: boolean): string {
+  const targetRef = useRef(text)
+  const [visibleText, setVisibleText] = useState(() =>
+    enabled ? initialBufferedRunningText(text) : text,
+  )
+
+  useEffect(() => {
+    targetRef.current = text
+    if (!enabled) {
+      return undefined
+    }
+    const timerId = window.setTimeout(() => {
+      setVisibleText((current) => reconcileBufferedRunningText(current, text))
+    }, 0)
+    return () => {
+      window.clearTimeout(timerId)
+    }
+  }, [enabled, text])
+
+  useEffect(() => {
+    if (!enabled) {
+      return undefined
+    }
+
+    const timerId = window.setInterval(() => {
+      setVisibleText((current) => advanceBufferedRunningText(current, targetRef.current))
+    }, RUNNING_STREAM_BUFFER_TICK_MS)
+
+    return () => {
+      window.clearInterval(timerId)
+    }
+  }, [enabled])
+
+  return enabled ? visibleText : text
+}
+
+function initialBufferedRunningText(text: string): string {
+  if (!text) {
+    return ''
+  }
+  if (text.startsWith(THINKING_PREFIX)) {
+    return text.slice(0, nextBufferedRunningEndIndex(text, THINKING_PREFIX.length))
+  }
+  return text.slice(0, nextBufferedRunningEndIndex(text, 0))
+}
+
+function reconcileBufferedRunningText(current: string, target: string): string {
+  if (!target) {
+    return ''
+  }
+  if (current === target || target.startsWith(current)) {
+    return current
+  }
+  if (current.startsWith(THINKING_PREFIX) && target.startsWith(THINKING_PREFIX)) {
+    return initialBufferedRunningText(target)
+  }
+  return initialBufferedRunningText(target)
+}
+
+function advanceBufferedRunningText(current: string, target: string): string {
+  const base = reconcileBufferedRunningText(current, target)
+  if (base !== current || base === target) {
+    return base
+  }
+  return target.slice(0, nextBufferedRunningEndIndex(target, base.length))
+}
+
+function nextBufferedRunningEndIndex(text: string, startIndex: number): number {
+  if (startIndex >= text.length) {
+    return text.length
+  }
+  if (text.startsWith(THINKING_PREFIX) && startIndex < THINKING_PREFIX.length) {
+    return THINKING_PREFIX.length
+  }
+  const minEndIndex = Math.min(text.length, startIndex + RUNNING_STREAM_BUFFER_MIN_CHARS_PER_TICK)
+  const maxEndIndex = Math.min(text.length, startIndex + RUNNING_STREAM_BUFFER_MAX_CHARS_PER_TICK)
+  const newlineIndex = text.indexOf('\n', startIndex)
+  if (newlineIndex !== -1 && newlineIndex + 1 <= maxEndIndex) {
+    return newlineIndex + 1
+  }
+  for (let index = maxEndIndex - 1; index >= minEndIndex; index -= 1) {
+    if (/[.!?。！？;；,，:：]/.test(text[index])) {
+      return index + 1
+    }
+  }
+  for (let index = maxEndIndex - 1; index >= minEndIndex; index -= 1) {
+    if (/\s/.test(text[index])) {
+      return index + 1
+    }
+  }
+  return maxEndIndex
+}
+
 function RunningAssistantContent({
   text,
   thinkingSummary,
@@ -517,17 +628,21 @@ function RunningAssistantContent({
   onToolTraceOpen,
 }: RunningAssistantContentProps) {
   const detail = text.startsWith(THINKING_PREFIX) ? text.slice(THINKING_PREFIX.length) : text
+  const hasDetail = detail.trim().length > 0
+  const panelSummary =
+    hasDetail ? thinkingSummaryWithoutModelText(thinkingSummary) : thinkingSummary
 
   return (
     <>
-      {thinkingSummary && thinkingSummary.items.length > 0 ? (
+      {panelSummary && panelSummary.items.length > 0 ? (
         <ThinkingPanel
-          summary={thinkingSummary}
+          summary={panelSummary}
           defaultOpen
           onToolTraceOpen={onToolTraceOpen}
         />
-      ) : detail.trim().length > 0 ? (
-        <MarkdownMessage
+      ) : null}
+      {hasDetail ? (
+        <RunningStreamContent
           text={detail}
           projectId={projectId}
           taskId={taskId}
@@ -536,20 +651,120 @@ function RunningAssistantContent({
           onTraceChanged={onTraceChanged}
         />
       ) : null}
-      <p className="markdown-paragraph running-thinking-line" aria-label={THINKING_RUNNING_TEXT}>
-        {THINKING_RUNNING_TEXT.split('').map((character, index) => (
-          <span
-            key={`${character}-${index}`}
-            className="thinking-character"
-            style={{ animationDelay: `${index * 0.075}s` }}
-            aria-hidden="true"
-          >
-            {character}
-          </span>
-        ))}
-      </p>
+      {!hasDetail ? (
+        <p className="markdown-paragraph running-thinking-line" aria-label={THINKING_RUNNING_TEXT}>
+          {THINKING_RUNNING_TEXT.split('').map((character, index) => (
+            <span
+              key={`${character}-${index}`}
+              className="thinking-character"
+              style={{ animationDelay: `${index * 0.075}s` }}
+              aria-hidden="true"
+            >
+              {character}
+            </span>
+          ))}
+        </p>
+      ) : null}
     </>
   )
+}
+
+function thinkingSummaryWithoutModelText(summary: ThinkingSummary | null): ThinkingSummary | null {
+  if (!summary) {
+    return null
+  }
+  const items = summary.items.filter((item) => item.kind !== 'model')
+  return {
+    ...summary,
+    items,
+    omitted: summary.omitted,
+  }
+}
+
+function RunningStreamContent({
+  text,
+  projectId,
+  taskId,
+  onCodeLinkResult,
+  onCodeLinkError,
+  onTraceChanged,
+}: MarkdownMessageProps) {
+  const { settledText, currentLine } = splitRunningStreamText(text)
+  return (
+    <>
+      {settledText.trim().length > 0 ? (
+        <MarkdownMessage
+          text={settledText}
+          projectId={projectId}
+          taskId={taskId}
+          onCodeLinkResult={onCodeLinkResult}
+          onCodeLinkError={onCodeLinkError}
+          onTraceChanged={onTraceChanged}
+        />
+      ) : null}
+      <RunningStreamLine
+        text={currentLine}
+        projectId={projectId}
+        taskId={taskId}
+        onCodeLinkResult={onCodeLinkResult}
+        onCodeLinkError={onCodeLinkError}
+        onTraceChanged={onTraceChanged}
+      />
+    </>
+  )
+}
+
+function RunningStreamLine({
+  text,
+  projectId,
+  taskId,
+  onCodeLinkResult,
+  onCodeLinkError,
+  onTraceChanged,
+}: MarkdownMessageProps) {
+  const line = text.trimStart()
+  if (!line) {
+    return null
+  }
+  const codeLinkContext = extractCodeLinksFromText(line)
+  return (
+    <p className="markdown-paragraph running-stream-line">
+      {renderInlineMarkdown(
+        line,
+        'running-stream-line',
+        projectId,
+        taskId,
+        codeLinkContext,
+        onCodeLinkResult,
+        onCodeLinkError,
+        onTraceChanged,
+      )}
+    </p>
+  )
+}
+
+function splitRunningStreamText(text: string): { settledText: string; currentLine: string } {
+  const normalized = text.replace(/\r\n/g, '\n')
+  if (!normalized.trim()) {
+    return { settledText: '', currentLine: '' }
+  }
+  if (normalized.endsWith('\n')) {
+    return { settledText: normalized, currentLine: '' }
+  }
+  const lineStart = normalized.lastIndexOf('\n') + 1
+  const line = normalized.slice(lineStart)
+  let startIndex = 0
+  while (startIndex < line.length) {
+    const nextIndex = nextBufferedRunningEndIndex(line, startIndex)
+    if (nextIndex >= line.length) {
+      break
+    }
+    startIndex = nextIndex
+  }
+  return {
+    settledText: normalized.slice(0, lineStart + startIndex),
+    currentLine: line.slice(startIndex).trimStart(),
+  }
 }
 
 function MarkdownMessage({
@@ -588,6 +803,7 @@ function renderMarkdownBlocks(
   let paragraph: string[] = []
   let listItems: string[] = []
   let orderedItems: string[] = []
+  let orderedStart = 1
   let codeLines: string[] | null = null
   let codeLanguage = ''
 
@@ -629,13 +845,18 @@ function renderMarkdownBlocks(
     }
     if (orderedItems.length > 0) {
       blocks.push(
-        <ol key={`ol-${blocks.length}`} className="markdown-list">
+        <ol
+          key={`ol-${blocks.length}`}
+          className="markdown-list"
+          start={orderedStart === 1 ? undefined : orderedStart}
+        >
           {orderedItems.map((item, index) => (
             <li key={`${index}-${item}`}>{renderInline(item, `ol-${blocks.length}-${index}`)}</li>
           ))}
         </ol>,
       )
       orderedItems = []
+      orderedStart = 1
     }
   }
 
@@ -722,19 +943,27 @@ function renderMarkdownBlocks(
     const unorderedMatch = line.match(/^\s*[-*]\s+(.+)$/)
     if (unorderedMatch) {
       flushParagraph()
-      orderedItems = []
+      if (orderedItems.length > 0) {
+        flushList()
+      }
       listItems.push(unorderedMatch[1])
       continue
     }
 
-    const orderedMatch = line.match(/^\s*\d+[.)]\s+(.+)$/)
+    const orderedMatch = line.match(/^\s*(\d+)[.)]\s+(.+)$/)
     if (orderedMatch) {
       flushParagraph()
-      listItems = []
-      orderedItems.push(orderedMatch[1])
+      if (listItems.length > 0) {
+        flushList()
+      }
+      if (orderedItems.length === 0) {
+        orderedStart = Number.parseInt(orderedMatch[1], 10)
+      }
+      orderedItems.push(orderedMatch[2])
       continue
     }
 
+    flushList()
     paragraph.push(line.trim())
   }
 

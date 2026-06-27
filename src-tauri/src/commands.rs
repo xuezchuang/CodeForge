@@ -4,8 +4,10 @@ use crate::agent_runner::{self, AgentRunInput};
 use crate::app_state::{current_settings, lock_error, AppState};
 use crate::code_link::{self, OpenCodeLinkResult, OpenFilePayload};
 use crate::history_store::{AgentTaskRecord, WorkspaceHistoryState};
+use crate::mcp_runtime::{McpInventorySummary, McpRuntime, McpToolSummary};
 use crate::process_manager;
 use crate::project_registry::{ProjectInput, ProjectSession};
+use crate::tool_interface::ToolOutput;
 use crate::tool_registry;
 use crate::tool_trace::{self, MockAgentRun, ToolTraceEvent, TraceEventType, TraceStatus};
 use crate::vs_bridge_service;
@@ -29,6 +31,13 @@ pub struct OpenVisualStudioResult {
 pub struct ToolDefinitionSummary {
     pub name: String,
     pub description: String,
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolCallInput {
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
 }
 
 #[tauri::command]
@@ -139,6 +148,29 @@ pub fn list_tools() -> Result<Vec<ToolDefinitionSummary>, String> {
             Some(ToolDefinitionSummary { name, description })
         })
         .collect())
+}
+
+#[tauri::command]
+pub async fn list_mcp_tools() -> Result<Vec<McpToolSummary>, String> {
+    Ok(McpRuntime::load_from_default_config()
+        .await?
+        .map(|runtime| runtime.tool_summaries())
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn inspect_mcp_inventory() -> Result<McpInventorySummary, String> {
+    McpRuntime::inspect_default_config().await
+}
+
+#[tauri::command]
+pub async fn call_mcp_tool(input: McpToolCallInput) -> Result<ToolOutput, String> {
+    let runtime = McpRuntime::load_from_default_config()
+        .await?
+        .ok_or_else(|| {
+            "No MCP tools are available. Run /mcp to inspect configured servers.".to_string()
+        })?;
+    Ok(runtime.call_tool(&input.tool_name, &input.arguments).await)
 }
 
 #[tauri::command]

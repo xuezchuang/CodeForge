@@ -1806,6 +1806,17 @@ button:focus-visible {
   letter-spacing: 0;
 }
 
+.running-stream-line {
+  display: block;
+  max-width: 100%;
+  margin-bottom: 0;
+  overflow: hidden;
+  overflow-wrap: normal;
+  white-space: nowrap;
+  -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 86px), transparent 100%);
+  mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 86px), transparent 100%);
+}
+
 .thinking-character {
   color: #98a2b3;
   opacity: 0.58;

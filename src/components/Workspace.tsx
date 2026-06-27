@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
+  callMcpTool,
   deleteWorkspaceSessions,
+  inspectMcpInventory,
   listTools,
   listTraces,
   loadWorkspaceSession,
@@ -10,7 +12,9 @@ import {
   runAgent,
   saveWorkspaceSession,
   updateSettings,
+  type McpInventorySummary,
   type ToolDefinitionSummary,
+  type ToolOutput,
 } from '../api/tauriApi'
 import { normalizeAgentTask, normalizeSettings } from '../state/appState'
 import type { AppState } from '../state/appState'
@@ -438,6 +442,15 @@ function Workspace({
     }
     const runSelection = normalizeRunSelection(selection)
     lastRunSelectionRef.current = runSelection
+    const mcpToolCall = parseMcpToolCallCommand(prompt)
+    if (mcpToolCall.kind === 'call') {
+      await showMcpToolCallCommand(activeProject.id, prompt, mcpToolCall)
+      return
+    }
+    if (mcpToolCall.kind === 'error') {
+      await showSlashErrorCommand(activeProject.id, prompt, mcpToolCall.message)
+      return
+    }
     if (isListToolsCommand(prompt)) {
       await showToolsCommand(activeProject.id, prompt)
       return
@@ -698,17 +711,89 @@ function Workspace({
     }
   }
 
+  const showMcpToolCallCommand = async (
+    projectId: string,
+    prompt: string,
+    toolCall: ParsedMcpToolCallCommand & { kind: 'call' },
+  ) => {
+    const sessionTaskId = currentTask?.id ?? crypto.randomUUID()
+    const userMessage = createMessage(sessionTaskId, 'user', prompt)
+
+    setBusy(true)
+    try {
+      const output = await callMcpTool(toolCall.toolName, toolCall.arguments)
+      const assistantMessage = createMessage(
+        sessionTaskId,
+        'assistant',
+        formatMcpToolCallMessage(toolCall.toolName, output),
+      )
+      setSelectedTrace(null)
+      setState((current) => ({
+        ...appendMessagesToSession(
+          current,
+          projectId,
+          sessionTaskId,
+          [userMessage, assistantMessage],
+          output.status === 'ok' ? 'completed' : 'failed',
+        ),
+        traceDrawerOpen: false,
+      }))
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught)
+      const errorMessage = createMessage(sessionTaskId, 'system', message)
+      setState((current) =>
+        appendMessagesToSession(
+          current,
+          projectId,
+          sessionTaskId,
+          [userMessage, errorMessage],
+          'failed',
+        ),
+      )
+      showWorkspaceToast('error', message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const showSlashErrorCommand = async (
+    projectId: string,
+    prompt: string,
+    message: string,
+  ) => {
+    const sessionTaskId = currentTask?.id ?? crypto.randomUUID()
+    const userMessage = createMessage(sessionTaskId, 'user', prompt)
+    const errorMessage = createMessage(sessionTaskId, 'system', message)
+    setState((current) =>
+      appendMessagesToSession(
+        current,
+        projectId,
+        sessionTaskId,
+        [userMessage, errorMessage],
+        'failed',
+      ),
+    )
+  }
+
   const showToolsCommand = async (projectId: string, prompt: string) => {
     const sessionTaskId = currentTask?.id ?? crypto.randomUUID()
     const userMessage = createMessage(sessionTaskId, 'user', prompt)
 
     setBusy(true)
     try {
-      const tools = await listTools()
+      const [tools, mcpResult] = await Promise.all([
+        listTools(),
+        inspectMcpInventory()
+          .then((inventory) => ({ inventory, error: null }))
+          .catch((caught) => ({
+            inventory: null as McpInventorySummary | null,
+            error: caught instanceof Error ? caught.message : String(caught),
+          })),
+      ])
       const assistantMessage = createMessage(
         sessionTaskId,
         'assistant',
-        formatToolsListMessage(tools),
+        formatToolsListMessage(tools, mcpResult.inventory, mcpResult.error),
       )
       setSelectedTrace(null)
       setState((current) => ({
@@ -1726,12 +1811,49 @@ function createRunningAssistantContent(
   traces: ToolTraceEvent[],
   _attachmentCount = 0,
 ): string {
+  const streamingContent = latestStreamingModelContent(traces)
+  if (streamingContent) {
+    return streamingContent
+  }
+
   const latestTrace = latestDescribableTrace(traces)
   if (!latestTrace) {
     return 'Thinking...\n\n'
   }
   const detail = describeRunningTrace(latestTrace)
   return detail ? `Thinking...\n\n${detail}` : 'Thinking...\n\n'
+}
+
+function latestStreamingModelContent(traces: ToolTraceEvent[]): string {
+  for (let index = traces.length - 1; index >= 0; index -= 1) {
+    const event = traces[index]
+    if (event.type !== 'model_message' || event.title !== 'streaming_model_message') {
+      continue
+    }
+    const output = plainRecord(event.output)
+    const content = typeof output.content === 'string' ? sanitizeModelMessage(output.content) : ''
+    if (content) {
+      return content
+    }
+    const reasoning = streamingReasoningContent(output)
+    if (reasoning) {
+      return `Thinking...\n\n${reasoning}`
+    }
+  }
+  return ''
+}
+
+function streamingReasoningContent(output: Record<string, unknown>): string {
+  for (const key of ['reasoning_content', 'reasoningContent', 'reasoning']) {
+    const value = output[key]
+    if (typeof value === 'string') {
+      const reasoning = sanitizeModelMessage(value)
+      if (reasoning) {
+        return reasoning
+      }
+    }
+  }
+  return ''
 }
 
 function latestDescribableTrace(traces: ToolTraceEvent[]): ToolTraceEvent | undefined {
@@ -2139,9 +2261,70 @@ function replaceMessageById(
   return replaced ? nextMessages : [...messages, replacement]
 }
 
+type ParsedMcpToolCallCommand =
+  | {
+      kind: 'call'
+      toolName: string
+      arguments: Record<string, unknown>
+    }
+  | {
+      kind: 'error'
+      message: string
+    }
+  | {
+      kind: 'none'
+    }
+
+function parseMcpToolCallCommand(prompt: string): ParsedMcpToolCallCommand {
+  const trimmed = prompt.trim()
+  const match = trimmed.match(/^\/mcp\s+call(?:\s+|$)/i)
+  if (!match) {
+    return { kind: 'none' }
+  }
+  const rest = trimmed.slice(match[0].length).trim()
+  if (!rest) {
+    return {
+      kind: 'error',
+      message: 'Usage: /mcp call <tool_name> {"arg": "value"}',
+    }
+  }
+  const firstSpace = rest.search(/\s/)
+  const toolName = firstSpace === -1 ? rest : rest.slice(0, firstSpace)
+  const jsonText = firstSpace === -1 ? '{}' : rest.slice(firstSpace).trim()
+  if (!toolName) {
+    return {
+      kind: 'error',
+      message: 'Usage: /mcp call <tool_name> {"arg": "value"}',
+    }
+  }
+  let parsed: unknown
+  try {
+    parsed = jsonText ? JSON.parse(jsonText) : {}
+  } catch (caught) {
+    return {
+      kind: 'error',
+      message:
+        caught instanceof Error ?
+          `Invalid JSON arguments: ${caught.message}`
+        : 'Invalid JSON arguments.',
+    }
+  }
+  if (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object') {
+    return {
+      kind: 'error',
+      message: 'MCP tool arguments must be a JSON object.',
+    }
+  }
+  return {
+    kind: 'call',
+    toolName,
+    arguments: parsed as Record<string, unknown>,
+  }
+}
+
 function isListToolsCommand(prompt: string): boolean {
   const command = prompt.trim().toLowerCase()
-  return command === '/skill' || command === '/skills'
+  return command === '/skill' || command === '/skills' || command === '/mcp'
 }
 
 function isStatusCommand(prompt: string): boolean {
@@ -2174,15 +2357,66 @@ function formatStatusCommandMessage(usage: {
   ].join('\n')
 }
 
-function formatToolsListMessage(tools: ToolDefinitionSummary[]): string {
-  if (tools.length === 0) {
+function formatToolsListMessage(
+  tools: ToolDefinitionSummary[],
+  mcpInventory: McpInventorySummary | null,
+  mcpError: string | null,
+): string {
+  const mcpTools = mcpInventory?.tools ?? []
+  const mcpServers = mcpInventory?.servers ?? []
+  if (tools.length === 0 && mcpTools.length === 0 && mcpServers.length === 0 && !mcpError) {
     return 'No tools are currently registered.'
   }
-  const lines = tools.map((tool) => {
+  const builtinLines = tools.map((tool) => {
     const description = tool.description.trim()
     return description ? `- \`${tool.name}\` - ${description}` : `- \`${tool.name}\``
   })
-  return [`Registered tools (${tools.length}):`, '', ...lines].join('\n')
+  const mcpLines = mcpTools.map((tool) => {
+    const description = tool.description.trim()
+    const suffix = description ? ` - ${description}` : ''
+    return `- \`${tool.name}\` (${tool.serverName}/${tool.rawName})${suffix}`
+  })
+  const mcpServerLines = mcpServers.map((server) => {
+    const required = server.required ? ', required' : ''
+    const error = server.error ? ` - ${server.error}` : ''
+    return `- \`${server.name}\` - ${server.status}, ${server.toolCount} tool(s)${required}${error}`
+  })
+  const sections = [
+    `Built-in tools (${tools.length}):`,
+    '',
+    ...(builtinLines.length ? builtinLines : ['- None']),
+    '',
+    `MCP servers (${mcpServers.length}):`,
+    '',
+    ...(mcpServerLines.length ? mcpServerLines : ['- No MCP servers configured']),
+    '',
+    `MCP tools (${mcpTools.length}):`,
+    '',
+    ...(mcpLines.length ? mcpLines : ['- None configured or no MCP tools available']),
+  ]
+  if (mcpInventory?.configPath) {
+    sections.push('', `MCP config: \`${mcpInventory.configPath}\``)
+  }
+  if (mcpError) {
+    sections.push('', `MCP inventory error: ${mcpError}`)
+  }
+  return sections.join('\n')
+}
+
+function formatMcpToolCallMessage(toolName: string, output: ToolOutput): string {
+  const lines = [
+    `MCP tool \`${toolName}\` finished with status \`${output.status}\` in ${output.elapsedMs} ms.`,
+  ]
+  if (output.summary) {
+    lines.push('', output.summary)
+  }
+  if (output.error) {
+    lines.push('', `Error: ${output.error}`)
+  }
+  if (output.output !== undefined && output.output !== null) {
+    lines.push('', 'Output:', '', '```json', JSON.stringify(output.output, null, 2), '```')
+  }
+  return lines.join('\n')
 }
 
 function hasFailedTrace(traces: ToolTraceEvent[]): boolean {

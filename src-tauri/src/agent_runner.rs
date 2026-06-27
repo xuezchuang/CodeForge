@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::agent::stream::StreamingChatCompletionAccumulator;
 use crate::codex_cli_runner::{self, CODEX_CLI_PROVIDER_TYPE, CODEX_CLI_TOOL_NAME};
 use crate::goal_state::GoalState;
+use crate::mcp_runtime::McpRuntime;
 use crate::project_registry::ProjectSession;
 use crate::subagent_manager::SubagentManager;
 use crate::tool_interface::ToolOutput;
@@ -31,6 +32,7 @@ pub const TOOL_CALL_TEST_PROMPT: &str = "请必须调用 calculator.add 工具�
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 32;
 const EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT: usize = 1;
 const MODEL_REQUEST_TIMEOUT_SECONDS: u64 = 360;
+const MCP_AGENT_STARTUP_BUDGET: Duration = Duration::from_secs(2);
 const STREAMING_TRACE_INTERVAL_MS: u64 = 750;
 const MODEL_RATE_LIMIT_RETRY_DELAYS_MS: [u64; 3] = [3_000, 10_000, 30_000];
 const PPTX_IMAGE_ANALYSIS_BATCH_SIZE: usize = 16;
@@ -702,6 +704,80 @@ pub async fn run_agent(
     }
 
     if supports_openai_tool_calls(&selected) {
+        let mcp_runtime = match tokio::time::timeout(
+            MCP_AGENT_STARTUP_BUDGET,
+            McpRuntime::load_from_default_config(),
+        )
+        .await
+        {
+            Ok(Ok(runtime)) => runtime,
+            Ok(Err(error)) => {
+                push_trace(
+                    &mut traces,
+                    trace(
+                        &task_id,
+                        step_index,
+                        TraceEventType::SystemEvent,
+                        None,
+                        "mcp_startup skipped",
+                        None,
+                        Some(json!({ "error": error })),
+                        Some("MCP startup failed; continuing without MCP tools".to_string()),
+                        TraceStatus::Warning,
+                        0,
+                    ),
+                    &mut on_trace,
+                );
+                step_index += 1;
+                None
+            }
+            Err(_) => {
+                push_trace(
+                    &mut traces,
+                    trace(
+                        &task_id,
+                        step_index,
+                        TraceEventType::SystemEvent,
+                        None,
+                        "mcp_startup skipped",
+                        None,
+                        Some(json!({ "timeoutMs": MCP_AGENT_STARTUP_BUDGET.as_millis() })),
+                        Some("MCP startup timed out; continuing without MCP tools".to_string()),
+                        TraceStatus::Warning,
+                        0,
+                    ),
+                    &mut on_trace,
+                );
+                step_index += 1;
+                None
+            }
+        };
+        if let Some(runtime) = mcp_runtime.as_ref() {
+            push_trace(
+                &mut traces,
+                trace(
+                    &task_id,
+                    step_index,
+                    TraceEventType::SystemEvent,
+                    None,
+                    "mcp_startup",
+                    None,
+                    Some(json!({
+                        "servers": runtime.server_names(),
+                        "toolCount": runtime.tool_count(),
+                    })),
+                    Some(format!(
+                        "MCP ready: {} tool(s) from {} server(s)",
+                        runtime.tool_count(),
+                        runtime.server_names().len()
+                    )),
+                    TraceStatus::Success,
+                    0,
+                ),
+                &mut on_trace,
+            );
+            step_index += 1;
+        }
         let require_read_tool_call =
             should_require_local_read_tool_call(&conversation_messages, &input.user_prompt);
         let mut initial_messages = build_openai_messages_for_mode(
@@ -725,6 +801,7 @@ pub async fn run_agent(
             assume_yes: input.assume_yes,
             cli_mode: input.cli_mode,
             goal: input.goal_slot.as_deref_mut(),
+            mcp_runtime: mcp_runtime.as_ref(),
         };
         let tools = openai_tool_definitions(
             &selected,
@@ -880,6 +957,7 @@ pub async fn run_tool_call_test(
         assume_yes: false,
         cli_mode: false,
         goal: None,
+        mcp_runtime: None,
     };
     run_openai_tool_agent_loop(
         &task_id,
@@ -1782,6 +1860,7 @@ impl ParallelToolExecutionContext {
             assume_yes: self.assume_yes,
             cli_mode: self.cli_mode,
             goal: None,
+            mcp_runtime: None,
         };
         let result = tool_registry::execute_tool_result(&mut context, &tool_name, &arguments).await;
 
@@ -1827,7 +1906,7 @@ fn openai_tool_definitions(
     read_only: bool,
     include_agent_tools: bool,
 ) -> Vec<Value> {
-    if tool_context.cli_mode {
+    let mut tools = if tool_context.cli_mode {
         tool_registry::cli_tool_definitions(
             &selected.provider.provider_type,
             &selected.model_id,
@@ -1845,7 +1924,13 @@ fn openai_tool_definitions(
             tools.extend(tool_registry::agent_tool_definitions());
         }
         tools
+    };
+    if !read_only {
+        if let Some(runtime) = tool_context.mcp_runtime {
+            tools.extend(runtime.tool_definitions());
+        }
     }
+    tools
 }
 
 async fn append_pptx_image_followup(
@@ -3595,6 +3680,7 @@ async fn read_streaming_chat_completion(
     let stream_event_id = Uuid::new_v4().to_string();
     let stream_started_at = Utc::now().to_rfc3339();
     let mut last_emit: Option<Instant> = None;
+    let mut emitted_content_chars = 0usize;
     let mut emitted_reasoning_chars = 0usize;
 
     while let Some(chunk) = response
@@ -3614,13 +3700,14 @@ async fn read_streaming_chat_completion(
             accumulator.accept_line(&raw_line)?;
         }
 
-        maybe_emit_streaming_thinking(
+        maybe_emit_streaming_model_message(
             streaming_trace.as_deref_mut(),
             request_body,
             &accumulator,
             &stream_event_id,
             &stream_started_at,
             request_started,
+            &mut emitted_content_chars,
             &mut emitted_reasoning_chars,
             &mut last_emit,
             false,
@@ -3631,13 +3718,14 @@ async fn read_streaming_chat_completion(
         accumulator.accept_line(line_buffer.trim_end_matches('\r'))?;
     }
 
-    maybe_emit_streaming_thinking(
+    maybe_emit_streaming_model_message(
         streaming_trace.as_deref_mut(),
         request_body,
         &accumulator,
         &stream_event_id,
         &stream_started_at,
         request_started,
+        &mut emitted_content_chars,
         &mut emitted_reasoning_chars,
         &mut last_emit,
         true,
@@ -3648,13 +3736,14 @@ async fn read_streaming_chat_completion(
         .map_err(|error| format!("{error}; body={body}"))
 }
 
-fn maybe_emit_streaming_thinking(
+fn maybe_emit_streaming_model_message(
     sink: Option<&mut StreamingTraceSink<'_>>,
     request_body: &Value,
     accumulator: &StreamingChatCompletionAccumulator,
     event_id: &str,
     stream_started_at: &str,
     request_started: Instant,
+    emitted_content_chars: &mut usize,
     emitted_reasoning_chars: &mut usize,
     last_emit: &mut Option<Instant>,
     force: bool,
@@ -3662,13 +3751,17 @@ fn maybe_emit_streaming_thinking(
     let Some(sink) = sink else {
         return;
     };
+    let content = accumulator.content();
     let reasoning = accumulator.reasoning_content();
-    if reasoning.is_empty() {
+    if content.is_empty() && reasoning.is_empty() {
         return;
     }
 
+    let content_chars = content.chars().count();
     let reasoning_chars = reasoning.chars().count();
-    if reasoning_chars == *emitted_reasoning_chars && !(force && last_emit.is_some()) {
+    let has_new_text =
+        content_chars != *emitted_content_chars || reasoning_chars != *emitted_reasoning_chars;
+    if !has_new_text && !(force && last_emit.is_some()) {
         return;
     }
     if !force {
@@ -3680,7 +3773,6 @@ fn maybe_emit_streaming_thinking(
     }
 
     let duration_ms = request_started.elapsed().as_millis() as u64;
-    let content = accumulator.content();
     let event = ToolTraceEvent {
         id: event_id.to_string(),
         task_id: sink.task_id.to_string(),
@@ -3692,7 +3784,7 @@ fn maybe_emit_streaming_thinking(
         step_index: sink.step_index,
         event_type: TraceEventType::ModelMessage,
         tool_name: None,
-        title: "streaming_thinking".to_string(),
+        title: "streaming_model_message".to_string(),
         input: Some(json!({
             "model": request_body.get("model").cloned().unwrap_or(Value::Null),
             "stream": true,
@@ -3702,7 +3794,7 @@ fn maybe_emit_streaming_thinking(
             "content": content,
             "model": request_body.get("model").cloned().unwrap_or(Value::Null),
         })),
-        output_summary: Some(format!("Streaming reasoning ({reasoning_chars} chars)")),
+        output_summary: Some(format!("Streaming response ({content_chars} chars)")),
         started_at: stream_started_at.to_string(),
         ended_at: if force {
             Some(Utc::now().to_rfc3339())
@@ -3717,6 +3809,7 @@ fn maybe_emit_streaming_thinking(
         },
     };
     (sink.on_trace)(&event);
+    *emitted_content_chars = content_chars;
     *emitted_reasoning_chars = reasoning_chars;
     *last_emit = Some(Instant::now());
 }
@@ -5621,6 +5714,7 @@ mod tests {
             assume_yes: false,
             cli_mode: false,
             goal: None,
+            mcp_runtime: None,
         };
         let tools = openai_tool_definitions(&selected, &tool_context, true, true);
         let names = tool_definition_names(&tools);
@@ -6296,8 +6390,11 @@ mod tests {
         let requests = server_thread.join().unwrap();
 
         assert_eq!(requests.len(), 1);
-        assert_eq!(run.traces.len(), streamed_titles.len());
+        assert!(streamed_titles.len() >= run.traces.len());
         assert!(streamed_titles.iter().any(|title| title == "llm_request:1"));
+        assert!(streamed_titles
+            .iter()
+            .any(|title| title == "streaming_model_message"));
         assert!(streamed_titles
             .iter()
             .any(|title| title == "llm_response:1"));

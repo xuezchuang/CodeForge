@@ -1328,7 +1328,8 @@ function isLongInlineCode(codeText: string): boolean {
   return codeText.length > 72
 }
 
-type ProgressStepStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'skipped'
+type ProgressStepStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'cancelled'
+export type ProgressTaskStatus = 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface ProgressStepSnapshot {
   id: string
@@ -1376,10 +1377,15 @@ const PROGRESS_UPDATE_STEPS_TOOL = 'progress/update_steps'
 export function ProgressStepsPanel({
   snapshot,
   compact = false,
+  taskStatus,
+  elapsed,
 }: {
   snapshot: ProgressSnapshot
   compact?: boolean
+  taskStatus?: ProgressTaskStatus
+  elapsed?: string
 }) {
+  const [compactOpen, setCompactOpen] = useState(false)
   const currentStep = currentProgressStep(snapshot)
   const totalCount = Math.max(snapshot.totalCount, snapshot.steps.length)
   const currentStepNumber =
@@ -1389,31 +1395,55 @@ export function ProgressStepsPanel({
         totalCount,
         Math.max(1, currentStep ? currentStep.index + 1 : snapshot.completedCount),
       )
-  const pillStatus =
-    currentStep?.step.status ??
-    (snapshot.completedCount >= totalCount ? 'completed' : 'pending')
+  const compactStatus = taskStatus ?? inferProgressTaskStatus(snapshot)
+  const activeTitle =
+    currentStep?.step.title ??
+    (snapshot.summary || snapshot.title || 'Agent progress')
+  const hasSteps = snapshot.steps.length > 0
 
   if (compact) {
     return (
-      <section className="progress-steps-card compact floating" aria-label={snapshot.title}>
-        <div className="progress-steps-popover">
-          <ol className="progress-steps-list">
-            {snapshot.steps.map((step, index) => (
-              <li className={`progress-step ${step.status}`} key={step.id}>
-                <ProgressStepMarker status={step.status} index={index} />
-                <span className="progress-step-body">
-                  <strong>{step.title}</strong>
-                </span>
-              </li>
-            ))}
-          </ol>
-        </div>
-        <div className="progress-steps-pill" aria-label={`Step ${currentStepNumber} of ${totalCount}`}>
-          <ProgressStepMarker status={pillStatus} index={currentStepNumber - 1} />
-          <span>
-            Step {currentStepNumber} / {totalCount}
+      <section
+        className={compactOpen ? 'progress-steps-card compact floating open' : 'progress-steps-card compact floating'}
+        aria-label={snapshot.title}
+      >
+        {compactOpen && hasSteps ? (
+          <div className="progress-steps-popover" role="dialog" aria-label="Agent steps">
+            <ol className="progress-steps-list">
+              {snapshot.steps.map((step) => (
+                <li className={`progress-step ${step.status}`} key={step.id}>
+                  <ProgressStepMarker status={step.status} />
+                  <span className="progress-step-body">
+                    <strong>{step.title}</strong>
+                    {step.detail ? <small>{step.detail}</small> : null}
+                  </span>
+                </li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
+        <button
+          type="button"
+          className={`progress-task-bar ${compactStatus}`}
+          aria-expanded={compactOpen}
+          aria-label={`Agent progress: ${activeTitle}`}
+          onClick={() => {
+            if (hasSteps) {
+              setCompactOpen((open) => !open)
+            }
+          }}
+        >
+          <ProgressTaskIcon status={compactStatus} />
+          <span className="progress-task-copy">
+            <strong>{progressTaskStatusLabel(compactStatus)}</strong>
+            <span>{activeTitle}</span>
           </span>
-        </div>
+          <span className="progress-task-meta">
+            {totalCount > 0 ? `${currentStepNumber} / ${totalCount}` : null}
+            {elapsed ? <small>{elapsed}</small> : null}
+          </span>
+          <ChevronDown size={14} aria-hidden="true" />
+        </button>
       </section>
     )
   }
@@ -1462,7 +1492,7 @@ function currentProgressStep(
 
   for (let index = snapshot.steps.length - 1; index >= 0; index -= 1) {
     const step = snapshot.steps[index]
-    if (step.status === 'completed' || step.status === 'blocked') {
+    if (step.status === 'completed' || step.status === 'failed' || step.status === 'cancelled') {
       return { step, index }
     }
   }
@@ -1472,30 +1502,70 @@ function currentProgressStep(
 
 function ProgressStepMarker({
   status,
-  index,
 }: {
   status: ProgressStepStatus
-  index: number
 }) {
   return (
     <span className={`progress-step-marker ${status}`}>
       {status === 'completed' ? <Check size={11} aria-hidden="true" /> : null}
-      {status === 'blocked' ? <CircleAlert size={11} aria-hidden="true" /> : null}
-      {status === 'skipped' ? <X size={11} aria-hidden="true" /> : null}
+      {status === 'failed' ? <CircleAlert size={11} aria-hidden="true" /> : null}
+      {status === 'cancelled' ? <X size={11} aria-hidden="true" /> : null}
       {status === 'in_progress' ? <LoaderCircle size={12} aria-hidden="true" /> : null}
-      {status === 'pending' ? index + 1 : null}
+      {status === 'pending' ? <Circle size={12} aria-hidden="true" /> : null}
     </span>
   )
+}
+
+function ProgressTaskIcon({ status }: { status: ProgressTaskStatus }) {
+  if (status === 'completed') {
+    return <Check size={14} aria-hidden="true" />
+  }
+  if (status === 'failed') {
+    return <CircleAlert size={14} aria-hidden="true" />
+  }
+  if (status === 'cancelled') {
+    return <X size={14} aria-hidden="true" />
+  }
+  return <LoaderCircle size={14} aria-hidden="true" />
+}
+
+function progressTaskStatusLabel(status: ProgressTaskStatus): string {
+  if (status === 'completed') {
+    return 'Done'
+  }
+  if (status === 'failed') {
+    return 'Failed'
+  }
+  if (status === 'cancelled') {
+    return 'Cancelled'
+  }
+  return 'Agent progress'
+}
+
+function inferProgressTaskStatus(snapshot: ProgressSnapshot): ProgressTaskStatus {
+  if (snapshot.steps.some((step) => step.status === 'failed')) {
+    return 'failed'
+  }
+  if (snapshot.steps.some((step) => step.status === 'in_progress')) {
+    return 'running'
+  }
+  if (snapshot.steps.length > 0 && snapshot.steps.every((step) => step.status === 'completed')) {
+    return 'completed'
+  }
+  if (snapshot.steps.length > 0 && snapshot.steps.every((step) => step.status === 'cancelled')) {
+    return 'cancelled'
+  }
+  return 'running'
 }
 
 function ProgressStepIcon({ status }: { status: ProgressStepStatus }) {
   if (status === 'completed') {
     return <Check size={13} aria-hidden="true" />
   }
-  if (status === 'blocked') {
+  if (status === 'failed') {
     return <CircleAlert size={13} aria-hidden="true" />
   }
-  if (status === 'skipped') {
+  if (status === 'cancelled') {
     return <X size={13} aria-hidden="true" />
   }
   if (status === 'in_progress') {
@@ -1788,11 +1858,17 @@ function normalizeProgressStatus(value: unknown): ProgressStepStatus {
   if (status === 'completed' || status === 'complete' || status === 'done') {
     return 'completed'
   }
-  if (status === 'blocked' || status === 'failed') {
-    return 'blocked'
+  if (status === 'blocked' || status === 'failed' || status === 'failure' || status === 'error') {
+    return 'failed'
   }
-  if (status === 'skipped' || status === 'skip') {
-    return 'skipped'
+  if (
+    status === 'skipped' ||
+    status === 'skip' ||
+    status === 'cancelled' ||
+    status === 'canceled' ||
+    status === 'cancel'
+  ) {
+    return 'cancelled'
   }
   return 'pending'
 }

@@ -18,6 +18,8 @@ const MCP_TOOL_PREFIX: &str = "mcp__";
 const MAX_TOOL_NAME_BYTES: usize = 64;
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone)]
 pub struct McpRuntime {
@@ -334,6 +336,7 @@ async fn connect_stdio_server(
         .filter(|command| !command.trim().is_empty())
         .ok_or_else(|| format!("MCP server `{server_name}` is missing command"))?;
     let mut process = Command::new(command);
+    hide_child_console(&mut process);
     process.args(&server.args);
     if let Some(cwd) = &server.cwd {
         process.current_dir(cwd);
@@ -361,6 +364,17 @@ async fn connect_stdio_server(
         service: Arc::new(service),
         tool_timeout: tool_timeout(server),
     })
+}
+
+fn hide_child_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
 }
 
 fn startup_timeout(server: &McpServerConfig) -> Duration {

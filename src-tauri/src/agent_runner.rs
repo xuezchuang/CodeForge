@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::agent::decision::{
+    decide_after_model_response, ModelResponseDecision, ModelResponseDecisionInput,
+};
+use crate::agent::session::AgentRunSession;
+use crate::agent::state::AgentRunState;
 use crate::agent::stream::StreamingChatCompletionAccumulator;
 use crate::codex_cli_runner::{self, CODEX_CLI_PROVIDER_TYPE, CODEX_CLI_TOOL_NAME};
 use crate::goal_state::GoalState;
@@ -249,6 +254,64 @@ struct CompletedToolCall {
     tool_name: String,
     arguments: Value,
     result: ToolOutput,
+}
+
+struct OpenAiToolLoopState {
+    session: AgentRunSession,
+    round_index: usize,
+    request: Option<Value>,
+    completion: Option<ChatCompletionResult>,
+    tool_calls: Vec<OpenAiToolCall>,
+    next_tool_choice: Option<Value>,
+    empty_tool_call_response_retries: usize,
+    required_tool_call_response_retries: usize,
+    pending_final_without_tools: Option<PendingFinalWithoutTools>,
+}
+
+enum PendingFinalWithoutTools {
+    EmptyToolCallFallback {
+        messages: Vec<Value>,
+        request_index: usize,
+    },
+    ToolBudgetReached {
+        messages: Vec<Value>,
+        round_index: usize,
+    },
+}
+
+impl OpenAiToolLoopState {
+    fn new(task_id: &str, step_index: u32, require_tool_call: bool) -> Self {
+        Self {
+            session: AgentRunSession::new(
+                task_id.to_string(),
+                AgentRunState::PrepareModelRequest,
+                step_index,
+            ),
+            round_index: 0,
+            request: None,
+            completion: None,
+            tool_calls: Vec::new(),
+            next_tool_choice: require_tool_call.then(|| json!("required")),
+            empty_tool_call_response_retries: 0,
+            required_tool_call_response_retries: 0,
+            pending_final_without_tools: None,
+        }
+    }
+
+    fn state(&self) -> AgentRunState {
+        self.session.state()
+    }
+
+    fn transition(&mut self, to: AgentRunState, reason: &str) {
+        self.session.transition(to, reason, Some(self.round_index));
+    }
+
+    fn advance_round(&mut self) {
+        self.round_index += 1;
+        self.request = None;
+        self.completion = None;
+        self.tool_calls.clear();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1273,465 +1336,509 @@ async fn run_openai_tool_agent_loop(
     mut subagent_manager: Option<&mut SubagentManager>,
     on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) -> Result<(), String> {
-    let mut empty_tool_call_response_retries = 0usize;
-    let mut required_tool_call_response_retries = 0usize;
-    let mut next_tool_choice: Option<Value> = require_tool_call.then(|| json!("required"));
+    let mut loop_state = OpenAiToolLoopState::new(task_id, *step_index, require_tool_call);
     let tool_name_map = ToolNameMap::from_tools(&tools);
     let model_tools = tool_name_map.tools_for_model(&tools);
 
-    for round_index in 0..=max_tool_rounds {
-        let request = build_chat_completion_request_with_tool_choice(
-            selected,
-            messages.clone(),
-            Some(model_tools.clone()),
-            next_tool_choice.take(),
-        );
-        let request_title = format!("llm_request:{}", round_index + 1);
-        push_trace(
-            traces,
-            trace(
-                task_id,
-                *step_index,
-                TraceEventType::LlmRequest,
-                None,
-                &request_title,
-                Some(redact_trace_value(&request)),
-                None,
-                Some(request_summary(&request)),
-                TraceStatus::Success,
-                0,
-            ),
-            on_trace,
-        );
-        *step_index += 1;
-
-        let completion = match send_chat_completion(
-            selected,
-            &request,
-            Some(StreamingTraceSink {
-                task_id,
-                step_index: *step_index,
-                on_trace: &mut *on_trace,
-            }),
-        )
-        .await
-        {
-            Ok(completion) => completion,
-            Err(error) => {
-                push_trace(
-                    traces,
-                    error_trace(
-                        task_id,
-                        *step_index,
-                        &format!("{request_title} failed"),
-                        Some(redact_trace_value(&request)),
-                        &error,
-                    ),
-                    on_trace,
-                );
-                *step_index += 1;
-                return Ok(());
-            }
-        };
-
-        let response_title = format!("llm_response:{}", round_index + 1);
-        push_trace(
-            traces,
-            trace(
-                task_id,
-                *step_index,
-                TraceEventType::LlmResponse,
-                None,
-                &response_title,
-                Some(json!({
-                    "request": redact_trace_value(&completion.request_body),
-                    "tokenUsage": serde_json::to_value(&completion.token_usage).unwrap_or_default(),
-                })),
-                Some(completion.response_body.clone()),
-                Some(response_summary(&completion.response_body)),
-                TraceStatus::Success,
-                completion.duration_ms,
-            ),
-            on_trace,
-        );
-        *step_index += 1;
-
-        let tool_calls = match parse_tool_calls(&completion.response_body) {
-            Ok(tool_calls) => tool_calls,
-            Err(error) => {
-                push_trace(
-                    traces,
-                    error_trace(
-                        task_id,
-                        *step_index,
-                        "parse_tool_calls failed",
-                        Some(completion.response_body),
-                        &error,
-                    ),
-                    on_trace,
-                );
-                *step_index += 1;
-                return Ok(());
-            }
-        };
-        let finish_reason = response_finish_reason(&completion.response_body);
-
-        if !tool_calls.is_empty() {
-            push_assistant_model_message_trace(
-                task_id,
-                traces,
-                step_index,
-                &completion.response_body,
-                on_trace,
-            );
-        }
-
-        if tool_calls.is_empty() {
-            if require_tool_call
-                && round_index == 0
-                && required_tool_call_response_retries == 0
-                && finish_reason.as_deref() != Some("tool_calls")
-            {
-                required_tool_call_response_retries += 1;
-                push_required_tool_call_retry_trace(
-                    task_id,
-                    traces,
-                    step_index,
-                    &completion,
-                    on_trace,
-                );
-                messages.push(json!({
-                    "role": "system",
-                    "content": required_tool_call_retry_message(),
-                }));
-                next_tool_choice = Some(json!("required"));
-                continue;
-            }
-
-            if finish_reason.as_deref() == Some("tool_calls") {
-                let can_retry = empty_tool_call_response_retries
-                    < EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT
-                    && round_index < max_tool_rounds;
-                let retry_tool_choice = can_retry.then(|| {
-                    empty_tool_call_retry_tool_choice(&completion.response_body, &model_tools)
-                });
-
-                push_empty_tool_call_response_trace(
-                    task_id,
-                    traces,
-                    step_index,
-                    &completion,
-                    can_retry,
-                    retry_tool_choice.as_ref(),
-                    on_trace,
-                );
-
-                if can_retry {
-                    empty_tool_call_response_retries += 1;
-                    next_tool_choice = retry_tool_choice;
-                    messages.push(json!({
-                        "role": "system",
-                        "content": "Your previous response ended with finish_reason=tool_calls but did not include any tool_calls. The next request will require a tool call. Choose the most relevant available tool and provide valid JSON arguments. Do not return an empty assistant message.",
-                    }));
-                    continue;
-                }
-
-                let mut final_messages = messages.clone();
-                final_messages.push(json!({
-                    "role": "system",
-                    "content": "Tool calling is unavailable for this response because the previous model response ended with finish_reason=tool_calls but did not include any tool_calls. Answer the user's question now in natural language without calling tools. If the workspace was not inspected, say that explicitly instead of inventing code details.",
-                }));
-                request_final_answer_without_tools(
-                    task_id,
+    while !loop_state.state().is_terminal() {
+        match loop_state.state() {
+            AgentRunState::PrepareModelRequest => {
+                let request = build_chat_completion_request_with_tool_choice(
                     selected,
-                    final_messages,
+                    messages.clone(),
+                    Some(model_tools.clone()),
+                    loop_state.next_tool_choice.take(),
+                );
+                let request_title = format!("llm_request:{}", loop_state.round_index + 1);
+                push_trace(
                     traces,
-                    step_index,
-                    round_index + 2,
+                    trace(
+                        task_id,
+                        loop_state.session.step_index,
+                        TraceEventType::LlmRequest,
+                        None,
+                        &request_title,
+                        Some(redact_trace_value(&request)),
+                        None,
+                        Some(request_summary(&request)),
+                        TraceStatus::Success,
+                        0,
+                    ),
                     on_trace,
-                )
-                .await?;
-                return Ok(());
+                );
+                loop_state.session.step_index += 1;
+                loop_state.request = Some(request);
+                loop_state.transition(AgentRunState::RequestModel, "model_request_ready");
             }
 
-            push_final_response_trace(
-                task_id,
-                traces,
-                step_index,
-                &completion,
-                require_tool_call && round_index == 0,
-                on_trace,
-            );
-            return Ok(());
-        }
+            AgentRunState::RequestModel => {
+                let Some(request) = loop_state.request.as_ref() else {
+                    loop_state.transition(AgentRunState::Failed, "missing_model_request");
+                    continue;
+                };
+                let request_title = format!("llm_request:{}", loop_state.round_index + 1);
+                let completion = match send_chat_completion(
+                    selected,
+                    request,
+                    Some(StreamingTraceSink {
+                        task_id,
+                        step_index: loop_state.session.step_index,
+                        on_trace: &mut *on_trace,
+                    }),
+                )
+                .await
+                {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        push_trace(
+                            traces,
+                            error_trace(
+                                task_id,
+                                loop_state.session.step_index,
+                                &format!("{request_title} failed"),
+                                Some(redact_trace_value(request)),
+                                &error,
+                            ),
+                            on_trace,
+                        );
+                        loop_state.session.step_index += 1;
+                        loop_state.transition(AgentRunState::Failed, "model_request_failed");
+                        continue;
+                    }
+                };
 
-        if round_index >= max_tool_rounds {
-            let requested_tool_names = tool_name_map.tool_call_names(&tool_calls);
-            let requested_tool_names_text = requested_tool_names.join(", ");
-            let requested_tool_count = tool_calls.len();
-            push_trace(
-                traces,
-                trace(
-                    task_id,
-                    *step_index,
-                    TraceEventType::SystemEvent,
-                    None,
-                    "tool_round_budget_reached",
-                    Some(json!({
-                        "maxToolRounds": max_tool_rounds,
-                        "usedToolRounds": round_index,
-                        "currentModelRound": round_index + 1,
-                        "blockedToolCallCount": requested_tool_count,
-                        "blockedToolNames": requested_tool_names,
-                        "requestedToolCalls": tool_calls,
-                    })),
-                    None,
-                    Some(format!(
-                        "Tool round budget reached after {max_tool_rounds} tool rounds; model round {} requested {requested_tool_count} more tool call(s): {}. Asking the model to answer with available evidence.",
-                        round_index + 1,
-                        requested_tool_names_text
-                    )),
-                    TraceStatus::Warning,
-                    0,
-                ),
-                on_trace,
-            );
-            *step_index += 1;
+                let response_title = format!("llm_response:{}", loop_state.round_index + 1);
+                push_trace(
+                    traces,
+                    trace(
+                        task_id,
+                        loop_state.session.step_index,
+                        TraceEventType::LlmResponse,
+                        None,
+                        &response_title,
+                        Some(json!({
+                            "request": redact_trace_value(&completion.request_body),
+                            "tokenUsage": serde_json::to_value(&completion.token_usage).unwrap_or_default(),
+                        })),
+                        Some(completion.response_body.clone()),
+                        Some(response_summary(&completion.response_body)),
+                        TraceStatus::Success,
+                        completion.duration_ms,
+                    ),
+                    on_trace,
+                );
+                loop_state.session.step_index += 1;
+                loop_state.completion = Some(completion);
+                loop_state.transition(AgentRunState::HandleModelResponse, "model_response_ready");
+            }
 
-            let mut final_messages = messages.clone();
-            final_messages.push(json!({
-                "role": "system",
-                "content": "Tool round budget reached. Do not call more tools. Answer the user's question now using the available tool results. If evidence is incomplete, state what is missing instead of requesting more tools.",
-            }));
-            let final_request = build_chat_completion_request(selected, final_messages, None);
-            let final_request_title = format!("llm_request:{}:final", round_index + 1);
-            push_trace(
-                traces,
-                trace(
-                    task_id,
-                    *step_index,
-                    TraceEventType::LlmRequest,
-                    None,
-                    &final_request_title,
-                    Some(redact_trace_value(&final_request)),
-                    None,
-                    Some(request_summary(&final_request)),
-                    TraceStatus::Success,
-                    0,
-                ),
-                on_trace,
-            );
-            *step_index += 1;
+            AgentRunState::HandleModelResponse => {
+                let Some(completion) = loop_state.completion.as_ref() else {
+                    loop_state.transition(AgentRunState::Failed, "missing_model_response");
+                    continue;
+                };
+                let tool_calls = match parse_tool_calls(&completion.response_body) {
+                    Ok(tool_calls) => tool_calls,
+                    Err(error) => {
+                        push_trace(
+                            traces,
+                            error_trace(
+                                task_id,
+                                loop_state.session.step_index,
+                                "parse_tool_calls failed",
+                                Some(completion.response_body.clone()),
+                                &error,
+                            ),
+                            on_trace,
+                        );
+                        loop_state.session.step_index += 1;
+                        loop_state.transition(AgentRunState::Failed, "tool_call_parse_failed");
+                        continue;
+                    }
+                };
+                let finish_reason = response_finish_reason(&completion.response_body);
 
-            let final_completion = match send_chat_completion(
-                selected,
-                &final_request,
-                Some(StreamingTraceSink {
-                    task_id,
-                    step_index: *step_index,
-                    on_trace: &mut *on_trace,
-                }),
-            )
-            .await
-            {
-                Ok(completion) => completion,
-                Err(error) => {
-                    push_trace(
+                if !tool_calls.is_empty() {
+                    push_assistant_model_message_trace(
+                        task_id,
                         traces,
-                        error_trace(
-                            task_id,
-                            *step_index,
-                            &format!("{final_request_title} failed"),
-                            Some(redact_trace_value(&final_request)),
-                            &error,
-                        ),
+                        &mut loop_state.session.step_index,
+                        &completion.response_body,
                         on_trace,
                     );
-                    *step_index += 1;
-                    return Ok(());
                 }
-            };
 
-            let final_response_title = format!("llm_response:{}:final", round_index + 1);
-            push_trace(
-                traces,
-                trace(
-                    task_id,
-                    *step_index,
-                    TraceEventType::LlmResponse,
-                    None,
-                    &final_response_title,
-                    Some(json!({
-                        "request": redact_trace_value(&final_completion.request_body),
-                    })),
-                    Some(final_completion.response_body.clone()),
-                    Some(response_summary(&final_completion.response_body)),
-                    TraceStatus::Success,
-                    final_completion.duration_ms,
-                ),
-                on_trace,
-            );
-            *step_index += 1;
+                let decision = decide_after_model_response(ModelResponseDecisionInput {
+                    tool_call_count: tool_calls.len(),
+                    finish_reason: finish_reason.as_deref(),
+                    round_index: loop_state.round_index,
+                    max_tool_rounds,
+                    require_tool_call,
+                    required_tool_call_response_retries: loop_state
+                        .required_tool_call_response_retries,
+                    empty_tool_call_response_retries: loop_state.empty_tool_call_response_retries,
+                    empty_tool_call_response_retry_limit: EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT,
+                });
+                loop_state.tool_calls = tool_calls;
 
-            push_final_response_trace(
-                task_id,
-                traces,
-                step_index,
-                &final_completion,
-                false,
-                on_trace,
-            );
-            return Ok(());
-        }
+                match decision {
+                    ModelResponseDecision::RetryRequiredToolCall => {
+                        loop_state.required_tool_call_response_retries += 1;
+                        push_required_tool_call_retry_trace(
+                            task_id,
+                            traces,
+                            &mut loop_state.session.step_index,
+                            completion,
+                            on_trace,
+                        );
+                        messages.push(json!({
+                            "role": "system",
+                            "content": required_tool_call_retry_message(),
+                        }));
+                        loop_state.next_tool_choice = Some(json!("required"));
+                        loop_state.transition(
+                            AgentRunState::PrepareModelRequest,
+                            "required_tool_call_retry",
+                        );
+                        loop_state.advance_round();
+                    }
+                    ModelResponseDecision::RetryEmptyToolCall => {
+                        let retry_tool_choice = empty_tool_call_retry_tool_choice(
+                            &completion.response_body,
+                            &model_tools,
+                        );
+                        push_empty_tool_call_response_trace(
+                            task_id,
+                            traces,
+                            &mut loop_state.session.step_index,
+                            completion,
+                            true,
+                            Some(&retry_tool_choice),
+                            on_trace,
+                        );
+                        loop_state.empty_tool_call_response_retries += 1;
+                        loop_state.next_tool_choice = Some(retry_tool_choice);
+                        messages.push(json!({
+                            "role": "system",
+                            "content": "Your previous response ended with finish_reason=tool_calls but did not include any tool_calls. The next request will require a tool call. Choose the most relevant available tool and provide valid JSON arguments. Do not return an empty assistant message.",
+                        }));
+                        loop_state.transition(
+                            AgentRunState::PrepareModelRequest,
+                            "empty_tool_call_retry",
+                        );
+                        loop_state.advance_round();
+                    }
+                    ModelResponseDecision::RequestFinalWithoutTools => {
+                        push_empty_tool_call_response_trace(
+                            task_id,
+                            traces,
+                            &mut loop_state.session.step_index,
+                            completion,
+                            false,
+                            None,
+                            on_trace,
+                        );
+                        let mut final_messages = messages.clone();
+                        final_messages.push(json!({
+                            "role": "system",
+                            "content": "Tool calling is unavailable for this response because the previous model response ended with finish_reason=tool_calls but did not include any tool_calls. Answer the user's question now in natural language without calling tools. If the workspace was not inspected, say that explicitly instead of inventing code details.",
+                        }));
+                        loop_state.pending_final_without_tools =
+                            Some(PendingFinalWithoutTools::EmptyToolCallFallback {
+                                messages: final_messages,
+                                request_index: loop_state.round_index + 2,
+                            });
+                        loop_state.transition(
+                            AgentRunState::RequestFinalWithoutTools,
+                            "empty_tool_call_final_fallback",
+                        );
+                    }
+                    ModelResponseDecision::Finalize => {
+                        loop_state.transition(AgentRunState::Finalize, "no_tool_calls");
+                    }
+                    ModelResponseDecision::RequestBudgetFinal => {
+                        let requested_tool_names =
+                            tool_name_map.tool_call_names(&loop_state.tool_calls);
+                        let requested_tool_names_text = requested_tool_names.join(", ");
+                        let requested_tool_count = loop_state.tool_calls.len();
+                        push_trace(
+                            traces,
+                            trace(
+                                task_id,
+                                loop_state.session.step_index,
+                                TraceEventType::SystemEvent,
+                                None,
+                                "tool_round_budget_reached",
+                                Some(json!({
+                                    "maxToolRounds": max_tool_rounds,
+                                    "usedToolRounds": loop_state.round_index,
+                                    "currentModelRound": loop_state.round_index + 1,
+                                    "blockedToolCallCount": requested_tool_count,
+                                    "blockedToolNames": requested_tool_names,
+                                    "requestedToolCalls": loop_state.tool_calls.clone(),
+                                })),
+                                None,
+                                Some(format!(
+                                    "Tool round budget reached after {max_tool_rounds} tool rounds; model round {} requested {requested_tool_count} more tool call(s): {}. Asking the model to answer with available evidence.",
+                                    loop_state.round_index + 1,
+                                    requested_tool_names_text
+                                )),
+                                TraceStatus::Warning,
+                                0,
+                            ),
+                            on_trace,
+                        );
+                        loop_state.session.step_index += 1;
 
-        match build_assistant_tool_call_message(&completion.response_body) {
-            Ok(message) => messages.push(message),
-            Err(error) => {
-                push_trace(
-                    traces,
-                    error_trace(
-                        task_id,
-                        *step_index,
-                        "assistant_tool_call_message failed",
-                        Some(completion.response_body),
-                        &error,
-                    ),
-                    on_trace,
-                );
-                *step_index += 1;
-                return Ok(());
+                        let mut final_messages = messages.clone();
+                        final_messages.push(json!({
+                            "role": "system",
+                            "content": "Tool round budget reached. Do not call more tools. Answer the user's question now using the available tool results. If evidence is incomplete, state what is missing instead of requesting more tools.",
+                        }));
+                        loop_state.pending_final_without_tools =
+                            Some(PendingFinalWithoutTools::ToolBudgetReached {
+                                messages: final_messages,
+                                round_index: loop_state.round_index,
+                            });
+                        loop_state.transition(
+                            AgentRunState::RequestFinalWithoutTools,
+                            "tool_round_budget_reached",
+                        );
+                    }
+                    ModelResponseDecision::ExecuteToolCalls => {
+                        loop_state.transition(AgentRunState::ExecuteToolCalls, "tool_calls_ready");
+                    }
+                }
             }
-        }
 
-        let mut post_tool_messages = Vec::new();
-        let mut parsed_tool_calls = Vec::new();
+            AgentRunState::ExecuteToolCalls => {
+                let Some(response_body) = loop_state
+                    .completion
+                    .as_ref()
+                    .map(|completion| completion.response_body.clone())
+                else {
+                    loop_state.transition(AgentRunState::Failed, "missing_tool_response");
+                    continue;
+                };
+                match build_assistant_tool_call_message(&response_body) {
+                    Ok(message) => messages.push(message),
+                    Err(error) => {
+                        push_trace(
+                            traces,
+                            error_trace(
+                                task_id,
+                                loop_state.session.step_index,
+                                "assistant_tool_call_message failed",
+                                Some(response_body),
+                                &error,
+                            ),
+                            on_trace,
+                        );
+                        loop_state.session.step_index += 1;
+                        loop_state.transition(
+                            AgentRunState::Failed,
+                            "assistant_tool_call_message_failed",
+                        );
+                        continue;
+                    }
+                }
 
-        for tool_call in tool_calls {
-            let original_tool_name = tool_name_map.original_name(&tool_call.function.name);
-            let arguments = match parse_tool_arguments(&tool_call.function.arguments) {
-                Ok(arguments) => arguments,
-                Err(error) => {
-                    let tool_result = tool_error_result(&error);
+                let mut post_tool_messages = Vec::new();
+                let mut parsed_tool_calls = Vec::new();
+                let tool_calls = std::mem::take(&mut loop_state.tool_calls);
+
+                for tool_call in tool_calls {
+                    let original_tool_name = tool_name_map.original_name(&tool_call.function.name);
+                    let arguments = match parse_tool_arguments(&tool_call.function.arguments) {
+                        Ok(arguments) => arguments,
+                        Err(error) => {
+                            let tool_result = tool_error_result(&error);
+                            push_trace(
+                                traces,
+                                trace(
+                                    task_id,
+                                    loop_state.session.step_index,
+                                    TraceEventType::Error,
+                                    Some(&original_tool_name),
+                                    "tool_arguments parse failed",
+                                    Some(json!({ "toolCall": tool_call.clone() })),
+                                    Some(tool_result.clone()),
+                                    Some(error),
+                                    TraceStatus::Failed,
+                                    0,
+                                ),
+                                on_trace,
+                            );
+                            loop_state.session.step_index += 1;
+                            messages.push(build_tool_result_message(&tool_call, &tool_result));
+                            continue;
+                        }
+                    };
+
                     push_trace(
                         traces,
                         trace(
                             task_id,
-                            *step_index,
-                            TraceEventType::Error,
+                            loop_state.session.step_index,
+                            TraceEventType::ToolCall,
                             Some(&original_tool_name),
-                            "tool_arguments parse failed",
-                            Some(json!({ "toolCall": tool_call.clone() })),
-                            Some(tool_result.clone()),
-                            Some(error),
-                            TraceStatus::Failed,
+                            "tool_call",
+                            Some(json!({
+                                "toolCall": tool_call.clone(),
+                                "toolName": original_tool_name.clone(),
+                                "arguments": arguments.clone(),
+                            })),
+                            None,
+                            Some(tool_call_summary(&original_tool_name, &arguments)),
+                            TraceStatus::Success,
                             0,
                         ),
                         on_trace,
                     );
-                    *step_index += 1;
-                    messages.push(build_tool_result_message(&tool_call, &tool_result));
-                    continue;
+                    loop_state.session.step_index += 1;
+
+                    parsed_tool_calls.push(ParsedToolCall {
+                        tool_call,
+                        tool_name: original_tool_name,
+                        arguments,
+                    });
                 }
-            };
 
-            push_trace(
-                traces,
-                trace(
+                let completed_tool_calls = execute_parsed_tool_calls(
+                    tool_context,
+                    subagent_manager.as_deref_mut(),
+                    parsed_tool_calls,
+                )
+                .await;
+
+                for completed in completed_tool_calls {
+                    let tool_result = completed.result.to_model_value();
+                    let trace_status = if completed.result.is_ok() {
+                        TraceStatus::Success
+                    } else {
+                        TraceStatus::Failed
+                    };
+                    let event_type = if completed.result.is_ok() {
+                        TraceEventType::ToolResult
+                    } else {
+                        TraceEventType::Error
+                    };
+
+                    push_trace(
+                        traces,
+                        trace(
+                            task_id,
+                            loop_state.session.step_index,
+                            event_type,
+                            Some(&completed.tool_name),
+                            "tool_result",
+                            Some(json!({
+                                "toolName": completed.tool_name.clone(),
+                                "modelToolName": completed.tool_call.function.name.clone(),
+                                "arguments": completed.arguments.clone(),
+                            })),
+                            Some(tool_result.clone()),
+                            Some(
+                                completed
+                                    .result
+                                    .summary
+                                    .clone()
+                                    .unwrap_or_else(|| tool_result_summary(&tool_result)),
+                            ),
+                            trace_status,
+                            completed.result.elapsed_ms,
+                        ),
+                        on_trace,
+                    );
+                    loop_state.session.step_index += 1;
+
+                    messages.push(build_tool_result_message(
+                        &completed.tool_call,
+                        &tool_result,
+                    ));
+                    append_pptx_image_followup(
+                        selected,
+                        tool_context.workspace_root,
+                        task_id,
+                        traces,
+                        &mut loop_state.session.step_index,
+                        on_trace,
+                        &completed.tool_name,
+                        &completed.result,
+                        &mut post_tool_messages,
+                    )
+                    .await;
+                }
+
+                messages.extend(post_tool_messages);
+                loop_state.transition(AgentRunState::PrepareModelRequest, "tool_results_ready");
+                loop_state.advance_round();
+            }
+
+            AgentRunState::RequestFinalWithoutTools => {
+                let Some(pending) = loop_state.pending_final_without_tools.take() else {
+                    loop_state.transition(AgentRunState::Failed, "missing_final_request");
+                    continue;
+                };
+                match pending {
+                    PendingFinalWithoutTools::EmptyToolCallFallback {
+                        messages,
+                        request_index,
+                    } => {
+                        request_final_answer_without_tools(
+                            task_id,
+                            selected,
+                            messages,
+                            traces,
+                            &mut loop_state.session.step_index,
+                            request_index,
+                            on_trace,
+                        )
+                        .await?;
+                    }
+                    PendingFinalWithoutTools::ToolBudgetReached {
+                        messages,
+                        round_index,
+                    } => {
+                        request_budget_final_answer_without_tools(
+                            task_id,
+                            selected,
+                            messages,
+                            traces,
+                            &mut loop_state.session.step_index,
+                            round_index,
+                            on_trace,
+                        )
+                        .await?;
+                    }
+                }
+                loop_state.transition(AgentRunState::Completed, "final_without_tools_done");
+            }
+
+            AgentRunState::Finalize => {
+                let Some(completion) = loop_state.completion.take() else {
+                    loop_state.transition(AgentRunState::Failed, "missing_final_response");
+                    continue;
+                };
+                push_final_response_trace(
                     task_id,
-                    *step_index,
-                    TraceEventType::ToolCall,
-                    Some(&original_tool_name),
-                    "tool_call",
-                    Some(json!({
-                        "toolCall": tool_call.clone(),
-                        "toolName": original_tool_name.clone(),
-                        "arguments": arguments.clone(),
-                    })),
-                    None,
-                    Some(tool_call_summary(&original_tool_name, &arguments)),
-                    TraceStatus::Success,
-                    0,
-                ),
-                on_trace,
-            );
-            *step_index += 1;
+                    traces,
+                    &mut loop_state.session.step_index,
+                    &completion,
+                    require_tool_call && loop_state.round_index == 0,
+                    on_trace,
+                );
+                loop_state.transition(AgentRunState::Completed, "final_response_recorded");
+            }
 
-            parsed_tool_calls.push(ParsedToolCall {
-                tool_call,
-                tool_name: original_tool_name,
-                arguments,
-            });
+            AgentRunState::Completed | AgentRunState::Failed => {}
+            _ => {
+                loop_state.transition(AgentRunState::Failed, "unsupported_loop_state");
+            }
         }
-
-        let completed_tool_calls = execute_parsed_tool_calls(
-            tool_context,
-            subagent_manager.as_deref_mut(),
-            parsed_tool_calls,
-        )
-        .await;
-
-        for completed in completed_tool_calls {
-            let tool_result = completed.result.to_model_value();
-            let trace_status = if completed.result.is_ok() {
-                TraceStatus::Success
-            } else {
-                TraceStatus::Failed
-            };
-            let event_type = if completed.result.is_ok() {
-                TraceEventType::ToolResult
-            } else {
-                TraceEventType::Error
-            };
-
-            push_trace(
-                traces,
-                trace(
-                    task_id,
-                    *step_index,
-                    event_type,
-                    Some(&completed.tool_name),
-                    "tool_result",
-                    Some(json!({
-                        "toolName": completed.tool_name.clone(),
-                        "modelToolName": completed.tool_call.function.name.clone(),
-                        "arguments": completed.arguments.clone(),
-                    })),
-                    Some(tool_result.clone()),
-                    Some(
-                        completed
-                            .result
-                            .summary
-                            .clone()
-                            .unwrap_or_else(|| tool_result_summary(&tool_result)),
-                    ),
-                    trace_status,
-                    completed.result.elapsed_ms,
-                ),
-                on_trace,
-            );
-            *step_index += 1;
-
-            messages.push(build_tool_result_message(
-                &completed.tool_call,
-                &tool_result,
-            ));
-            append_pptx_image_followup(
-                selected,
-                tool_context.workspace_root,
-                task_id,
-                traces,
-                step_index,
-                on_trace,
-                &completed.tool_name,
-                &completed.result,
-                &mut post_tool_messages,
-            )
-            .await;
-        }
-
-        messages.extend(post_tool_messages);
     }
 
+    *step_index = loop_state.session.step_index;
     Ok(())
 }
 
@@ -2462,6 +2569,96 @@ async fn request_final_answer_without_tools(
     Ok(())
 }
 
+async fn request_budget_final_answer_without_tools(
+    task_id: &str,
+    selected: &SelectedModel,
+    messages: Vec<Value>,
+    traces: &mut Vec<ToolTraceEvent>,
+    step_index: &mut u32,
+    round_index: usize,
+    on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
+) -> Result<(), String> {
+    let final_request = build_chat_completion_request(selected, messages, None);
+    let final_request_title = format!("llm_request:{}:final", round_index + 1);
+    push_trace(
+        traces,
+        trace(
+            task_id,
+            *step_index,
+            TraceEventType::LlmRequest,
+            None,
+            &final_request_title,
+            Some(redact_trace_value(&final_request)),
+            None,
+            Some(request_summary(&final_request)),
+            TraceStatus::Success,
+            0,
+        ),
+        on_trace,
+    );
+    *step_index += 1;
+
+    let final_completion = match send_chat_completion(
+        selected,
+        &final_request,
+        Some(StreamingTraceSink {
+            task_id,
+            step_index: *step_index,
+            on_trace: &mut *on_trace,
+        }),
+    )
+    .await
+    {
+        Ok(completion) => completion,
+        Err(error) => {
+            push_trace(
+                traces,
+                error_trace(
+                    task_id,
+                    *step_index,
+                    &format!("{final_request_title} failed"),
+                    Some(redact_trace_value(&final_request)),
+                    &error,
+                ),
+                on_trace,
+            );
+            *step_index += 1;
+            return Ok(());
+        }
+    };
+
+    let final_response_title = format!("llm_response:{}:final", round_index + 1);
+    push_trace(
+        traces,
+        trace(
+            task_id,
+            *step_index,
+            TraceEventType::LlmResponse,
+            None,
+            &final_response_title,
+            Some(json!({
+                "request": redact_trace_value(&final_completion.request_body),
+            })),
+            Some(final_completion.response_body.clone()),
+            Some(response_summary(&final_completion.response_body)),
+            TraceStatus::Success,
+            final_completion.duration_ms,
+        ),
+        on_trace,
+    );
+    *step_index += 1;
+
+    push_final_response_trace(
+        task_id,
+        traces,
+        step_index,
+        &final_completion,
+        false,
+        on_trace,
+    );
+    Ok(())
+}
+
 fn push_empty_tool_call_response_trace(
     task_id: &str,
     traces: &mut Vec<ToolTraceEvent>,
@@ -3146,7 +3343,11 @@ fn normalize_model_reasoning_effort(
     let Some(model) = model else {
         return explicit;
     };
-    if let Some(reasoning) = model.reasoning.as_ref().filter(|config| !config.levels.is_empty()) {
+    if let Some(reasoning) = model
+        .reasoning
+        .as_ref()
+        .filter(|config| !config.levels.is_empty())
+    {
         let requested = explicit.as_deref().or_else(|| {
             let default = model.default_reasoning.trim();
             (!default.is_empty()).then_some(default)
@@ -3399,7 +3600,10 @@ fn build_chat_completion_request_with_tool_choice(
     request_body
 }
 
-fn apply_custom_model_reasoning_request(request_body: &mut Value, selected: &SelectedModel) -> bool {
+fn apply_custom_model_reasoning_request(
+    request_body: &mut Value,
+    selected: &SelectedModel,
+) -> bool {
     let Some(level) = selected_custom_reasoning_level(selected) else {
         return false;
     };
@@ -3434,12 +3638,16 @@ fn selected_custom_reasoning_level(
 }
 
 fn merge_request_fragment(target: &mut Value, fragment: &Value) {
-    let (Some(target_object), Some(fragment_object)) = (target.as_object_mut(), fragment.as_object())
+    let (Some(target_object), Some(fragment_object)) =
+        (target.as_object_mut(), fragment.as_object())
     else {
         return;
     };
     for (key, value) in fragment_object {
-        merge_request_value(target_object.entry(key.clone()).or_insert(Value::Null), value);
+        merge_request_value(
+            target_object.entry(key.clone()).or_insert(Value::Null),
+            value,
+        );
     }
 }
 
@@ -6351,6 +6559,65 @@ mod tests {
             event.title == "final_response"
                 && matches!(&event.status, TraceStatus::Success)
                 && event.output_summary.as_deref() == Some("Answered without tools.")
+        }));
+    }
+
+    #[test]
+    fn openai_tool_loop_budget_requests_final_without_executing_blocked_tools() {
+        let model_tool_name = safe_model_tool_name(tool_registry::WORKSPACE_READ_FILE_TOOL_NAME);
+        let (base_url, server_thread) = start_mock_openai_server(vec![
+            tool_call_response_with_args(&model_tool_name, json!({ "path": "sample.txt" })),
+            final_message_response("Budget final answer."),
+        ]);
+        let mut selected = test_selected_model("openai");
+        selected.provider.base_url = base_url;
+        let mut tool_context = ToolExecutionContext {
+            workspace_root: "D:\\code\\snowAgents",
+            vs_bridge_endpoint: None,
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
+            goal: None,
+            mcp_runtime: None,
+        };
+        let mut traces = Vec::new();
+        let mut step_index = 1;
+        let mut ignore_trace = |_event: &ToolTraceEvent| {};
+
+        tauri::async_runtime::block_on(run_openai_tool_agent_loop(
+            "task",
+            &selected,
+            &mut tool_context,
+            vec![json!({ "role": "user", "content": "read sample" })],
+            tool_registry::read_only_tool_definitions(),
+            &mut traces,
+            &mut step_index,
+            0,
+            false,
+            None,
+            &mut ignore_trace,
+        ))
+        .unwrap();
+        let requests = server_thread.join().unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].get("tools").is_none());
+        assert!(requests[1].get("tool_choice").is_none());
+        assert!(traces.iter().any(|event| {
+            event.title == "tool_round_budget_reached"
+                && matches!(&event.event_type, TraceEventType::SystemEvent)
+                && matches!(&event.status, TraceStatus::Warning)
+        }));
+        assert!(traces.iter().any(|event| {
+            event.title == "llm_request:1:final"
+                && matches!(&event.event_type, TraceEventType::LlmRequest)
+        }));
+        assert!(!traces
+            .iter()
+            .any(|event| matches!(&event.event_type, TraceEventType::ToolCall)));
+        assert!(traces.iter().any(|event| {
+            event.title == "final_response"
+                && event.output_summary.as_deref() == Some("Budget final answer.")
         }));
     }
 

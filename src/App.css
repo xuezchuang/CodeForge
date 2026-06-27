@@ -849,7 +849,7 @@ button:focus-visible {
   min-height: 0;
   position: relative;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto auto;
+  grid-template-rows: minmax(0, 1fr) auto;
   overflow: hidden;
 }
 
@@ -2081,13 +2081,13 @@ button:focus-visible {
   color: #1769d3;
 }
 
-.progress-step.blocked svg,
-.progress-step.blocked strong {
+.progress-step.failed svg,
+.progress-step.failed strong {
   color: #b4232c;
 }
 
-.progress-step.skipped svg,
-.progress-step.skipped strong {
+.progress-step.cancelled svg,
+.progress-step.cancelled strong {
   color: #667085;
 }
 
@@ -2127,6 +2127,13 @@ button:focus-visible {
   font-size: 11px;
 }
 
+.composer-dock {
+  min-width: 0;
+  position: relative;
+  display: grid;
+  align-items: end;
+}
+
 .composer-progress {
   border-top: 0;
   padding: 0 16px 8px;
@@ -2134,6 +2141,15 @@ button:focus-visible {
   display: flex;
   justify-content: center;
   pointer-events: none;
+  opacity: 1;
+  transition:
+    opacity 0.28s ease,
+    transform 0.28s ease;
+}
+
+.composer-progress.fading {
+  opacity: 0;
+  transform: translateY(4px);
 }
 
 .composer-progress + .composer {
@@ -2146,26 +2162,30 @@ button:focus-visible {
 }
 
 .progress-steps-card.compact.floating {
-  width: min(340px, calc(100% - 32px));
+  width: min(520px, calc(100% - 32px));
   border: 0;
   border-radius: 0;
   background: transparent;
   color: #344054;
   overflow: visible;
-  display: grid;
-  justify-items: center;
-  gap: 4px;
+  position: relative;
+  display: block;
   pointer-events: auto;
 }
 
 .progress-steps-popover {
-  width: 100%;
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  z-index: 8;
+  width: min(560px, calc(100vw - 48px));
   max-height: min(224px, 34vh);
   border: 1px solid rgb(16 24 40 / 10%);
-  border-radius: 10px;
+  border-radius: 12px;
   background: rgb(255 255 255 / 92%);
   box-shadow: 0 18px 42px rgb(15 23 42 / 18%);
   overflow-y: auto;
+  transform: translateX(-50%);
   backdrop-filter: blur(16px);
 }
 
@@ -2177,8 +2197,8 @@ button:focus-visible {
   grid-template-columns: 18px minmax(0, 1fr);
   gap: 8px;
   align-items: center;
-  min-height: 32px;
-  padding: 5px 11px;
+  min-height: 36px;
+  padding: 7px 12px;
   background: transparent;
 }
 
@@ -2188,18 +2208,18 @@ button:focus-visible {
 
 .progress-steps-card.compact.floating .progress-step strong {
   color: #344054;
-  font-size: 12px;
-  font-weight: 650;
-  line-height: 1.3;
+  font-size: 14px;
+  font-weight: 550;
+  line-height: 1.35;
 }
 
 .progress-steps-card.compact.floating .progress-step.completed strong,
-.progress-steps-card.compact.floating .progress-step.skipped strong {
+.progress-steps-card.compact.floating .progress-step.cancelled strong {
   color: #667085;
 }
 
 .progress-steps-card.compact.floating .progress-step.completed svg,
-.progress-steps-card.compact.floating .progress-step.skipped svg {
+.progress-steps-card.compact.floating .progress-step.cancelled svg {
   color: #667085;
 }
 
@@ -2211,35 +2231,97 @@ button:focus-visible {
   color: #1769d3;
 }
 
+.progress-steps-card.compact.floating .progress-step.failed strong,
+.progress-steps-card.compact.floating .progress-step.failed svg {
+  color: #b4232c;
+}
+
+.progress-task-bar {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid rgb(16 24 40 / 10%);
+  border-radius: 12px;
+  padding: 0 10px 0 12px;
+  background: rgb(255 255 255 / 92%);
+  color: #344054;
+  box-shadow: 0 10px 28px rgb(15 23 42 / 12%);
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto 16px;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  text-align: left;
+  backdrop-filter: blur(16px);
+}
+
+.progress-task-bar svg {
+  color: #667085;
+}
+
+.progress-task-bar.running > svg:first-child {
+  animation: spin 0.8s linear infinite;
+  color: #1769d3;
+}
+
+.progress-task-bar.completed > svg:first-child {
+  color: #16814a;
+}
+
+.progress-task-bar.failed > svg:first-child {
+  color: #b4232c;
+}
+
+.progress-task-bar.cancelled > svg:first-child {
+  color: #667085;
+}
+
+.progress-task-copy {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.progress-task-copy strong {
+  flex: 0 0 auto;
+  color: #20242c;
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1;
+}
+
+.progress-task-copy span {
+  min-width: 0;
+  color: #667085;
+  font-size: 14px;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-task-meta {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #667085;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.progress-task-meta small {
+  color: #667085;
+  font-size: 12px;
+}
+
 .progress-step-marker svg {
   stroke-width: 2;
 }
 
 .progress-step-marker.in_progress svg {
   animation: spin 0.8s linear infinite;
-}
-
-.progress-steps-pill {
-  min-height: 32px;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  border: 1px solid rgb(16 24 40 / 10%);
-  border-radius: 999px;
-  background: rgb(255 255 255 / 88%);
-  box-shadow: 0 10px 28px rgb(15 23 42 / 14%);
-  color: #344054;
-  padding: 0 12px;
-  font-size: 12px;
-  font-weight: 600;
-  backdrop-filter: blur(16px);
-}
-
-.progress-steps-pill .progress-step-marker {
-  width: 14px;
-  height: 14px;
-  margin-top: 0;
-  background: transparent;
 }
 
 .thinking-toggle {
@@ -4630,13 +4712,13 @@ pre {
   color: #73b8ff;
 }
 
-.app-root.codex-style .progress-step.blocked svg,
-.app-root.codex-style .progress-step.blocked strong {
+.app-root.codex-style .progress-step.failed svg,
+.app-root.codex-style .progress-step.failed strong {
   color: #ff9aa4;
 }
 
-.app-root.codex-style .progress-step.skipped svg,
-.app-root.codex-style .progress-step.skipped strong {
+.app-root.codex-style .progress-step.cancelled svg,
+.app-root.codex-style .progress-step.cancelled strong {
   color: #9ca6aa;
 }
 
@@ -4646,10 +4728,16 @@ pre {
 
 .app-root.codex-style .composer-progress {
   border-top: 0;
-  padding: 0 24px 6px;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 12px);
+  z-index: 6;
+  padding: 0;
   background: transparent;
   display: flex;
   justify-content: center;
+  pointer-events: none;
 }
 
 .app-root.codex-style .composer-progress + .composer {
@@ -4665,33 +4753,40 @@ pre {
 }
 
 .app-root.codex-style .composer-progress .progress-steps-card.compact.floating {
-  width: min(322px, calc(100% - 32px));
+  width: min(560px, calc(100% - 48px));
   border: 0;
   background: transparent;
   box-shadow: none;
 }
 
 .app-root.codex-style .progress-steps-popover {
-  border-color: rgb(255 255 255 / 8%);
-  background: rgb(44 44 44 / 88%);
-  box-shadow: 0 18px 42px rgb(0 0 0 / 36%);
+  width: min(560px, calc(100vw - 48px));
+  max-height: min(232px, 32vh);
+  border-color: #404040;
+  border-radius: 12px;
+  background: rgb(45 45 45 / 96%);
+  box-shadow: 0 18px 42px rgb(0 0 0 / 38%);
 }
 
 .app-root.codex-style .progress-steps-card.compact.floating .progress-step {
+  min-height: 38px;
+  padding: 7px 14px;
   background: transparent;
 }
 
 .app-root.codex-style .progress-steps-card.compact.floating .progress-step strong {
-  color: #ededed;
+  color: #dcdcdc;
+  font-size: 14px;
+  font-weight: 550;
 }
 
 .app-root.codex-style .progress-steps-card.compact.floating .progress-step.completed strong,
-.app-root.codex-style .progress-steps-card.compact.floating .progress-step.skipped strong {
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step.cancelled strong {
   color: #9b9b9b;
 }
 
 .app-root.codex-style .progress-steps-card.compact.floating .progress-step.completed svg,
-.app-root.codex-style .progress-steps-card.compact.floating .progress-step.skipped svg {
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step.cancelled svg {
   color: #9b9b9b;
 }
 
@@ -4701,6 +4796,11 @@ pre {
 
 .app-root.codex-style .progress-steps-card.compact.floating .progress-step.in_progress svg {
   color: #d6d6d6;
+}
+
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step.failed strong,
+.app-root.codex-style .progress-steps-card.compact.floating .progress-step.failed svg {
+  color: #ff9aa4;
 }
 
 .app-root.codex-style .progress-step-marker {
@@ -4718,15 +4818,52 @@ pre {
   color: #d6d6d6;
 }
 
-.app-root.codex-style .progress-steps-pill {
-  border-color: rgb(255 255 255 / 9%);
-  background: rgb(54 54 54 / 90%);
-  box-shadow: 0 10px 28px rgb(0 0 0 / 30%);
-  color: #e5e5e5;
+.app-root.codex-style .progress-step-marker.pending svg {
+  color: #ededed;
+  stroke-width: 1.9;
 }
 
-.app-root.codex-style .progress-steps-pill .progress-step-marker.in_progress {
+.app-root.codex-style .progress-task-bar {
+  min-height: 42px;
+  border-color: #3d3d3d;
+  border-radius: 12px;
+  background: rgb(44 44 44 / 96%);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 28%);
+  color: #e0e0e0;
+}
+
+.app-root.codex-style .progress-task-bar:hover,
+.app-root.codex-style .progress-steps-card.open .progress-task-bar {
+  border-color: #4a4a4a;
+  background: rgb(50 50 50 / 98%);
+}
+
+.app-root.codex-style .progress-task-bar svg {
+  color: #a6a6a6;
+}
+
+.app-root.codex-style .progress-task-bar.running > svg:first-child {
   color: #2f9bff;
+}
+
+.app-root.codex-style .progress-task-bar.completed > svg:first-child {
+  color: #a6a6a6;
+}
+
+.app-root.codex-style .progress-task-bar.failed > svg:first-child {
+  color: #ff9aa4;
+}
+
+.app-root.codex-style .progress-task-copy strong {
+  color: #f1f1f1;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.app-root.codex-style .progress-task-copy span,
+.app-root.codex-style .progress-task-meta,
+.app-root.codex-style .progress-task-meta small {
+  color: #a8a8a8;
 }
 
 .app-root.codex-style .workspace-rail-card {
@@ -4949,35 +5086,48 @@ pre {
   color: #d6dddf;
 }
 
-.app-root.codex-style .composer {
-  border-top: 0;
+.app-root.codex-style .composer-dock {
+  position: relative;
+  z-index: 6;
+  display: grid;
+  justify-items: center;
   padding: 0 24px 26px;
-  background: transparent;
-  display: flex;
-  justify-content: center;
 }
 
-.app-root.codex-style .chat-main.has-side-rail .composer {
-  justify-content: flex-start;
+.app-root.codex-style .composer {
+  width: min(1106px, 100%);
+  border-top: 0;
+  padding: 0;
+  background: transparent;
+  display: block;
+}
+
+.app-root.codex-style .chat-main.has-side-rail .composer-dock {
+  justify-items: start;
   padding-left: 44px;
   padding-right: calc(
     var(--workspace-side-rail-width) + var(--workspace-side-rail-gap) + 16px
   );
 }
 
+.app-root.codex-style .chat-main.has-side-rail .composer {
+  width: 100%;
+}
+
 .app-root.codex-style .composer-surface {
-  width: min(1080px, 100%);
-  min-height: 96px;
+  width: 100%;
+  min-height: 146px;
+  max-height: none;
   border-color: #363636;
-  border-radius: 18px;
-  padding: 13px 12px 11px;
+  border-radius: 24px;
+  padding: 27px 18px 18px;
   background: #2d2d2d;
-  box-shadow: 0 14px 34px rgb(0 0 0 / 24%);
+  box-shadow: none;
 }
 
 .app-root.codex-style .composer-surface:focus-within {
   border-color: #363636;
-  box-shadow: 0 14px 34px rgb(0 0 0 / 24%);
+  box-shadow: none;
 }
 
 .app-root.codex-style .composer-attachment {
@@ -8891,8 +9041,8 @@ pre {
     padding-right: 44px;
   }
 
-  .app-root.codex-style .chat-main.has-side-rail .composer {
-    justify-content: center;
+  .app-root.codex-style .chat-main.has-side-rail .composer-dock {
+    justify-items: center;
     padding-left: 24px;
     padding-right: 24px;
   }
@@ -9047,8 +9197,26 @@ pre {
     max-height: calc(100vh - 24px);
   }
 
-  .app-root.codex-style .composer {
+  .app-root.codex-style .composer-dock {
     padding: 12px;
+  }
+
+  .app-root.codex-style .composer {
+    padding: 0;
+  }
+
+  .app-root.codex-style .composer-surface {
+    min-height: 118px;
+    border-radius: 18px;
+    padding: 18px 12px 12px;
+  }
+
+  .app-root.codex-style .composer-progress {
+    bottom: calc(100% + 8px);
+  }
+
+  .app-root.codex-style .composer-progress .progress-steps-card.compact.floating {
+    width: min(420px, calc(100% - 24px));
   }
 
   .section-header,

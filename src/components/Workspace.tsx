@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { Dispatch, SetStateAction } from 'react'
+import type { Dispatch, MutableRefObject, SetStateAction } from 'react'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   callMcpTool,
@@ -30,6 +30,7 @@ import {
   ProgressStepsPanel,
   createProgressSnapshot,
   type ProgressSnapshot,
+  type ProgressTaskStatus,
 } from './ChatMessage'
 import Composer from './Composer'
 import Toast, { type ToastState } from './Toast'
@@ -91,6 +92,12 @@ interface CodeReviewPanelState {
   updatedAt: string
 }
 
+interface TerminalProgressState {
+  taskId: string
+  status: Extract<ProgressTaskStatus, 'completed' | 'cancelled'>
+  phase: 'visible' | 'fading'
+}
+
 const traceEventName = 'agent_trace_event'
 const progressUpdateStepsTool = 'progress/update_steps'
 
@@ -114,6 +121,8 @@ function Workspace({
     Record<string, CodeReviewPanelState>
   >({})
   const runningSessionIdsRef = useRef<Set<string>>(new Set())
+  const lastRunningProgressTaskIdRef = useRef<string | null>(null)
+  const terminalProgressTimersRef = useRef<number[]>([])
   const currentWorkspaceTaskIdRef = useRef<string | null>(state.currentWorkspaceTaskId)
   const lastRunSelectionRef = useRef<AgentRunSelection | null>(null)
   const activeProject = useMemo(
@@ -135,6 +144,20 @@ function Workspace({
   )
   const currentTaskIsRunning = Boolean(
     currentTask && runningSessionIds.has(currentTask.id),
+  )
+  const [runtimeNowMs, setRuntimeNowMs] = useState(() => Date.now())
+  const [terminalProgressState, setTerminalProgressState] =
+    useState<TerminalProgressState | null>(null)
+  const agentProgressDisplay = useMemo(
+    () =>
+      createAgentProgressDisplay({
+        task: currentTask,
+        snapshot: progressSnapshot,
+        running: currentTaskIsRunning,
+        terminalState: terminalProgressState,
+        nowMs: runtimeNowMs,
+      }),
+    [currentTask, currentTaskIsRunning, progressSnapshot, runtimeNowMs, terminalProgressState],
   )
   const selectedTraceEvents = selectedTrace?.events ?? []
   const currentTaskPersistenceKey =
@@ -159,6 +182,81 @@ function Workspace({
   useEffect(() => {
     currentWorkspaceTaskIdRef.current = state.currentWorkspaceTaskId
   }, [state.currentWorkspaceTaskId])
+
+  useEffect(() => {
+    if (!currentTaskIsRunning) {
+      return undefined
+    }
+    if (currentTask?.id) {
+      lastRunningProgressTaskIdRef.current = currentTask.id
+    }
+    if (terminalProgressState) {
+      setTerminalProgressState(null)
+    }
+    setRuntimeNowMs(Date.now())
+    const intervalId = window.setInterval(() => {
+      setRuntimeNowMs(Date.now())
+    }, 1000)
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [currentTask?.id, currentTaskIsRunning, terminalProgressState])
+
+  useEffect(() => {
+    return () => {
+      clearTerminalProgressTimers(terminalProgressTimersRef)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!currentTask || currentTaskIsRunning) {
+      return
+    }
+
+    const terminalStatus = taskTerminalProgressStatus(currentTask)
+    if (terminalStatus === 'failed') {
+      clearTerminalProgressTimers(terminalProgressTimersRef)
+      if (terminalProgressState?.taskId === currentTask.id) {
+        setTerminalProgressState(null)
+      }
+      return
+    }
+    if (
+      terminalStatus !== 'completed' &&
+      terminalStatus !== 'cancelled'
+    ) {
+      return
+    }
+    if (lastRunningProgressTaskIdRef.current !== currentTask.id) {
+      return
+    }
+    if (terminalProgressState?.taskId === currentTask.id) {
+      return
+    }
+
+    clearTerminalProgressTimers(terminalProgressTimersRef)
+    setTerminalProgressState({
+      taskId: currentTask.id,
+      status: terminalStatus,
+      phase: 'visible',
+    })
+    const fadeTimer = window.setTimeout(() => {
+      setTerminalProgressState((state) =>
+        state?.taskId === currentTask.id ? { ...state, phase: 'fading' } : state,
+      )
+    }, 1500)
+    const clearTimer = window.setTimeout(() => {
+      setTerminalProgressState((state) => (state?.taskId === currentTask.id ? null : state))
+      if (lastRunningProgressTaskIdRef.current === currentTask.id) {
+        lastRunningProgressTaskIdRef.current = null
+      }
+    }, 1900)
+    terminalProgressTimersRef.current = [fadeTimer, clearTimer]
+  }, [
+    currentTask,
+    currentTaskIsRunning,
+    terminalProgressState?.taskId,
+  ])
 
   const setComposerDraft = useCallback((value: string) => {
     if (!composerDraftKey) {
@@ -1155,21 +1253,34 @@ function Workspace({
               }}
               onSuggestionSelect={setComposerDraft}
             />
-            {progressSnapshot ? (
-              <div className="composer-progress">
-                <ProgressStepsPanel snapshot={progressSnapshot} compact />
-              </div>
-            ) : null}
-            <Composer
-              providers={state.providers}
-              busy={busy || currentTaskIsRunning || currentTask?.messagesLoaded === false}
-              value={composerDraft}
-              onChange={setComposerDraft}
-              onSend={runTask}
-              onModelSelectionChange={(selection) => {
-                void persistComposerModelSelection(selection)
-              }}
-            />
+            <div className={agentProgressDisplay ? 'composer-dock running' : 'composer-dock'}>
+              {agentProgressDisplay ? (
+                <div
+                  className={
+                    agentProgressDisplay.phase === 'fading' ?
+                      'composer-progress fading'
+                    : 'composer-progress'
+                  }
+                >
+                  <ProgressStepsPanel
+                    snapshot={agentProgressDisplay.snapshot}
+                    compact
+                    taskStatus={agentProgressDisplay.status}
+                    elapsed={agentProgressDisplay.elapsed}
+                  />
+                </div>
+              ) : null}
+              <Composer
+                providers={state.providers}
+                busy={busy || currentTaskIsRunning || currentTask?.messagesLoaded === false}
+                value={composerDraft}
+                onChange={setComposerDraft}
+                onSend={runTask}
+                onModelSelectionChange={(selection) => {
+                  void persistComposerModelSelection(selection)
+                }}
+              />
+            </div>
           </div>
         </main>
       </div>
@@ -1975,10 +2086,10 @@ function finalizeProgressSnapshot(
     }
 
     if (step.status === 'in_progress') {
-      return { ...step, status: 'blocked' as const }
+      return { ...step, status: 'failed' as const }
     }
     if (step.status === 'pending') {
-      return { ...step, status: 'skipped' as const }
+      return { ...step, status: 'cancelled' as const }
     }
     return step
   })
@@ -2046,6 +2157,170 @@ function firstRunningText(values: unknown[]): string {
 function compactRunningDetail(value: string): string {
   const normalized = value.replace(/\s+/g, ' ').trim()
   return normalized.length > 96 ? `${normalized.slice(0, 93)}...` : normalized
+}
+
+interface AgentProgressDisplay {
+  snapshot: ProgressSnapshot
+  status: ProgressTaskStatus
+  phase: TerminalProgressState['phase'] | null
+  elapsed: string
+}
+
+function createAgentProgressDisplay({
+  task,
+  snapshot,
+  running,
+  terminalState,
+  nowMs,
+}: {
+  task: AgentTask | null
+  snapshot: ProgressSnapshot | null
+  running: boolean
+  terminalState: TerminalProgressState | null
+  nowMs: number
+}): AgentProgressDisplay | null {
+  if (!task) {
+    return null
+  }
+
+  const terminalStatus = taskTerminalProgressStatus(task)
+  const displaySnapshot =
+    snapshot ??
+    (running ? createPreparingProgressSnapshot()
+    : terminalStatus ? createTerminalProgressSnapshot(terminalStatus)
+    : null)
+  if (!displaySnapshot) {
+    return null
+  }
+
+  if (running) {
+    return {
+      snapshot: displaySnapshot,
+      status: 'running',
+      phase: null,
+      elapsed: formatRuntimeElapsed(progressStartedAt(task), nowMs),
+    }
+  }
+
+  if (terminalStatus === 'failed') {
+    return {
+      snapshot: displaySnapshot,
+      status: 'failed',
+      phase: null,
+      elapsed: 'failed',
+    }
+  }
+
+  if (terminalState?.taskId === task.id) {
+    return {
+      snapshot: displaySnapshot,
+      status: terminalState.status,
+      phase: terminalState.phase,
+      elapsed: terminalState.status === 'completed' ? 'done' : 'cancelled',
+    }
+  }
+
+  return null
+}
+
+function createTerminalProgressSnapshot(status: ProgressTaskStatus): ProgressSnapshot {
+  const stepStatus =
+    status === 'completed' ? 'completed'
+    : status === 'failed' ? 'failed'
+    : status === 'cancelled' ? 'cancelled'
+    : 'in_progress'
+  const title =
+    status === 'completed' ? 'Task completed'
+    : status === 'failed' ? 'Task failed'
+    : status === 'cancelled' ? 'Task cancelled'
+    : 'Task running'
+  return {
+    title: 'Agent progress',
+    mode: '',
+    summary: '',
+    steps: [
+      {
+        id: `terminal-${status}`,
+        title,
+        status: stepStatus,
+      },
+    ],
+    completedCount: status === 'completed' ? 1 : 0,
+    totalCount: 1,
+  }
+}
+
+function createPreparingProgressSnapshot(): ProgressSnapshot {
+  return {
+    title: 'Agent progress',
+    mode: '',
+    summary: '',
+    steps: [
+      {
+        id: 'waiting-for-agent-steps',
+        title: 'Waiting for agent steps',
+        status: 'in_progress',
+      },
+    ],
+    completedCount: 0,
+    totalCount: 1,
+  }
+}
+
+function progressStartedAt(task: AgentTask): string | undefined {
+  return (
+    [...task.messages]
+      .reverse()
+      .find((message) => message.role === 'assistant' && message.status === 'running')
+      ?.createdAt ??
+    task.updatedAt ??
+    task.createdAt
+  )
+}
+
+function taskTerminalProgressStatus(task: AgentTask): ProgressTaskStatus | null {
+  const status = String(task.status).toLowerCase()
+  if (status === 'failed' || status === 'error') {
+    return 'failed'
+  }
+  if (status === 'cancelled' || status === 'canceled' || status === 'cancel') {
+    return 'cancelled'
+  }
+  if (status === 'completed' || status === 'complete' || status === 'done') {
+    return 'completed'
+  }
+  return null
+}
+
+function formatRuntimeElapsed(startedAt: string | undefined, nowMs: number): string {
+  if (!startedAt) {
+    return 'Running'
+  }
+  const startedMs = new Date(startedAt).getTime()
+  if (!Number.isFinite(startedMs)) {
+    return 'Running'
+  }
+  const elapsedSeconds = Math.max(0, Math.floor((nowMs - startedMs) / 1000))
+  if (elapsedSeconds < 60) {
+    return `${elapsedSeconds}s`
+  }
+  const minutes = Math.floor(elapsedSeconds / 60)
+  const seconds = elapsedSeconds % 60
+  if (minutes < 60) {
+    return `${minutes}m ${seconds}s`
+  }
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  return `${hours}h ${remainingMinutes}m`
+}
+
+function clearTerminalProgressTimers(
+  timersRef: MutableRefObject<number[]>,
+): void {
+  for (const timer of timersRef.current) {
+    window.clearTimeout(timer)
+  }
+  timersRef.current = []
 }
 
 function plainRecord(value: unknown): Record<string, unknown> {

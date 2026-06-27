@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::history_store::HistoryStore;
+use crate::mcp_runtime::McpRuntime;
 use crate::project_registry::ProjectRegistry;
 use crate::tool_trace::ToolTraceStore;
 use crate::vs_registry::{AppSettings, SettingsStore, VsRegistry};
@@ -14,6 +15,7 @@ pub struct AppState {
     pub vs_registry: Arc<Mutex<VsRegistry>>,
     pub traces: Arc<Mutex<ToolTraceStore>>,
     pub history: Arc<Mutex<HistoryStore>>,
+    pub mcp_runtime: Arc<tokio::sync::Mutex<McpRuntime>>,
 }
 
 impl AppState {
@@ -41,6 +43,9 @@ impl AppState {
             history: Arc::new(Mutex::new(HistoryStore::load(
                 data_dir.join("codeforge.sqlite3"),
             )?)),
+            mcp_runtime: Arc::new(tokio::sync::Mutex::new(
+                McpRuntime::load_from_default_config(),
+            )),
         })
     }
 }

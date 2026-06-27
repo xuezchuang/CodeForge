@@ -64,7 +64,7 @@ impl StreamingChatCompletionAccumulator {
                 .or_else(|| delta.get("reasoning"))
                 .and_then(Value::as_str)
             {
-                self.reasoning_content.push_str(delta_reasoning);
+                merge_streaming_text(&mut self.reasoning_content, delta_reasoning);
             }
             if let Some(delta_tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for delta_tool_call in delta_tool_calls {
@@ -124,6 +124,41 @@ impl StreamingChatCompletionAccumulator {
     }
 }
 
+fn merge_streaming_text(accumulated: &mut String, fragment: &str) {
+    if fragment.is_empty() {
+        return;
+    }
+    if accumulated.is_empty() {
+        accumulated.push_str(fragment);
+        return;
+    }
+
+    if fragment == accumulated.as_str() || accumulated.ends_with(fragment) {
+        return;
+    }
+    if fragment.starts_with(accumulated.as_str()) {
+        accumulated.clear();
+        accumulated.push_str(fragment);
+        return;
+    }
+
+    let overlap = largest_suffix_prefix_overlap(accumulated, fragment);
+    accumulated.push_str(&fragment[overlap..]);
+}
+
+fn largest_suffix_prefix_overlap(accumulated: &str, fragment: &str) -> usize {
+    let max_overlap = accumulated.len().min(fragment.len());
+    for overlap in (1..=max_overlap).rev() {
+        if !fragment.is_char_boundary(overlap) {
+            continue;
+        }
+        if accumulated.ends_with(&fragment[..overlap]) {
+            return overlap;
+        }
+    }
+    0
+}
+
 pub fn stream_error_message(error: &Value) -> String {
     error
         .get("message")
@@ -173,6 +208,45 @@ mod tests {
         assert_eq!(
             response["choices"][0]["message"]["reasoning_content"],
             json!("think hard now")
+        );
+    }
+
+    #[test]
+    fn reasoning_snapshot_frames_replace_instead_of_duplicate() {
+        let response = response_from_lines(&[
+            r#"data: {"choices":[{"delta":{"reasoning":"所有相关位置都掌握了。"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning":"所有相关位置都掌握了。媒体查询 9470-9617 范围确认。"},"finish_reason":"stop"}]}"#,
+        ]);
+
+        assert_eq!(
+            response["choices"][0]["message"]["reasoning_content"],
+            json!("所有相关位置都掌握了。媒体查询 9470-9617 范围确认。")
+        );
+    }
+
+    #[test]
+    fn reasoning_overlapping_frames_append_only_new_suffix() {
+        let response = response_from_lines(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":"媒体查询 9470-"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_content":"9470-9617 范围确认。"},"finish_reason":"stop"}]}"#,
+        ]);
+
+        assert_eq!(
+            response["choices"][0]["message"]["reasoning_content"],
+            json!("媒体查询 9470-9617 范围确认。")
+        );
+    }
+
+    #[test]
+    fn repeated_reasoning_frames_are_not_duplicated() {
+        let response = response_from_lines(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":"检查媒体查询。"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_content":"检查媒体查询。"},"finish_reason":"stop"}]}"#,
+        ]);
+
+        assert_eq!(
+            response["choices"][0]["message"]["reasoning_content"],
+            json!("检查媒体查询。")
         );
     }
 

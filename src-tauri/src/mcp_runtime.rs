@@ -4,6 +4,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -14,6 +15,11 @@ use tokio::process::Command;
 
 use crate::tool_interface::ToolOutput;
 
+pub const MCP_LIST_SERVERS_TOOL_NAME: &str = "mcp_list_servers";
+pub const MCP_CONNECT_SERVER_TOOL_NAME: &str = "mcp_connect_server";
+pub const MCP_DISCONNECT_SERVER_TOOL_NAME: &str = "mcp_disconnect_server";
+pub const MCP_LIST_TOOLS_TOOL_NAME: &str = "mcp_list_tools";
+
 const MCP_TOOL_PREFIX: &str = "mcp__";
 const MAX_TOOL_NAME_BYTES: usize = 64;
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -23,8 +29,53 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone)]
 pub struct McpRuntime {
+    config_path: Option<PathBuf>,
+    config_error: Option<String>,
+    servers: HashMap<String, McpServerState>,
+}
+
+impl std::fmt::Debug for McpRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpRuntime")
+            .field("config_path", &self.config_path)
+            .field("config_error", &self.config_error)
+            .field("server_count", &self.servers.len())
+            .field("tool_count", &self.tool_count())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct McpServerState {
+    config: McpServerConfig,
+    status: McpServerStatus,
     tools: Vec<McpToolDefinition>,
-    clients: HashMap<String, Arc<McpClient>>,
+    client: Option<Arc<McpClient>>,
+    last_error: Option<String>,
+    connected_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpServerStatus {
+    Configured,
+    Connecting,
+    Connected,
+    Failed,
+    Disabled,
+    Disconnected,
+}
+
+impl McpServerStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            McpServerStatus::Configured => "configured",
+            McpServerStatus::Connecting => "connecting",
+            McpServerStatus::Connected => "connected",
+            McpServerStatus::Failed => "failed",
+            McpServerStatus::Disabled => "disabled",
+            McpServerStatus::Disconnected => "disconnected",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +90,7 @@ pub struct McpToolDefinition {
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpToolSummary {
+    pub server_id: String,
     pub server_name: String,
     pub name: String,
     pub raw_name: String,
@@ -48,20 +100,37 @@ pub struct McpToolSummary {
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerSummary {
+    pub id: String,
     pub name: String,
     pub status: String,
     pub enabled: bool,
+    pub auto_connect: bool,
     pub required: bool,
     pub tool_count: usize,
     pub error: Option<String>,
+    pub transport: String,
+    pub url: Option<String>,
+    pub connected_at: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpInventorySummary {
     pub config_path: Option<String>,
+    pub config_error: Option<String>,
     pub servers: Vec<McpServerSummary>,
     pub tools: Vec<McpToolSummary>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerActionResult {
+    pub server_id: String,
+    pub name: String,
+    pub status: String,
+    pub tool_count: usize,
+    pub message: String,
+    pub error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -78,6 +147,8 @@ pub struct McpConfigFile {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct McpServerConfig {
+    pub name: Option<String>,
+    pub transport: Option<String>,
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
@@ -90,9 +161,12 @@ pub struct McpServerConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default)]
+    pub auto_connect: bool,
+    #[serde(default)]
     pub required: bool,
     #[serde(default)]
     pub supports_parallel_tool_calls: bool,
+    pub approval_mode: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_duration_secs")]
     pub startup_timeout_sec: Option<Duration>,
     pub startup_timeout_ms: Option<u64>,
@@ -119,146 +193,405 @@ impl McpServerEnvVar {
 }
 
 impl McpRuntime {
-    pub async fn load_from_default_config() -> Result<Option<Self>, String> {
-        let Some(config_path) = default_config_path() else {
-            return Ok(None);
-        };
-        if !config_path.exists() {
-            return Ok(None);
-        }
-        Self::load_from_path(config_path).await
-    }
-
-    pub async fn load_from_path(config_path: PathBuf) -> Result<Option<Self>, String> {
-        let config = read_config_file(&config_path)?;
-        Self::from_config(config).await
-    }
-
-    pub async fn inspect_default_config() -> Result<McpInventorySummary, String> {
+    pub fn load_from_default_config() -> Self {
         let config_path = default_config_path();
-        let Some(config_path) = config_path else {
-            return Ok(empty_inventory(None));
+        let Some(path) = config_path else {
+            return empty_runtime(None);
         };
-        if !config_path.exists() {
-            return Ok(empty_inventory(Some(
-                config_path.to_string_lossy().to_string(),
-            )));
+        if !path.exists() {
+            return empty_runtime(Some(path));
         }
-        let config = read_config_file(&config_path)?;
-        inspect_config(Some(config_path), config).await
+        match read_config_file(&path) {
+            Ok(config) => Self::from_config_with_path(Some(path), config),
+            Err(error) => Self {
+                config_path: Some(path),
+                config_error: Some(error),
+                servers: HashMap::new(),
+            },
+        }
     }
 
-    pub async fn from_config(config: McpConfigFile) -> Result<Option<Self>, String> {
-        if config.mcp_servers.is_empty() {
-            return Ok(None);
+    pub fn from_config(config: McpConfigFile) -> Self {
+        Self::from_config_with_path(None, config)
+    }
+
+    fn from_config_with_path(config_path: Option<PathBuf>, config: McpConfigFile) -> Self {
+        let servers = config
+            .mcp_servers
+            .into_iter()
+            .map(|(server_id, server)| {
+                let status = if server.enabled {
+                    McpServerStatus::Configured
+                } else {
+                    McpServerStatus::Disabled
+                };
+                (
+                    server_id,
+                    McpServerState {
+                        config: server,
+                        status,
+                        tools: Vec::new(),
+                        client: None,
+                        last_error: None,
+                        connected_at: None,
+                    },
+                )
+            })
+            .collect();
+
+        Self {
+            config_path,
+            config_error: None,
+            servers,
         }
+    }
 
-        let mut clients = HashMap::new();
-        let mut tools = Vec::new();
-        let mut used_model_tool_names = HashSet::new();
-
-        for (server_name, server) in config.mcp_servers {
-            if !server.enabled {
-                continue;
-            }
-            match connect_server(&server_name, &server).await {
-                Ok(client) => {
-                    let server_tools = match list_server_tools(&server_name, &server, &client).await
-                    {
-                        Ok(tools) => tools,
-                        Err(error) if server.required => return Err(error),
-                        Err(_error) => continue,
-                    };
-                    for tool in server_tools {
-                        let raw_tool_name = tool.name.to_string();
-                        let model_tool_name = unique_model_tool_name(
-                            &server_name,
-                            &raw_tool_name,
-                            &mut used_model_tool_names,
-                        );
-                        let definition = openai_tool_definition(&model_tool_name, &tool);
-                        tools.push(McpToolDefinition {
-                            server_name: server_name.clone(),
-                            raw_tool_name,
-                            model_tool_name,
-                            definition,
-                            supports_parallel_tool_calls: server.supports_parallel_tool_calls,
-                        });
-                    }
-                    clients.insert(server_name, Arc::new(client));
-                }
-                Err(error) if server.required => return Err(error),
-                Err(_error) => {}
-            }
+    pub fn inventory(&self) -> McpInventorySummary {
+        McpInventorySummary {
+            config_path: self
+                .config_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            config_error: self.config_error.clone(),
+            servers: self.server_summaries(),
+            tools: self.tool_summaries(),
         }
+    }
 
-        if tools.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(Self { tools, clients }))
+    pub fn server_summaries(&self) -> Vec<McpServerSummary> {
+        self.sorted_server_ids()
+            .into_iter()
+            .filter_map(|server_id| {
+                let state = self.servers.get(&server_id)?;
+                Some(McpServerSummary {
+                    id: server_id.clone(),
+                    name: server_display_name(&server_id, &state.config),
+                    status: state.status.as_str().to_string(),
+                    enabled: state.config.enabled,
+                    auto_connect: state.config.auto_connect,
+                    required: state.config.required,
+                    tool_count: state.tools.len(),
+                    error: state.last_error.clone(),
+                    transport: server_transport(&state.config),
+                    url: state.config.url.clone(),
+                    connected_at: state.connected_at.clone(),
+                })
+            })
+            .collect()
     }
 
     pub fn tool_definitions(&self) -> Vec<Value> {
-        self.tools
-            .iter()
+        self.sorted_connected_tools()
+            .into_iter()
             .map(|tool| tool.definition.clone())
             .collect()
     }
 
     pub fn tool_count(&self) -> usize {
-        self.tools.len()
+        self.servers.values().map(|server| server.tools.len()).sum()
     }
 
     pub fn tool_summaries(&self) -> Vec<McpToolSummary> {
-        self.tools
-            .iter()
-            .map(|tool| McpToolSummary {
-                server_name: tool.server_name.clone(),
-                name: tool.model_tool_name.clone(),
-                raw_name: tool.raw_tool_name.clone(),
-                description: tool
-                    .definition
-                    .get("function")
-                    .and_then(|function| function.get("description"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
+        self.sorted_connected_tools()
+            .into_iter()
+            .map(|tool| {
+                let server_name = self
+                    .servers
+                    .get(&tool.server_name)
+                    .map(|state| server_display_name(&tool.server_name, &state.config))
+                    .unwrap_or_else(|| tool.server_name.clone());
+                McpToolSummary {
+                    server_id: tool.server_name.clone(),
+                    server_name,
+                    name: tool.model_tool_name.clone(),
+                    raw_name: tool.raw_tool_name.clone(),
+                    description: tool
+                        .definition
+                        .get("function")
+                        .and_then(|function| function.get("description"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                }
             })
             .collect()
     }
 
     pub fn server_names(&self) -> Vec<String> {
-        let mut names = self.clients.keys().cloned().collect::<Vec<_>>();
-        names.sort();
-        names
+        self.sorted_server_ids()
+            .into_iter()
+            .filter(|server_id| {
+                self.servers
+                    .get(server_id)
+                    .is_some_and(|server| server.status == McpServerStatus::Connected)
+            })
+            .collect()
     }
 
     pub fn is_mcp_tool(&self, name: &str) -> bool {
-        self.tools.iter().any(|tool| tool.model_tool_name == name)
+        self.servers
+            .values()
+            .flat_map(|server| server.tools.iter())
+            .any(|tool| tool.model_tool_name == name)
     }
 
     pub fn supports_parallel_tool_calls(&self, name: &str) -> bool {
-        self.tools
-            .iter()
+        self.servers
+            .values()
+            .flat_map(|server| server.tools.iter())
             .find(|tool| tool.model_tool_name == name)
             .is_some_and(|tool| tool.supports_parallel_tool_calls)
     }
 
+    pub async fn connect_auto_connect_servers(&mut self) -> Vec<McpServerActionResult> {
+        let server_ids = self
+            .sorted_server_ids()
+            .into_iter()
+            .filter(|server_id| {
+                self.servers.get(server_id).is_some_and(|server| {
+                    server.config.enabled
+                        && server.config.auto_connect
+                        && server.status != McpServerStatus::Connected
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(server_ids.len());
+        for server_id in server_ids {
+            results.push(self.connect_server_by_id(&server_id).await);
+        }
+        results
+    }
+
+    pub async fn connect_server_by_id(&mut self, server_id: &str) -> McpServerActionResult {
+        let Some(state) = self.servers.get_mut(server_id) else {
+            return action_result(
+                server_id,
+                server_id,
+                McpServerStatus::Failed,
+                0,
+                format!("Unknown MCP server `{server_id}`"),
+                Some(format!("Unknown MCP server `{server_id}`")),
+            );
+        };
+        let display_name = server_display_name(server_id, &state.config);
+
+        if !state.config.enabled {
+            state.status = McpServerStatus::Disabled;
+            state.last_error = Some(format!("MCP server `{server_id}` is disabled"));
+            return action_result(
+                server_id,
+                &display_name,
+                McpServerStatus::Disabled,
+                0,
+                format!("MCP server `{server_id}` is disabled."),
+                state.last_error.clone(),
+            );
+        }
+
+        if state.status == McpServerStatus::Connected {
+            return action_result(
+                server_id,
+                &display_name,
+                McpServerStatus::Connected,
+                state.tools.len(),
+                "MCP server is already connected. Tools are available in model requests."
+                    .to_string(),
+                None,
+            );
+        }
+
+        let config = state.config.clone();
+        state.status = McpServerStatus::Connecting;
+        state.last_error = None;
+        state.tools.clear();
+        state.client = None;
+        state.connected_at = None;
+
+        let client = match connect_server(server_id, &config).await {
+            Ok(client) => client,
+            Err(error) => {
+                self.mark_server_failed(server_id, &error);
+                return action_result(
+                    server_id,
+                    &display_name,
+                    McpServerStatus::Failed,
+                    0,
+                    format!("MCP server `{server_id}` failed to connect."),
+                    Some(error),
+                );
+            }
+        };
+
+        let server_tools = match list_server_tools(server_id, &config, &client).await {
+            Ok(tools) => tools,
+            Err(error) => {
+                self.mark_server_failed(server_id, &error);
+                return action_result(
+                    server_id,
+                    &display_name,
+                    McpServerStatus::Failed,
+                    0,
+                    format!("MCP server `{server_id}` connected but tools/list failed."),
+                    Some(error),
+                );
+            }
+        };
+
+        let mut used_model_tool_names = self.used_model_tool_names(Some(server_id));
+        let definitions = server_tools
+            .into_iter()
+            .map(|tool| {
+                let raw_tool_name = tool.name.to_string();
+                let model_tool_name =
+                    unique_model_tool_name(server_id, &raw_tool_name, &mut used_model_tool_names);
+                let definition = openai_tool_definition(&model_tool_name, &tool);
+                McpToolDefinition {
+                    server_name: server_id.to_string(),
+                    raw_tool_name,
+                    model_tool_name,
+                    definition,
+                    supports_parallel_tool_calls: config.supports_parallel_tool_calls,
+                }
+            })
+            .collect::<Vec<_>>();
+        let tool_count = definitions.len();
+
+        if let Some(state) = self.servers.get_mut(server_id) {
+            state.status = McpServerStatus::Connected;
+            state.tools = definitions;
+            state.client = Some(Arc::new(client));
+            state.last_error = None;
+            state.connected_at = Some(Utc::now().to_rfc3339());
+        }
+
+        action_result(
+            server_id,
+            &display_name,
+            McpServerStatus::Connected,
+            tool_count,
+            "MCP server connected. Tools will be available from the next model request."
+                .to_string(),
+            None,
+        )
+    }
+
+    pub fn disconnect_server_by_id(&mut self, server_id: &str) -> McpServerActionResult {
+        let Some(state) = self.servers.get_mut(server_id) else {
+            return action_result(
+                server_id,
+                server_id,
+                McpServerStatus::Failed,
+                0,
+                format!("Unknown MCP server `{server_id}`"),
+                Some(format!("Unknown MCP server `{server_id}`")),
+            );
+        };
+        let display_name = server_display_name(server_id, &state.config);
+        state.tools.clear();
+        state.client = None;
+        state.connected_at = None;
+        state.last_error = None;
+        state.status = if state.config.enabled {
+            McpServerStatus::Disconnected
+        } else {
+            McpServerStatus::Disabled
+        };
+        action_result(
+            server_id,
+            &display_name,
+            state.status,
+            0,
+            "MCP server disconnected. Tools have been removed from future model requests."
+                .to_string(),
+            None,
+        )
+    }
+
+    pub async fn execute_management_tool(&mut self, name: &str, arguments: &Value) -> ToolOutput {
+        let started = Instant::now();
+        match name {
+            MCP_LIST_SERVERS_TOOL_NAME => {
+                let output = json!({ "servers": self.server_summaries() });
+                ToolOutput::ok_with_summary(
+                    output,
+                    started.elapsed().as_millis() as u64,
+                    format!("Listed {} MCP server(s)", self.servers.len()),
+                )
+            }
+            MCP_CONNECT_SERVER_TOOL_NAME => {
+                let Some(server_id) = server_id_argument(arguments) else {
+                    return ToolOutput::error(
+                        "mcp_connect_server requires server_id".to_string(),
+                        started.elapsed().as_millis() as u64,
+                    );
+                };
+                let result = self.connect_server_by_id(server_id).await;
+                let summary = result.message.clone();
+                let output = serde_json::to_value(result).unwrap_or_else(|_| json!({}));
+                ToolOutput::ok_with_summary(output, started.elapsed().as_millis() as u64, summary)
+            }
+            MCP_DISCONNECT_SERVER_TOOL_NAME => {
+                let Some(server_id) = server_id_argument(arguments) else {
+                    return ToolOutput::error(
+                        "mcp_disconnect_server requires server_id".to_string(),
+                        started.elapsed().as_millis() as u64,
+                    );
+                };
+                let result = self.disconnect_server_by_id(server_id);
+                let summary = result.message.clone();
+                let output = serde_json::to_value(result).unwrap_or_else(|_| json!({}));
+                ToolOutput::ok_with_summary(output, started.elapsed().as_millis() as u64, summary)
+            }
+            MCP_LIST_TOOLS_TOOL_NAME => {
+                let Some(server_id) = server_id_argument(arguments) else {
+                    return ToolOutput::error(
+                        "mcp_list_tools requires server_id".to_string(),
+                        started.elapsed().as_millis() as u64,
+                    );
+                };
+                let Some(state) = self.servers.get(server_id) else {
+                    return ToolOutput::error(
+                        format!("Unknown MCP server `{server_id}`"),
+                        started.elapsed().as_millis() as u64,
+                    );
+                };
+                let tools = state
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "name": tool.model_tool_name,
+                            "rawName": tool.raw_tool_name,
+                            "description": tool.definition
+                                .get("function")
+                                .and_then(|function| function.get("description"))
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let output = json!({
+                    "server_id": server_id,
+                    "status": state.status.as_str(),
+                    "tools": tools,
+                });
+                ToolOutput::ok_with_summary(
+                    output,
+                    started.elapsed().as_millis() as u64,
+                    format!(
+                        "MCP server `{server_id}` has {} registered tool(s)",
+                        state.tools.len()
+                    ),
+                )
+            }
+            _ => ToolOutput::error(format!("Unknown MCP management tool: {name}"), 0),
+        }
+    }
+
     pub async fn call_tool(&self, model_tool_name: &str, arguments: &Value) -> ToolOutput {
         let started = Instant::now();
-        let Some(tool) = self
-            .tools
-            .iter()
-            .find(|tool| tool.model_tool_name == model_tool_name)
-        else {
+        let Some((tool, client)) = self.lookup_tool_and_client(model_tool_name) else {
             return ToolOutput::error(format!("Unknown MCP tool: {model_tool_name}"), 0);
-        };
-        let Some(client) = self.clients.get(&tool.server_name).cloned() else {
-            return ToolOutput::error(
-                format!("MCP server `{}` is not connected", tool.server_name),
-                0,
-            );
         };
 
         let arguments = match arguments {
@@ -297,6 +630,76 @@ impl McpRuntime {
             Err(_) => ToolOutput::timeout(elapsed_ms),
         }
     }
+
+    fn lookup_tool_and_client(
+        &self,
+        model_tool_name: &str,
+    ) -> Option<(McpToolDefinition, Arc<McpClient>)> {
+        for server in self.servers.values() {
+            let Some(client) = server.client.as_ref() else {
+                continue;
+            };
+            if let Some(tool) = server
+                .tools
+                .iter()
+                .find(|tool| tool.model_tool_name == model_tool_name)
+            {
+                return Some((tool.clone(), client.clone()));
+            }
+        }
+        None
+    }
+
+    fn mark_server_failed(&mut self, server_id: &str, error: &str) {
+        if let Some(state) = self.servers.get_mut(server_id) {
+            state.status = McpServerStatus::Failed;
+            state.tools.clear();
+            state.client = None;
+            state.connected_at = None;
+            state.last_error = Some(error.to_string());
+        }
+    }
+
+    fn used_model_tool_names(&self, except_server_id: Option<&str>) -> HashSet<String> {
+        self.servers
+            .iter()
+            .filter(|(server_id, _)| except_server_id != Some(server_id.as_str()))
+            .flat_map(|(_, server)| server.tools.iter())
+            .map(|tool| tool.model_tool_name.clone())
+            .collect()
+    }
+
+    fn sorted_server_ids(&self) -> Vec<String> {
+        let mut ids = self.servers.keys().cloned().collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    fn sorted_connected_tools(&self) -> Vec<&McpToolDefinition> {
+        let mut tools = self
+            .sorted_server_ids()
+            .into_iter()
+            .filter_map(|server_id| self.servers.get(&server_id))
+            .filter(|server| server.status == McpServerStatus::Connected)
+            .flat_map(|server| server.tools.iter())
+            .collect::<Vec<_>>();
+        tools.sort_by(|left, right| {
+            left.model_tool_name
+                .cmp(&right.model_tool_name)
+                .then(left.raw_tool_name.cmp(&right.raw_tool_name))
+        });
+        tools
+    }
+}
+
+pub fn is_mcp_management_tool(name: &str) -> bool {
+    matches!(
+        name,
+        MCP_LIST_SERVERS_TOOL_NAME
+            | MCP_CONNECT_SERVER_TOOL_NAME
+            | MCP_DISCONNECT_SERVER_TOOL_NAME
+            | MCP_LIST_TOOLS_TOOL_NAME
+    )
 }
 
 async fn connect_server(server_name: &str, server: &McpServerConfig) -> Result<McpClient, String> {
@@ -513,94 +916,69 @@ fn mcp_result_summary(server_name: &str, raw_tool_name: &str, output: &Value) ->
     format!("MCP {server_name}/{raw_tool_name} returned {content_count} content item(s)")
 }
 
-async fn inspect_config(
-    config_path: Option<PathBuf>,
-    config: McpConfigFile,
-) -> Result<McpInventorySummary, String> {
-    let mut server_entries = config.mcp_servers.into_iter().collect::<Vec<_>>();
-    server_entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut servers = Vec::with_capacity(server_entries.len());
-    let mut tools = Vec::new();
-    let mut used_model_tool_names = HashSet::new();
-
-    for (server_name, server) in server_entries {
-        if !server.enabled {
-            servers.push(McpServerSummary {
-                name: server_name,
-                status: "disabled".to_string(),
-                enabled: false,
-                required: server.required,
-                tool_count: 0,
-                error: None,
-            });
-            continue;
-        }
-
-        let client = match connect_server(&server_name, &server).await {
-            Ok(client) => client,
-            Err(error) => {
-                servers.push(McpServerSummary {
-                    name: server_name,
-                    status: "failed".to_string(),
-                    enabled: true,
-                    required: server.required,
-                    tool_count: 0,
-                    error: Some(error),
-                });
-                continue;
-            }
-        };
-
-        let server_tools = match list_server_tools(&server_name, &server, &client).await {
-            Ok(tools) => tools,
-            Err(error) => {
-                servers.push(McpServerSummary {
-                    name: server_name,
-                    status: "failed".to_string(),
-                    enabled: true,
-                    required: server.required,
-                    tool_count: 0,
-                    error: Some(error),
-                });
-                continue;
-            }
-        };
-
-        let tool_count = server_tools.len();
-        for tool in server_tools {
-            let raw_tool_name = tool.name.to_string();
-            let model_tool_name =
-                unique_model_tool_name(&server_name, &raw_tool_name, &mut used_model_tool_names);
-            tools.push(McpToolSummary {
-                server_name: server_name.clone(),
-                name: model_tool_name,
-                raw_name: raw_tool_name,
-                description: tool.description.as_deref().unwrap_or("").to_string(),
-            });
-        }
-        servers.push(McpServerSummary {
-            name: server_name,
-            status: "ready".to_string(),
-            enabled: true,
-            required: server.required,
-            tool_count,
-            error: None,
-        });
+fn action_result(
+    server_id: &str,
+    name: &str,
+    status: McpServerStatus,
+    tool_count: usize,
+    message: String,
+    error: Option<String>,
+) -> McpServerActionResult {
+    McpServerActionResult {
+        server_id: server_id.to_string(),
+        name: name.to_string(),
+        status: status.as_str().to_string(),
+        tool_count,
+        message,
+        error,
     }
-
-    Ok(McpInventorySummary {
-        config_path: config_path.map(|path| path.to_string_lossy().to_string()),
-        servers,
-        tools,
-    })
 }
 
-fn empty_inventory(config_path: Option<String>) -> McpInventorySummary {
-    McpInventorySummary {
+fn server_id_argument(arguments: &Value) -> Option<&str> {
+    arguments
+        .get("server_id")
+        .or_else(|| arguments.get("serverId"))
+        .or_else(|| arguments.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn server_display_name(server_id: &str, config: &McpServerConfig) -> String {
+    config
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(server_id)
+        .to_string()
+}
+
+fn server_transport(config: &McpServerConfig) -> String {
+    if let Some(transport) = config
+        .transport
+        .as_deref()
+        .map(str::trim)
+        .filter(|transport| !transport.is_empty())
+    {
+        return transport.to_string();
+    }
+    if config
+        .url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        "http".to_string()
+    } else {
+        "stdio".to_string()
+    }
+}
+
+fn empty_runtime(config_path: Option<PathBuf>) -> McpRuntime {
+    McpRuntime {
         config_path,
-        servers: Vec::new(),
-        tools: Vec::new(),
+        config_error: None,
+        servers: HashMap::new(),
     }
 }
 
@@ -641,6 +1019,29 @@ where
 mod tests {
     use super::*;
 
+    fn server_config(command: Option<&str>, url: Option<String>) -> McpServerConfig {
+        McpServerConfig {
+            name: None,
+            transport: None,
+            command: command.map(str::to_string),
+            args: Vec::new(),
+            env: HashMap::new(),
+            env_vars: Vec::new(),
+            cwd: None,
+            url,
+            enabled: true,
+            auto_connect: false,
+            required: false,
+            supports_parallel_tool_calls: false,
+            approval_mode: None,
+            startup_timeout_sec: None,
+            startup_timeout_ms: None,
+            tool_timeout_sec: None,
+            enabled_tools: None,
+            disabled_tools: None,
+        }
+    }
+
     #[test]
     fn sanitize_tool_names_use_mcp_prefix_and_safe_chars() {
         let mut used = HashSet::new();
@@ -665,20 +1066,9 @@ mod tests {
     #[test]
     fn disabled_tools_are_not_enabled_by_filter() {
         let config = McpServerConfig {
-            command: Some("dummy".to_string()),
-            args: Vec::new(),
-            env: HashMap::new(),
-            env_vars: Vec::new(),
-            cwd: None,
-            url: None,
-            enabled: true,
-            required: false,
-            supports_parallel_tool_calls: false,
-            startup_timeout_sec: None,
-            startup_timeout_ms: None,
-            tool_timeout_sec: None,
             enabled_tools: Some(vec!["allowed".to_string()]),
             disabled_tools: Some(vec!["blocked".to_string()]),
+            ..server_config(Some("dummy"), None)
         };
 
         assert!(config
@@ -698,24 +1088,32 @@ mod tests {
         let config: McpConfigFile = toml_edit::de::from_str(
             r#"
             [mcp_servers.ue]
+            name = "Unreal Engine MCP"
+            transport = "stdio"
             command = "node"
             args = ["ue-mcp.js"]
             startup_timeout_sec = 0.25
             env_vars = ["UE_PROJECT_ROOT", { name = "UE_PLUGIN_PATH", source = "local" }]
             startup_timeout_ms = 500
             tool_timeout_sec = 120.5
+            auto_connect = false
+            approval_mode = "prompt"
             supports_parallel_tool_calls = false
             "#,
         )
         .unwrap();
 
         let ue = config.mcp_servers.get("ue").unwrap();
+        assert_eq!(ue.name.as_deref(), Some("Unreal Engine MCP"));
+        assert_eq!(ue.transport.as_deref(), Some("stdio"));
         assert_eq!(ue.command.as_deref(), Some("node"));
         assert_eq!(ue.args, vec!["ue-mcp.js"]);
         assert_eq!(ue.env_vars.len(), 2);
         assert_eq!(ue.startup_timeout_sec, Some(Duration::from_millis(250)));
         assert_eq!(ue.startup_timeout_ms, Some(500));
         assert_eq!(ue.tool_timeout_sec, Some(Duration::from_millis(120_500)));
+        assert_eq!(ue.approval_mode.as_deref(), Some("prompt"));
+        assert!(!ue.auto_connect);
         assert!(!ue.supports_parallel_tool_calls);
     }
 
@@ -724,6 +1122,7 @@ mod tests {
         let config: McpConfigFile = toml_edit::de::from_str(
             r#"
             [mcp_servers.unreal-mcp]
+            transport = "http"
             url = "http://127.0.0.1:8000/mcp"
             startup_timeout_sec = 5
             tool_timeout_sec = 30
@@ -732,6 +1131,7 @@ mod tests {
         .unwrap();
 
         let ue = config.mcp_servers.get("unreal-mcp").unwrap();
+        assert_eq!(ue.transport.as_deref(), Some("http"));
         assert_eq!(ue.url.as_deref(), Some("http://127.0.0.1:8000/mcp"));
         assert!(ue.command.is_none());
         assert_eq!(ue.startup_timeout_sec, Some(Duration::from_secs(5)));
@@ -739,66 +1139,37 @@ mod tests {
     }
 
     #[test]
-    fn inspect_config_reports_disabled_and_failed_servers() {
+    fn inventory_reports_configured_disabled_and_no_eager_connect() {
         let config = McpConfigFile {
             mcp_servers: HashMap::from([
                 (
                     "disabled".to_string(),
                     McpServerConfig {
-                        command: Some("dummy".to_string()),
-                        args: Vec::new(),
-                        env: HashMap::new(),
-                        env_vars: Vec::new(),
-                        cwd: None,
-                        url: None,
                         enabled: false,
-                        required: false,
-                        supports_parallel_tool_calls: false,
-                        startup_timeout_sec: None,
-                        startup_timeout_ms: None,
-                        tool_timeout_sec: None,
-                        enabled_tools: None,
-                        disabled_tools: None,
+                        ..server_config(Some("dummy"), None)
                     },
                 ),
                 (
-                    "missing".to_string(),
+                    "configured".to_string(),
                     McpServerConfig {
-                        command: None,
-                        args: Vec::new(),
-                        env: HashMap::new(),
-                        env_vars: Vec::new(),
-                        cwd: None,
-                        url: None,
-                        enabled: true,
                         required: true,
-                        supports_parallel_tool_calls: false,
-                        startup_timeout_sec: None,
-                        startup_timeout_ms: None,
-                        tool_timeout_sec: None,
-                        enabled_tools: None,
-                        disabled_tools: None,
+                        ..server_config(None, None)
                     },
                 ),
             ]),
         };
 
-        let inventory = tauri::async_runtime::block_on(inspect_config(None, config)).unwrap();
+        let runtime = McpRuntime::from_config(config);
+        let inventory = runtime.inventory();
         assert_eq!(inventory.tools.len(), 0);
-        assert_eq!(inventory.servers[0].name, "disabled");
-        assert_eq!(inventory.servers[0].status, "disabled");
-        assert_eq!(inventory.servers[1].name, "missing");
-        assert_eq!(inventory.servers[1].status, "failed");
-        assert!(inventory.servers[1].required);
-        assert!(inventory.servers[1]
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("missing command"));
+        assert_eq!(inventory.servers[0].id, "configured");
+        assert_eq!(inventory.servers[0].status, "configured");
+        assert_eq!(inventory.servers[1].id, "disabled");
+        assert_eq!(inventory.servers[1].status, "disabled");
     }
 
     #[test]
-    fn stdio_smoke_server_lists_and_calls_tool() {
+    fn stdio_smoke_server_connects_lists_and_calls_tool() {
         if std::process::Command::new("node")
             .arg("--version")
             .output()
@@ -819,25 +1190,18 @@ mod tests {
                 McpServerConfig {
                     command: Some("node".to_string()),
                     args: vec![smoke_server.to_string_lossy().to_string()],
-                    env: HashMap::new(),
-                    env_vars: Vec::new(),
-                    cwd: None,
-                    url: None,
-                    enabled: true,
                     required: true,
-                    supports_parallel_tool_calls: false,
                     startup_timeout_sec: Some(Duration::from_secs(5)),
-                    startup_timeout_ms: None,
                     tool_timeout_sec: Some(Duration::from_secs(5)),
-                    enabled_tools: None,
-                    disabled_tools: None,
+                    ..server_config(None, None)
                 },
             )]),
         };
 
-        let runtime = tauri::async_runtime::block_on(McpRuntime::from_config(config))
-            .unwrap()
-            .expect("smoke runtime should expose tools");
+        let mut runtime = McpRuntime::from_config(config);
+        assert_eq!(runtime.tool_count(), 0);
+        let connect = tauri::async_runtime::block_on(runtime.connect_server_by_id("smoke"));
+        assert_eq!(connect.status, "connected");
         assert_eq!(runtime.server_names(), vec!["smoke".to_string()]);
         assert_eq!(runtime.tool_count(), 1);
         let tool_name = runtime.tool_summaries()[0].name.clone();
@@ -856,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn http_smoke_server_lists_and_calls_tool() {
+    fn http_smoke_server_connects_lists_and_calls_tool() {
         if std::process::Command::new("node")
             .arg("--version")
             .output()
@@ -887,27 +1251,19 @@ mod tests {
             mcp_servers: HashMap::from([(
                 "ue".to_string(),
                 McpServerConfig {
-                    command: None,
-                    args: Vec::new(),
-                    env: HashMap::new(),
-                    env_vars: Vec::new(),
-                    cwd: None,
                     url: Some(format!("http://127.0.0.1:{port}/mcp")),
-                    enabled: true,
                     required: true,
-                    supports_parallel_tool_calls: false,
                     startup_timeout_sec: Some(Duration::from_secs(5)),
-                    startup_timeout_ms: None,
                     tool_timeout_sec: Some(Duration::from_secs(5)),
-                    enabled_tools: None,
-                    disabled_tools: None,
+                    ..server_config(None, None)
                 },
             )]),
         };
 
-        let runtime = tauri::async_runtime::block_on(McpRuntime::from_config(config))
-            .unwrap()
-            .expect("HTTP smoke runtime should expose tools");
+        let mut runtime = McpRuntime::from_config(config);
+        assert_eq!(runtime.tool_count(), 0);
+        let connect = tauri::async_runtime::block_on(runtime.connect_server_by_id("ue"));
+        assert_eq!(connect.status, "connected");
         assert_eq!(runtime.server_names(), vec!["ue".to_string()]);
         assert_eq!(runtime.tool_count(), 1);
         let tool_name = runtime.tool_summaries()[0].name.clone();
@@ -926,6 +1282,26 @@ mod tests {
             .and_then(|value| value.get("echoed"))
             .and_then(Value::as_str)
             .is_some_and(|value| value == "ue"));
+    }
+
+    #[test]
+    fn management_tools_connect_and_list_next_round_message() {
+        let config = McpConfigFile {
+            mcp_servers: HashMap::from([("missing".to_string(), server_config(None, None))]),
+        };
+        let mut runtime = McpRuntime::from_config(config);
+        let output = tauri::async_runtime::block_on(runtime.execute_management_tool(
+            MCP_CONNECT_SERVER_TOOL_NAME,
+            &json!({ "server_id": "missing" }),
+        ));
+        assert!(output.is_ok());
+        let value = output.output.unwrap();
+        assert_eq!(value["status"], json!("failed"));
+        assert!(value["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to connect"));
+        assert_eq!(runtime.inventory().servers[0].status, "failed");
     }
 
     fn wait_for_tcp_port(port: u16) {

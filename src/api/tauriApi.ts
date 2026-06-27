@@ -26,7 +26,14 @@ export interface ToolDefinitionSummary {
   description: string
 }
 
+export interface CodeforgeSkillSummary {
+  name: string
+  description: string
+  path: string
+}
+
 export interface McpToolDefinitionSummary {
+  serverId: string
   serverName: string
   name: string
   rawName: string
@@ -34,18 +41,33 @@ export interface McpToolDefinitionSummary {
 }
 
 export interface McpServerSummary {
+  id: string
   name: string
   status: string
   enabled: boolean
+  autoConnect: boolean
   required: boolean
   toolCount: number
   error: string | null
+  transport: string
+  url: string | null
+  connectedAt: string | null
 }
 
 export interface McpInventorySummary {
   configPath: string | null
+  configError: string | null
   servers: McpServerSummary[]
   tools: McpToolDefinitionSummary[]
+}
+
+export interface McpServerActionResult {
+  serverId: string
+  name: string
+  status: string
+  toolCount: number
+  message: string
+  error: string | null
 }
 
 export interface ToolOutput {
@@ -122,12 +144,28 @@ export function listTools(): Promise<ToolDefinitionSummary[]> {
   return call<ToolDefinitionSummary[]>('list_tools')
 }
 
+export function listSkills(projectId: string): Promise<CodeforgeSkillSummary[]> {
+  return call<CodeforgeSkillSummary[]>('list_skills', { projectId })
+}
+
 export function listMcpTools(): Promise<McpToolDefinitionSummary[]> {
   return call<McpToolDefinitionSummary[]>('list_mcp_tools')
 }
 
 export function inspectMcpInventory(): Promise<McpInventorySummary> {
   return call<McpInventorySummary>('inspect_mcp_inventory')
+}
+
+export function connectMcpServer(serverId: string): Promise<McpServerActionResult> {
+  return call<McpServerActionResult>('connect_mcp_server', {
+    input: { serverId },
+  })
+}
+
+export function disconnectMcpServer(serverId: string): Promise<McpServerActionResult> {
+  return call<McpServerActionResult>('disconnect_mcp_server', {
+    input: { serverId },
+  })
 }
 
 export function callMcpTool(

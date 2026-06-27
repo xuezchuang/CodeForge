@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -8,6 +9,7 @@ use reqwest::header::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::agent::decision::{
@@ -54,6 +56,10 @@ const CODEFORGE_DEVELOPER_INSTRUCTION_FILES: [&str; 4] = [
 ];
 const AGENTS_USER_INSTRUCTION_FILES: [&str; 1] = ["AGENTS.md"];
 const AI_CONTEXT_INDEX_FILE: &str = "doc/ai-context/README.md";
+const CODEFORGE_SKILLS_DIR: &str = ".codeforge/skills";
+const MAX_CODEFORGE_SKILLS: usize = 32;
+const MAX_ACTIVE_SKILLS: usize = 3;
+const MAX_ACTIVE_SKILL_CONTENT_CHARS: usize = 24_000;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +100,10 @@ pub struct AgentRunInput {
     /// not need write-back can leave this as None and pass goal instead.
     #[serde(default, skip)]
     pub goal_slot: Option<Box<Option<GoalState>>>,
+    #[serde(default, skip)]
+    pub mcp_runtime: Option<Arc<Mutex<McpRuntime>>>,
+    #[serde(default, skip)]
+    pub write_scope: Option<tool_registry::WriteScope>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -189,6 +199,22 @@ struct PromptLayers {
     user_context: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeforgeSkillSummary {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug)]
+struct CodeforgeSkill {
+    name: String,
+    description: String,
+    path: PathBuf,
+    content: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentIntentMode {
     Default,
@@ -262,6 +288,8 @@ struct OpenAiToolLoopState {
     request: Option<Value>,
     completion: Option<ChatCompletionResult>,
     tool_calls: Vec<OpenAiToolCall>,
+    tool_name_map: ToolNameMap,
+    model_tools: Vec<Value>,
     next_tool_choice: Option<Value>,
     empty_tool_call_response_retries: usize,
     required_tool_call_response_retries: usize,
@@ -291,6 +319,8 @@ impl OpenAiToolLoopState {
             request: None,
             completion: None,
             tool_calls: Vec::new(),
+            tool_name_map: ToolNameMap::default(),
+            model_tools: Vec::new(),
             next_tool_choice: require_tool_call.then(|| json!("required")),
             empty_tool_call_response_retries: 0,
             required_tool_call_response_retries: 0,
@@ -533,8 +563,9 @@ pub async fn run_agent(
         classify_intent_mode(&input.user_prompt)
     };
     let intent_mode = intent_classification.mode;
-    let effective_read_only =
-        input.read_only || (!init_command && intent_mode.enforces_read_only());
+    let intent_forces_read_only =
+        !init_command && input.subagent_depth == 0 && intent_mode.enforces_read_only();
+    let effective_read_only = input.read_only || intent_forces_read_only;
     let mut conversation_messages = if init_command {
         vec![chat_message("user", ai_context_init_prompt(project))]
     } else {
@@ -664,7 +695,11 @@ pub async fn run_agent(
     let auto_readonly_subagents = input.subagent_depth == 0
         && !input.cli_mode
         && intent_mode.allows_auto_readonly_subagents();
-    let mut subagent_manager = if auto_readonly_subagents {
+    let subagent_tools_enabled = input.subagent_depth == 0
+        && !input.cli_mode
+        && !init_command
+        && (auto_readonly_subagents || !effective_read_only);
+    let mut subagent_manager = if subagent_tools_enabled {
         Some(SubagentManager::new(
             task_id.clone(),
             project.clone(),
@@ -676,6 +711,8 @@ pub async fn run_agent(
                 .map(|credential| credential.id.clone()),
             Some(selected.model_id.clone()),
             selected.reasoning_effort.clone(),
+            input.mcp_runtime.clone(),
+            !effective_read_only,
         ))
     } else {
         None
@@ -767,79 +804,71 @@ pub async fn run_agent(
     }
 
     if supports_openai_tool_calls(&selected) {
-        let mcp_runtime = match tokio::time::timeout(
-            MCP_AGENT_STARTUP_BUDGET,
-            McpRuntime::load_from_default_config(),
-        )
-        .await
-        {
-            Ok(Ok(runtime)) => runtime,
-            Ok(Err(error)) => {
-                push_trace(
-                    &mut traces,
-                    trace(
-                        &task_id,
-                        step_index,
-                        TraceEventType::SystemEvent,
-                        None,
-                        "mcp_startup skipped",
-                        None,
-                        Some(json!({ "error": error })),
-                        Some("MCP startup failed; continuing without MCP tools".to_string()),
-                        TraceStatus::Warning,
-                        0,
-                    ),
-                    &mut on_trace,
-                );
-                step_index += 1;
-                None
-            }
-            Err(_) => {
-                push_trace(
-                    &mut traces,
-                    trace(
-                        &task_id,
-                        step_index,
-                        TraceEventType::SystemEvent,
-                        None,
-                        "mcp_startup skipped",
-                        None,
-                        Some(json!({ "timeoutMs": MCP_AGENT_STARTUP_BUDGET.as_millis() })),
-                        Some("MCP startup timed out; continuing without MCP tools".to_string()),
-                        TraceStatus::Warning,
-                        0,
-                    ),
-                    &mut on_trace,
-                );
-                step_index += 1;
-                None
-            }
-        };
+        let mcp_runtime = input.mcp_runtime.clone();
         if let Some(runtime) = mcp_runtime.as_ref() {
-            push_trace(
-                &mut traces,
-                trace(
-                    &task_id,
-                    step_index,
-                    TraceEventType::SystemEvent,
-                    None,
-                    "mcp_startup",
-                    None,
-                    Some(json!({
-                        "servers": runtime.server_names(),
-                        "toolCount": runtime.tool_count(),
-                    })),
-                    Some(format!(
-                        "MCP ready: {} tool(s) from {} server(s)",
-                        runtime.tool_count(),
-                        runtime.server_names().len()
-                    )),
-                    TraceStatus::Success,
-                    0,
-                ),
-                &mut on_trace,
-            );
-            step_index += 1;
+            match tokio::time::timeout(MCP_AGENT_STARTUP_BUDGET, async {
+                let mut runtime = runtime.lock().await;
+                runtime.connect_auto_connect_servers().await
+            })
+            .await
+            {
+                Ok(results) if !results.is_empty() => {
+                    let connected_count = results
+                        .iter()
+                        .filter(|result| result.status == "connected")
+                        .count();
+                    let failed_count = results
+                        .iter()
+                        .filter(|result| result.status == "failed")
+                        .count();
+                    push_trace(
+                        &mut traces,
+                        trace(
+                            &task_id,
+                            step_index,
+                            TraceEventType::SystemEvent,
+                            None,
+                            "mcp_auto_connect",
+                            Some(json!({ "timeoutMs": MCP_AGENT_STARTUP_BUDGET.as_millis() })),
+                            Some(json!({ "results": results })),
+                            Some(format!(
+                                "MCP auto-connect completed: {connected_count} connected, {failed_count} failed"
+                            )),
+                            if failed_count > 0 {
+                                TraceStatus::Warning
+                            } else {
+                                TraceStatus::Success
+                            },
+                            0,
+                        ),
+                        &mut on_trace,
+                    );
+                    step_index += 1;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    push_trace(
+                        &mut traces,
+                        trace(
+                            &task_id,
+                            step_index,
+                            TraceEventType::SystemEvent,
+                            None,
+                            "mcp_auto_connect skipped",
+                            None,
+                            Some(json!({ "timeoutMs": MCP_AGENT_STARTUP_BUDGET.as_millis() })),
+                            Some(
+                                "MCP auto-connect timed out; continuing with currently connected MCP tools"
+                                    .to_string(),
+                            ),
+                            TraceStatus::Warning,
+                            0,
+                        ),
+                        &mut on_trace,
+                    );
+                    step_index += 1;
+                }
+            }
         }
         let require_read_tool_call =
             should_require_local_read_tool_call(&conversation_messages, &input.user_prompt);
@@ -864,20 +893,18 @@ pub async fn run_agent(
             assume_yes: input.assume_yes,
             cli_mode: input.cli_mode,
             goal: input.goal_slot.as_deref_mut(),
-            mcp_runtime: mcp_runtime.as_ref(),
+            mcp_runtime,
+            write_scope: input.write_scope.as_ref(),
         };
-        let tools = openai_tool_definitions(
-            &selected,
-            &tool_context,
-            effective_read_only,
-            auto_readonly_subagents,
-        );
         run_openai_tool_agent_loop(
             &task_id,
             &selected,
             &mut tool_context,
             initial_messages,
-            tools,
+            OpenAiToolSource::Agent {
+                read_only: effective_read_only,
+                include_agent_tools: subagent_tools_enabled,
+            },
             &mut traces,
             &mut step_index,
             DEFAULT_MAX_TOOL_ROUNDS,
@@ -1021,13 +1048,14 @@ pub async fn run_tool_call_test(
         cli_mode: false,
         goal: None,
         mcp_runtime: None,
+        write_scope: None,
     };
     run_openai_tool_agent_loop(
         &task_id,
         &selected,
         &mut tool_context,
         initial_messages,
-        tool_registry::tool_call_test_definitions(),
+        OpenAiToolSource::Static(tool_registry::tool_call_test_definitions()),
         &mut traces,
         &mut step_index,
         DEFAULT_MAX_TOOL_ROUNDS,
@@ -1323,12 +1351,20 @@ fn estimate_message_tokens(message: &ChatMessage) -> usize {
     role_tokens + content_tokens + attachment_tokens + 4
 }
 
+enum OpenAiToolSource {
+    Static(Vec<Value>),
+    Agent {
+        read_only: bool,
+        include_agent_tools: bool,
+    },
+}
+
 async fn run_openai_tool_agent_loop(
     task_id: &str,
     selected: &SelectedModel,
     tool_context: &mut ToolExecutionContext<'_>,
     mut messages: Vec<Value>,
-    tools: Vec<Value>,
+    tool_source: OpenAiToolSource,
     traces: &mut Vec<ToolTraceEvent>,
     step_index: &mut u32,
     max_tool_rounds: usize,
@@ -1337,16 +1373,17 @@ async fn run_openai_tool_agent_loop(
     on_trace: &mut (impl FnMut(&ToolTraceEvent) + Send),
 ) -> Result<(), String> {
     let mut loop_state = OpenAiToolLoopState::new(task_id, *step_index, require_tool_call);
-    let tool_name_map = ToolNameMap::from_tools(&tools);
-    let model_tools = tool_name_map.tools_for_model(&tools);
 
     while !loop_state.state().is_terminal() {
         match loop_state.state() {
             AgentRunState::PrepareModelRequest => {
+                let tools = openai_tool_definitions(selected, tool_context, &tool_source).await;
+                loop_state.tool_name_map = ToolNameMap::from_tools(&tools);
+                loop_state.model_tools = loop_state.tool_name_map.tools_for_model(&tools);
                 let request = build_chat_completion_request_with_tool_choice(
                     selected,
                     messages.clone(),
-                    Some(model_tools.clone()),
+                    Some(loop_state.model_tools.clone()),
                     loop_state.next_tool_choice.take(),
                 );
                 let request_title = format!("llm_request:{}", loop_state.round_index + 1);
@@ -1505,7 +1542,7 @@ async fn run_openai_tool_agent_loop(
                     ModelResponseDecision::RetryEmptyToolCall => {
                         let retry_tool_choice = empty_tool_call_retry_tool_choice(
                             &completion.response_body,
-                            &model_tools,
+                            &loop_state.model_tools,
                         );
                         push_empty_tool_call_response_trace(
                             task_id,
@@ -1557,8 +1594,9 @@ async fn run_openai_tool_agent_loop(
                         loop_state.transition(AgentRunState::Finalize, "no_tool_calls");
                     }
                     ModelResponseDecision::RequestBudgetFinal => {
-                        let requested_tool_names =
-                            tool_name_map.tool_call_names(&loop_state.tool_calls);
+                        let requested_tool_names = loop_state
+                            .tool_name_map
+                            .tool_call_names(&loop_state.tool_calls);
                         let requested_tool_names_text = requested_tool_names.join(", ");
                         let requested_tool_count = loop_state.tool_calls.len();
                         push_trace(
@@ -1648,7 +1686,9 @@ async fn run_openai_tool_agent_loop(
                 let tool_calls = std::mem::take(&mut loop_state.tool_calls);
 
                 for tool_call in tool_calls {
-                    let original_tool_name = tool_name_map.original_name(&tool_call.function.name);
+                    let original_tool_name = loop_state
+                        .tool_name_map
+                        .original_name(&tool_call.function.name);
                     let arguments = match parse_tool_arguments(&tool_call.function.arguments) {
                         Ok(arguments) => arguments,
                         Err(error) => {
@@ -1968,6 +2008,7 @@ impl ParallelToolExecutionContext {
             cli_mode: self.cli_mode,
             goal: None,
             mcp_runtime: None,
+            write_scope: None,
         };
         let result = tool_registry::execute_tool_result(&mut context, &tool_name, &arguments).await;
 
@@ -2007,36 +2048,43 @@ fn is_parallel_readonly_tool(tool_name: &str) -> bool {
     )
 }
 
-fn openai_tool_definitions(
+async fn openai_tool_definitions(
     selected: &SelectedModel,
     tool_context: &ToolExecutionContext<'_>,
-    read_only: bool,
-    include_agent_tools: bool,
+    tool_source: &OpenAiToolSource,
 ) -> Vec<Value> {
-    let mut tools = if tool_context.cli_mode {
-        tool_registry::cli_tool_definitions(
-            &selected.provider.provider_type,
-            &selected.model_id,
-            tool_context.allow_shell,
-        )
-    } else if read_only {
-        let mut tools = tool_registry::read_only_tool_definitions();
-        if include_agent_tools {
-            tools.extend(tool_registry::agent_tool_definitions());
+    let tools = match tool_source {
+        OpenAiToolSource::Static(tools) => tools.clone(),
+        OpenAiToolSource::Agent {
+            read_only,
+            include_agent_tools,
+        } => {
+            let mut tools = if tool_context.cli_mode {
+                tool_registry::cli_tool_definitions(
+                    &selected.provider.provider_type,
+                    &selected.model_id,
+                    tool_context.allow_shell,
+                )
+            } else if *read_only {
+                let mut tools = tool_registry::read_only_tool_definitions();
+                if *include_agent_tools {
+                    tools.extend(tool_registry::agent_tool_definitions());
+                }
+                tools
+            } else {
+                let mut tools = tool_registry::tool_definitions();
+                if *include_agent_tools {
+                    tools.extend(tool_registry::agent_tool_definitions());
+                }
+                tools
+            };
+            if let Some(runtime) = tool_context.mcp_runtime.clone() {
+                let runtime = runtime.lock().await;
+                tools.extend(runtime.tool_definitions());
+            }
+            tools
         }
-        tools
-    } else {
-        let mut tools = tool_registry::tool_definitions();
-        if include_agent_tools {
-            tools.extend(tool_registry::agent_tool_definitions());
-        }
-        tools
     };
-    if !read_only {
-        if let Some(runtime) = tool_context.mcp_runtime {
-            tools.extend(runtime.tool_definitions());
-        }
-    }
     tools
 }
 
@@ -4818,6 +4866,7 @@ fn build_layered_chat_messages_for_mode(
         layers.developer.push_str("\n");
         layers.developer.push_str(auto_readonly_subagent_guidance());
     }
+    append_active_codeforge_skills(project, conversation_messages, &mut layers.developer);
     let mut messages = Vec::new();
     if use_developer_role {
         messages.push(chat_message("system", layers.system));
@@ -4974,7 +5023,186 @@ fn developer_prompt(project: &ProjectSession, cli_mode: bool) -> String {
         prompt.push_str("\n</codeforge_developer_instructions>");
     }
 
+    append_codeforge_skill_index(project, &mut prompt);
+
     prompt
+}
+
+pub fn list_codeforge_skill_summaries(repo_root: &str) -> Vec<CodeforgeSkillSummary> {
+    let root = Path::new(repo_root);
+    discover_codeforge_skills(repo_root)
+        .into_iter()
+        .map(|skill| CodeforgeSkillSummary {
+            name: skill.name,
+            description: skill.description,
+            path: skill
+                .path
+                .strip_prefix(root)
+                .unwrap_or(&skill.path)
+                .display()
+                .to_string()
+                .replace('\\', "/"),
+        })
+        .collect()
+}
+
+fn append_codeforge_skill_index(project: &ProjectSession, prompt: &mut String) {
+    let skills = discover_codeforge_skills(&project.repo_root);
+    if skills.is_empty() {
+        return;
+    }
+
+    prompt.push_str("\n\nCodeForge workspace skills are available from ");
+    prompt.push_str(CODEFORGE_SKILLS_DIR);
+    prompt.push_str(". A skill is a reusable agent workflow. If the user invokes a skill with `$skill-name`, `/skill skill-name`, `/skills skill-name`, or the request clearly matches a skill description, read and follow that skill's `SKILL.md` before acting. Do not load every skill by default; use only the relevant skill.\n<codeforge_skill_index>\n");
+    for skill in skills {
+        prompt.push_str("- ");
+        prompt.push_str(&skill.name);
+        prompt.push_str(": ");
+        prompt.push_str(&skill.description);
+        prompt.push_str(" (");
+        prompt.push_str(&display_instruction_path(project, &skill.path).replace('\\', "/"));
+        prompt.push_str(")\n");
+    }
+    prompt.push_str("</codeforge_skill_index>");
+}
+
+fn append_active_codeforge_skills(
+    project: &ProjectSession,
+    conversation_messages: &[ChatMessage],
+    developer_prompt: &mut String,
+) {
+    let Some(latest_user_message) = conversation_messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+    else {
+        return;
+    };
+    let prompt = latest_user_message.content.as_str();
+    let active_skills = discover_codeforge_skills(&project.repo_root)
+        .into_iter()
+        .filter(|skill| skill_invoked_by_prompt(skill, prompt))
+        .take(MAX_ACTIVE_SKILLS)
+        .collect::<Vec<_>>();
+    if active_skills.is_empty() {
+        return;
+    }
+
+    developer_prompt.push_str("\n\nActive CodeForge skills for this turn. Follow each relevant `SKILL.md` workflow while preserving higher-priority instructions.\n<codeforge_active_skills>\n");
+    for skill in active_skills {
+        developer_prompt.push_str("<skill name=\"");
+        developer_prompt.push_str(&skill.name);
+        developer_prompt.push_str("\" path=\"");
+        developer_prompt
+            .push_str(&display_instruction_path(project, &skill.path).replace('\\', "/"));
+        developer_prompt.push_str("\">\n");
+        developer_prompt.push_str(&truncate_chars(
+            &skill.content,
+            MAX_ACTIVE_SKILL_CONTENT_CHARS,
+        ));
+        developer_prompt.push_str("\n</skill>\n");
+    }
+    developer_prompt.push_str("</codeforge_active_skills>");
+}
+
+fn discover_codeforge_skills(repo_root: &str) -> Vec<CodeforgeSkill> {
+    let skills_dir = Path::new(repo_root).join(CODEFORGE_SKILLS_DIR);
+    let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+        return Vec::new();
+    };
+    let mut skill_dirs = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    skill_dirs.sort();
+
+    skill_dirs
+        .into_iter()
+        .take(MAX_CODEFORGE_SKILLS)
+        .filter_map(read_codeforge_skill)
+        .collect()
+}
+
+fn read_codeforge_skill(skill_dir: PathBuf) -> Option<CodeforgeSkill> {
+    let path = skill_dir.join("SKILL.md");
+    if !path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&path).ok()?.trim().to_string();
+    if content.is_empty() {
+        return None;
+    }
+    let (name, description) = parse_skill_frontmatter(&content)?;
+    Some(CodeforgeSkill {
+        name,
+        description,
+        path,
+        content,
+    })
+}
+
+fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
+    let rest = content.strip_prefix("---")?;
+    let rest = rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))?;
+    let end = rest.find("\n---").or_else(|| rest.find("\r\n---"))?;
+    let frontmatter = &rest[..end];
+    let mut name = None;
+    let mut description = None;
+    for line in frontmatter.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = unquote_frontmatter_value(value.trim());
+        match key.trim() {
+            "name" if !value.is_empty() => name = Some(value),
+            "description" if !value.is_empty() => description = Some(value),
+            _ => {}
+        }
+    }
+    Some((name?, description.unwrap_or_default()))
+}
+
+fn unquote_frontmatter_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        return value[1..value.len() - 1].to_string();
+    }
+    value.to_string()
+}
+
+fn skill_invoked_by_prompt(skill: &CodeforgeSkill, prompt: &str) -> bool {
+    let prompt = prompt.to_ascii_lowercase();
+    let name = skill.name.to_ascii_lowercase();
+    if prompt.contains(&format!("${name}"))
+        || prompt.contains(&format!("/skill {name}"))
+        || prompt.contains(&format!("/skills {name}"))
+        || prompt.contains(&name)
+    {
+        return true;
+    }
+
+    let name_tokens = name
+        .split('-')
+        .filter(|token| token.len() >= 3)
+        .collect::<Vec<_>>();
+    !name_tokens.is_empty() && name_tokens.iter().all(|token| prompt.contains(token))
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}\n\n[Skill content truncated]")
+    } else {
+        truncated
+    }
 }
 
 fn local_read_tool_required_message() -> &'static str {
@@ -5795,6 +6023,63 @@ mod tests {
     }
 
     #[test]
+    fn codeforge_skills_are_indexed_and_explicitly_loaded() {
+        let root = test_workspace();
+        let skill_dir = root
+            .join(".codeforge")
+            .join("skills")
+            .join("git-commit-message");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: git-commit-message
+description: Draft commit messages from pending git changes.
+---
+
+# Git Commit Message
+
+Inspect `git status --short` before writing the message.
+"#,
+        )
+        .unwrap();
+        let project = test_project_with_root(root.to_str().unwrap());
+        let selected = test_selected_model("openai");
+
+        let summaries = list_codeforge_skill_summaries(&project.repo_root);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].name, "git-commit-message");
+        assert!(summaries[0].path.contains("git-commit-message"));
+        assert!(summaries[0].path.ends_with("SKILL.md"));
+
+        let indexed = build_openai_messages(
+            &project,
+            &[chat_message("user", "hello".to_string())],
+            false,
+            &selected,
+            false,
+        );
+        let developer = indexed[1]["content"].as_str().unwrap();
+        assert!(developer.contains("<codeforge_skill_index>"));
+        assert!(developer.contains("git-commit-message"));
+        assert!(!developer.contains("Inspect `git status --short`"));
+
+        let loaded = build_openai_messages(
+            &project,
+            &[chat_message(
+                "user",
+                "Use $git-commit-message for this diff.".to_string(),
+            )],
+            false,
+            &selected,
+            false,
+        );
+        let developer = loaded[1]["content"].as_str().unwrap();
+        assert!(developer.contains("<codeforge_active_skills>"));
+        assert!(developer.contains("Inspect `git status --short`"));
+    }
+
+    #[test]
     fn openai_messages_include_auto_readonly_subagent_policy_for_root_tool_runs() {
         let root = test_workspace();
         let project = test_project_with_root(root.to_str().unwrap());
@@ -5923,15 +6208,56 @@ mod tests {
             cli_mode: false,
             goal: None,
             mcp_runtime: None,
+            write_scope: None,
         };
-        let tools = openai_tool_definitions(&selected, &tool_context, true, true);
+        let tools = tauri::async_runtime::block_on(openai_tool_definitions(
+            &selected,
+            &tool_context,
+            &OpenAiToolSource::Agent {
+                read_only: true,
+                include_agent_tools: true,
+            },
+        ));
         let names = tool_definition_names(&tools);
 
         assert!(names.contains(&tool_registry::WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&tool_registry::WORKSPACE_SEARCH_CONTENT_TOOL_NAME.to_string()));
         assert!(names.contains(&tool_registry::AGENT_SPAWN_TOOL_NAME.to_string()));
+        assert!(names.contains(&crate::mcp_runtime::MCP_LIST_SERVERS_TOOL_NAME.to_string()));
+        assert!(names.contains(&crate::mcp_runtime::MCP_CONNECT_SERVER_TOOL_NAME.to_string()));
         assert!(!names.contains(&tool_registry::WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&tool_registry::WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&tool_registry::SHELL_COMMAND_TOOL_NAME.to_string()));
+    }
+
+    #[test]
+    fn writable_root_tools_include_agent_spawn_and_write_tools() {
+        let root = test_workspace();
+        let project = test_project_with_root(root.to_str().unwrap());
+        let selected = test_selected_model("openai");
+        let tool_context = ToolExecutionContext {
+            workspace_root: &project.repo_root,
+            vs_bridge_endpoint: None,
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
+            goal: None,
+            mcp_runtime: None,
+            write_scope: None,
+        };
+        let tools = tauri::async_runtime::block_on(openai_tool_definitions(
+            &selected,
+            &tool_context,
+            &OpenAiToolSource::Agent {
+                read_only: false,
+                include_agent_tools: true,
+            },
+        ));
+        let names = tool_definition_names(&tools);
+
+        assert!(names.contains(&tool_registry::AGENT_SPAWN_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&tool_registry::SHELL_COMMAND_TOOL_NAME.to_string()));
     }
 
@@ -6163,6 +6489,8 @@ mod tests {
             read_only: false,
             subagent_depth: 0,
             goal_slot: None,
+            mcp_runtime: None,
+            write_scope: None,
         };
 
         let run =
@@ -6282,6 +6610,8 @@ mod tests {
             read_only: false,
             subagent_depth: 0,
             goal_slot: None,
+            mcp_runtime: None,
+            write_scope: None,
         };
 
         let run =
@@ -6363,6 +6693,8 @@ mod tests {
             read_only: false,
             subagent_depth: 0,
             goal_slot: None,
+            mcp_runtime: None,
+            write_scope: None,
         };
 
         let run =
@@ -6438,6 +6770,8 @@ mod tests {
             read_only: false,
             subagent_depth: 0,
             goal_slot: None,
+            mcp_runtime: None,
+            write_scope: None,
         };
 
         let run =
@@ -6513,6 +6847,8 @@ mod tests {
             read_only: false,
             subagent_depth: 0,
             goal_slot: None,
+            mcp_runtime: None,
+            write_scope: None,
         };
 
         let run =
@@ -6579,6 +6915,7 @@ mod tests {
             cli_mode: false,
             goal: None,
             mcp_runtime: None,
+            write_scope: None,
         };
         let mut traces = Vec::new();
         let mut step_index = 1;
@@ -6589,7 +6926,7 @@ mod tests {
             &selected,
             &mut tool_context,
             vec![json!({ "role": "user", "content": "read sample" })],
-            tool_registry::read_only_tool_definitions(),
+            OpenAiToolSource::Static(tool_registry::read_only_tool_definitions()),
             &mut traces,
             &mut step_index,
             0,
@@ -6622,6 +6959,99 @@ mod tests {
     }
 
     #[test]
+    fn mcp_connect_management_tool_injects_tools_on_next_request() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let smoke_server = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tools")
+            .join("mcp_smoke_server.mjs");
+        if !smoke_server.exists() {
+            return;
+        }
+        let (base_url, server_thread) = start_mock_openai_server(vec![
+            tool_call_response_with_args(
+                crate::mcp_runtime::MCP_CONNECT_SERVER_TOOL_NAME,
+                json!({ "server_id": "smoke" }),
+            ),
+            final_message_response("Smoke MCP connected."),
+        ]);
+        let project = test_project();
+        let settings = test_settings(&base_url);
+        let runtime = McpRuntime::from_config(crate::mcp_runtime::McpConfigFile {
+            mcp_servers: std::collections::HashMap::from([(
+                "smoke".to_string(),
+                crate::mcp_runtime::McpServerConfig {
+                    name: Some("Smoke MCP".to_string()),
+                    transport: None,
+                    command: Some("node".to_string()),
+                    args: vec![smoke_server.to_string_lossy().to_string()],
+                    env: std::collections::HashMap::new(),
+                    env_vars: Vec::new(),
+                    cwd: None,
+                    url: None,
+                    enabled: true,
+                    auto_connect: false,
+                    required: false,
+                    supports_parallel_tool_calls: false,
+                    approval_mode: None,
+                    startup_timeout_sec: Some(Duration::from_secs(5)),
+                    startup_timeout_ms: None,
+                    tool_timeout_sec: Some(Duration::from_secs(5)),
+                    enabled_tools: None,
+                    disabled_tools: None,
+                },
+            )]),
+        });
+        let input = AgentRunInput {
+            project_id: project.id.clone(),
+            session_id: None,
+            task_id: None,
+            user_prompt: "connect smoke MCP".to_string(),
+            messages: None,
+            provider_id: Some("provider".to_string()),
+            credential_id: Some("default".to_string()),
+            model_id: Some("test-model".to_string()),
+            reasoning_effort: None,
+            allow_shell: false,
+            assume_yes: false,
+            cli_mode: false,
+            goal: None,
+            parent_task_id: None,
+            agent_name: None,
+            task_name: None,
+            read_only: false,
+            subagent_depth: 0,
+            goal_slot: None,
+            mcp_runtime: Some(Arc::new(Mutex::new(runtime))),
+            write_scope: None,
+        };
+
+        let run =
+            tauri::async_runtime::block_on(run_agent(&project, &settings, input, |_event| {}))
+                .unwrap();
+        let requests = server_thread.join().unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert!(request_tool_names(&requests[0])
+            .contains(&crate::mcp_runtime::MCP_CONNECT_SERVER_TOOL_NAME.to_string()));
+        assert!(request_tool_names(&requests[1]).contains(&"mcp__smoke__echo".to_string()));
+        assert!(run.traces.iter().any(|event| {
+            event.title == "tool_result"
+                && event.tool_name.as_deref()
+                    == Some(crate::mcp_runtime::MCP_CONNECT_SERVER_TOOL_NAME)
+                && event.output_summary.as_deref().is_some_and(|summary| {
+                    summary.contains("Tools will be available from the next model request")
+                })
+        }));
+    }
+
+    #[test]
     fn run_agent_emits_trace_events_while_running() {
         let (base_url, server_thread) =
             start_mock_openai_server(vec![final_message_response("Done.")]);
@@ -6647,6 +7077,8 @@ mod tests {
             read_only: false,
             subagent_depth: 0,
             goal_slot: None,
+            mcp_runtime: None,
+            write_scope: None,
         };
         let mut streamed_titles = Vec::new();
 
@@ -6731,6 +7163,8 @@ mod tests {
             read_only: false,
             subagent_depth: 0,
             goal_slot: None,
+            mcp_runtime: None,
+            write_scope: None,
         };
 
         let run =

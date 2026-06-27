@@ -1,10 +1,16 @@
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use codeforge_core::office_tools;
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
 use crate::goal_state::GoalState;
-use crate::mcp_runtime::McpRuntime;
+use crate::mcp_runtime::{
+    is_mcp_management_tool, McpRuntime, MCP_CONNECT_SERVER_TOOL_NAME,
+    MCP_DISCONNECT_SERVER_TOOL_NAME, MCP_LIST_SERVERS_TOOL_NAME, MCP_LIST_TOOLS_TOOL_NAME,
+};
 use crate::tool_interface::ToolOutput;
 use crate::vs_bridge_client;
 use crate::workspace_tools;
@@ -44,6 +50,47 @@ pub const AGENT_WAIT_TOOL_NAME: &str = "agent/wait";
 pub const AGENT_LIST_TOOL_NAME: &str = "agent/list";
 pub const PROGRESS_UPDATE_STEPS_TOOL_NAME: &str = "progress/update_steps";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteScope {
+    paths: Vec<String>,
+}
+
+impl WriteScope {
+    pub fn from_allowed_paths(workspace_root: &str, paths: &[String]) -> Result<Self, String> {
+        let mut normalized = paths
+            .iter()
+            .map(|path| normalize_write_target_path(workspace_root, path))
+            .collect::<Result<Vec<_>, _>>()?;
+        normalized.sort();
+        normalized.dedup();
+        if normalized.is_empty() {
+            return Err("allowedWritePaths must include at least one workspace path".to_string());
+        }
+        Ok(Self { paths: normalized })
+    }
+
+    pub fn paths(&self) -> &[String] {
+        &self.paths
+    }
+
+    pub fn allows(&self, workspace_root: &str, raw_path: &str) -> Result<bool, String> {
+        let target = normalize_write_target_path(workspace_root, raw_path)?;
+        Ok(self
+            .paths
+            .iter()
+            .any(|allowed| path_is_within(&target, allowed)))
+    }
+
+    pub fn overlaps(&self, other: &WriteScope) -> bool {
+        self.paths.iter().any(|left| {
+            other
+                .paths
+                .iter()
+                .any(|right| write_paths_overlap(left, right))
+        })
+    }
+}
+
 pub struct ToolExecutionContext<'a> {
     pub workspace_root: &'a str,
     pub vs_bridge_endpoint: Option<&'a str>,
@@ -51,7 +98,8 @@ pub struct ToolExecutionContext<'a> {
     pub assume_yes: bool,
     pub cli_mode: bool,
     pub goal: Option<&'a mut Option<GoalState>>,
-    pub mcp_runtime: Option<&'a McpRuntime>,
+    pub mcp_runtime: Option<Arc<Mutex<McpRuntime>>>,
+    pub write_scope: Option<&'a WriteScope>,
 }
 
 fn workspace_namespace_aliases() -> Vec<Value> {
@@ -100,6 +148,7 @@ pub fn tool_definitions() -> Vec<Value> {
         goal_clear_definition(),
         progress_update_steps_definition(),
     ]);
+    tools.extend(mcp_management_tool_definitions());
     tools.extend(workspace_namespace_aliases());
     tools
 }
@@ -120,6 +169,7 @@ pub fn read_only_tool_definitions() -> Vec<Value> {
         goal_get_definition(),
         progress_update_steps_definition(),
     ]);
+    tools.extend(mcp_management_tool_definitions());
     tools.extend(read_only_workspace_namespace_aliases());
     tools
 }
@@ -170,6 +220,15 @@ fn read_only_workspace_tool_definitions() -> Vec<Value> {
     ]
 }
 
+pub fn mcp_management_tool_definitions() -> Vec<Value> {
+    vec![
+        mcp_list_servers_definition(),
+        mcp_connect_server_definition(),
+        mcp_disconnect_server_definition(),
+        mcp_list_tools_definition(),
+    ]
+}
+
 fn read_only_workspace_namespace_aliases() -> Vec<Value> {
     vec![
         workspace_alias(WORKSPACE_LIST_DIR_TOOL_NAME, &list_dir_definition()),
@@ -196,6 +255,107 @@ pub fn exposes_apply_patch_raw(provider_type: &str, model_id: &str) -> bool {
         )
 }
 
+fn write_tool_target(arguments: &Value) -> Result<String, String> {
+    arguments
+        .get("file")
+        .or_else(|| arguments.get("path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "invalid_arguments: write tool requires `file`".to_string())
+}
+
+fn ensure_write_scope_allows(
+    context: &ToolExecutionContext<'_>,
+    name: &str,
+    arguments: &Value,
+) -> Result<(), String> {
+    let Some(scope) = context.write_scope else {
+        return Ok(());
+    };
+    let target = write_tool_target(arguments)?;
+    if scope.allows(context.workspace_root, &target)? {
+        return Ok(());
+    }
+
+    Err(format!(
+        "rejected: {name} target `{target}` is outside this subagent write scope: {}",
+        scope.paths().join(", ")
+    ))
+}
+
+fn normalize_write_target_path(workspace_root: &str, raw_path: &str) -> Result<String, String> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err("invalid_arguments: write path must not be empty".to_string());
+    }
+
+    let workspace = clean_path(&PathBuf::from(workspace_root));
+    let raw = Path::new(trimmed);
+    let absolute = if raw.is_absolute() {
+        clean_path(raw)
+    } else {
+        clean_path(&workspace.join(raw))
+    };
+    if !absolute.starts_with(&workspace) {
+        return Err(format!(
+            "invalid_arguments: write path `{trimmed}` must stay inside the workspace"
+        ));
+    }
+    let relative = absolute.strip_prefix(&workspace).map_err(|_| {
+        format!("invalid_arguments: write path `{trimmed}` must stay inside the workspace")
+    })?;
+    let normalized = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().replace('\\', "/")),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if normalized.is_empty() {
+        return Err("invalid_arguments: write path cannot be the workspace root".to_string());
+    }
+    Ok(write_path_key(&normalized))
+}
+
+fn clean_path(path: &Path) -> PathBuf {
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                cleaned.pop();
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                cleaned.push(component.as_os_str());
+            }
+        }
+    }
+    cleaned
+}
+
+fn write_path_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/").trim_matches('/').to_string();
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn write_paths_overlap(left: &str, right: &str) -> bool {
+    path_is_within(left, right) || path_is_within(right, left)
+}
+
+fn path_is_within(path: &str, scope: &str) -> bool {
+    path == scope
+        || path
+            .strip_prefix(scope)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 pub async fn execute_tool(
     context: &mut ToolExecutionContext<'_>,
     name: &str,
@@ -216,10 +376,19 @@ pub async fn execute_tool_result(
     name: &str,
     arguments: &Value,
 ) -> ToolOutput {
-    if let Some(runtime) = context.mcp_runtime {
+    if let Some(runtime) = context.mcp_runtime.clone() {
+        let mut runtime = runtime.lock().await;
+        if is_mcp_management_tool(name) {
+            return runtime.execute_management_tool(name, arguments).await;
+        }
         if runtime.is_mcp_tool(name) {
             return runtime.call_tool(name, arguments).await;
         }
+    } else if is_mcp_management_tool(name) || name.starts_with("mcp__") {
+        return ToolOutput::error(
+            "MCP runtime is not available for this agent run".to_string(),
+            0,
+        );
     }
 
     let started = Instant::now();
@@ -260,8 +429,14 @@ async fn execute_tool_inner(
         READ_FILE_TOOL_NAME | WORKSPACE_READ_FILE_TOOL_NAME => workspace_tools::read_file(context.workspace_root, arguments),
         SEARCH_FILE_TOOL_NAME | WORKSPACE_SEARCH_FILE_TOOL_NAME => execute_search_file(context, arguments).await,
         SEARCH_CONTENT_TOOL_NAME | WORKSPACE_SEARCH_CONTENT_TOOL_NAME | WORKSPACE_SEARCH_CONTENT_ALIAS_TOOL_NAME => execute_search_content(context, arguments).await,
-        EDIT_FILE_TOOL_NAME | WORKSPACE_EDIT_FILE_TOOL_NAME => workspace_tools::edit_file(context.workspace_root, arguments),
-        WRITE_FILE_TOOL_NAME | WORKSPACE_WRITE_FILE_TOOL_NAME => workspace_tools::write_file(context.workspace_root, arguments),
+        EDIT_FILE_TOOL_NAME | WORKSPACE_EDIT_FILE_TOOL_NAME => {
+            ensure_write_scope_allows(context, name, arguments)?;
+            workspace_tools::edit_file(context.workspace_root, arguments)
+        },
+        WRITE_FILE_TOOL_NAME | WORKSPACE_WRITE_FILE_TOOL_NAME => {
+            ensure_write_scope_allows(context, name, arguments)?;
+            workspace_tools::write_file(context.workspace_root, arguments)
+        },
         SHELL_COMMAND_TOOL_NAME | WORKSPACE_SHELL_COMMAND_TOOL_NAME => workspace_tools::shell_command(
             context.workspace_root,
             arguments,
@@ -815,12 +990,86 @@ fn vs_get_error_list_definition() -> Value {
     })
 }
 
+fn mcp_list_servers_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": MCP_LIST_SERVERS_TOOL_NAME,
+            "description": "List configured MCP servers and their current connection state without connecting to them.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn mcp_connect_server_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": MCP_CONNECT_SERVER_TOOL_NAME,
+            "description": "Connect a configured MCP server, read tools/list, and register its tools for subsequent model requests. Newly connected tools become available from the next model request, not the current response.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Configured MCP server id, for example ue."
+                    }
+                },
+                "required": ["server_id"]
+            }
+        }
+    })
+}
+
+fn mcp_disconnect_server_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": MCP_DISCONNECT_SERVER_TOOL_NAME,
+            "description": "Disconnect a connected MCP server and remove its tools from future model requests.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Configured MCP server id, for example ue."
+                    }
+                },
+                "required": ["server_id"]
+            }
+        }
+    })
+}
+
+fn mcp_list_tools_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": MCP_LIST_TOOLS_TOOL_NAME,
+            "description": "List tools currently registered for one MCP server. If the server is not connected, this returns an empty tool list with its current status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server_id": {
+                        "type": "string",
+                        "description": "Configured MCP server id, for example ue."
+                    }
+                },
+                "required": ["server_id"]
+            }
+        }
+    })
+}
+
 fn agent_spawn_definition() -> Value {
     json!({
         "type": "function",
         "function": {
             "name": AGENT_SPAWN_TOOL_NAME,
-            "description": "Spawn a read-only CodeForge subagent for a bounded code investigation task. Use proactively for broad, multi-file, review, architecture, debugging, performance, security, or test-gap tasks; avoid it for simple single-file edits or direct answers. The child agent returns a concise summary; raw child trace is stored separately.",
+            "description": "Spawn a CodeForge subagent for a bounded code task. Use read-only subagents proactively for broad, multi-file, review, architecture, debugging, performance, security, or test-gap investigations. In a write-capable parent run, set readOnly=false only for a narrow implementation task and assign non-overlapping allowedWritePaths. Avoid subagents for simple single-file edits or direct answers. The child agent returns a concise summary; raw child trace is stored separately.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -836,7 +1085,7 @@ fn agent_spawn_definition() -> Value {
                         "type": "string",
                         "enum": ["explorer", "reviewer", "worker"],
                         "default": "explorer",
-                        "description": "Subagent profile. The first implementation treats all child agents as read-only; worker is accepted for naming only."
+                        "description": "Subagent profile. Use explorer or reviewer for read-only work, and worker for write-capable implementation subtasks when readOnly is false."
                     },
                     "modelId": {
                         "type": "string",
@@ -850,7 +1099,13 @@ fn agent_spawn_definition() -> Value {
                     "readOnly": {
                         "type": "boolean",
                         "default": true,
-                        "description": "Must be true in this implementation. Write-capable subagents are rejected."
+                        "description": "Defaults to true. Keep true for investigations. Set false only in a write-capable parent run when the child should be allowed to edit workspace files; read-only parent runs reject false."
+                    },
+                    "allowedWritePaths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "default": [],
+                        "description": "Workspace-relative files or directories this child may edit. Required and must be non-empty when readOnly=false. Use non-overlapping allowedWritePaths across running write-capable subagents."
                     }
                 },
                 "required": ["taskName", "message"]
@@ -1203,6 +1458,7 @@ mod tests {
             cli_mode: false,
             goal: None,
             mcp_runtime: None,
+            write_scope: None,
         }
     }
 
@@ -1361,10 +1617,29 @@ mod tests {
             })
             .unwrap();
         let description = spawn["function"]["description"].as_str().unwrap();
+        let read_only_description = spawn["function"]["parameters"]["properties"]["readOnly"]
+            ["description"]
+            .as_str()
+            .unwrap();
+        let agent_kind_description = spawn["function"]["parameters"]["properties"]["agentKind"]
+            ["description"]
+            .as_str()
+            .unwrap();
+        let allowed_write_paths_description = spawn["function"]["parameters"]["properties"]
+            ["allowedWritePaths"]["description"]
+            .as_str()
+            .unwrap();
 
-        assert!(description.contains("Use proactively"));
-        assert!(description.contains("read-only CodeForge subagent"));
+        assert!(description.contains("proactively"));
+        assert!(description.contains("read-only subagents"));
+        assert!(description.contains("readOnly=false"));
+        assert!(description.contains("allowedWritePaths"));
+        assert!(read_only_description.contains("write-capable parent run"));
+        assert!(allowed_write_paths_description.contains("Required"));
+        assert!(allowed_write_paths_description.contains("non-overlapping"));
+        assert!(agent_kind_description.contains("worker"));
         assert!(!description.contains("explicitly asks"));
+        assert!(!read_only_description.contains("Must be true"));
     }
 
     #[test]
@@ -1431,6 +1706,7 @@ mod cli_runtime_tests {
             cli_mode: true,
             goal: None,
             mcp_runtime: None,
+            write_scope: None,
         }
     }
 
@@ -1545,6 +1821,7 @@ mod cli_runtime_tests {
             cli_mode: true,
             goal: None,
             mcp_runtime: None,
+            write_scope: None,
         };
 
         let result = tauri::async_runtime::block_on(execute_tool_result(
@@ -1579,6 +1856,7 @@ mod cli_runtime_tests {
             cli_mode: true,
             goal: None,
             mcp_runtime: None,
+            write_scope: None,
         };
 
         let result = tauri::async_runtime::block_on(execute_tool_result(
@@ -1610,6 +1888,48 @@ mod cli_runtime_tests {
         assert_eq!(
             fs::read_to_string(root.join("sample.txt")).unwrap(),
             "alpha\ngamma\n"
+        );
+    }
+
+    #[test]
+    fn write_scope_rejects_writes_outside_allowed_paths() {
+        let root = workspace();
+        fs::write(root.join("allowed.txt"), "alpha\nbeta\n").unwrap();
+        fs::write(root.join("blocked.txt"), "alpha\nbeta\n").unwrap();
+        let root_text = root.to_string_lossy().to_string();
+        let allowed = vec!["allowed.txt".to_string()];
+        let scope = WriteScope::from_allowed_paths(&root_text, &allowed).unwrap();
+        let mut context = ToolExecutionContext {
+            workspace_root: &root_text,
+            vs_bridge_endpoint: None,
+            allow_shell: false,
+            assume_yes: true,
+            cli_mode: true,
+            goal: None,
+            mcp_runtime: None,
+            write_scope: Some(&scope),
+        };
+
+        let allowed_result = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context,
+            EDIT_FILE_TOOL_NAME,
+            &json!({ "file": "allowed.txt", "search": "beta", "replace": "gamma" }),
+        ));
+        assert_eq!(allowed_result.status, ToolOutputStatus::Ok);
+
+        let blocked_result = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context,
+            WRITE_FILE_TOOL_NAME,
+            &json!({ "file": "blocked.txt", "content": "nope\n" }),
+        ));
+        assert_eq!(blocked_result.status, ToolOutputStatus::Rejected);
+        assert!(blocked_result
+            .error
+            .unwrap()
+            .contains("outside this subagent write scope"));
+        assert_eq!(
+            fs::read_to_string(root.join("blocked.txt")).unwrap(),
+            "alpha\nbeta\n"
         );
     }
 

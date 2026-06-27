@@ -61,6 +61,11 @@ const slashCommands: SlashCommand[] = [
     title: 'Init AI context',
     description: 'Create or update doc/ai-context for this workspace.',
   },
+  {
+    command: '/skills',
+    title: 'List skills',
+    description: 'Show project skills from .codeforge/skills plus tools.',
+  },
 ]
 
 function Composer({

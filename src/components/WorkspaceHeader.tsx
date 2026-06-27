@@ -1,4 +1,4 @@
-import { MonitorUp, MoreHorizontal } from 'lucide-react'
+import { MonitorUp, MoreHorizontal, Server } from 'lucide-react'
 import { useState } from 'react'
 import type { ProjectSession } from '../types/project'
 import { normalizeDisplayPath } from '../utils/path'
@@ -8,7 +8,9 @@ interface WorkspaceHeaderProps {
   project: ProjectSession
   busy: boolean
   divided: boolean
+  mcpPanelOpen: boolean
   onOpenVisualStudio: () => void
+  onToggleMcpPanel: () => void
   onRefreshBridge: () => void
   onClearWorkspace: () => void
   onNotice: (message: string) => void
@@ -18,7 +20,9 @@ function WorkspaceHeader({
   project,
   busy,
   divided,
+  mcpPanelOpen,
   onOpenVisualStudio,
+  onToggleMcpPanel,
   onRefreshBridge,
   onClearWorkspace,
   onNotice,
@@ -48,6 +52,21 @@ function WorkspaceHeader({
         </div>
 
         <div className="workspace-topbar-actions">
+          <button
+            type="button"
+            className={
+              mcpPanelOpen ?
+                'icon-button topbar-icon-button side-rail-toggle active'
+              : 'icon-button topbar-icon-button side-rail-toggle'
+            }
+            onClick={onToggleMcpPanel}
+            title={mcpPanelOpen ? 'Hide MCP servers' : 'Show MCP servers'}
+            aria-label={mcpPanelOpen ? 'Hide MCP servers' : 'Show MCP servers'}
+            aria-controls="mcp-server-panel"
+            aria-expanded={mcpPanelOpen}
+          >
+            <Server size={16} aria-hidden="true" />
+          </button>
           <button
             type="button"
             className="icon-button topbar-icon-button"

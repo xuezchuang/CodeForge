@@ -4,7 +4,7 @@ use crate::agent_runner::{self, AgentRunInput};
 use crate::app_state::{current_settings, lock_error, AppState};
 use crate::code_link::{self, OpenCodeLinkResult, OpenFilePayload};
 use crate::history_store::{AgentTaskRecord, WorkspaceHistoryState};
-use crate::mcp_runtime::{McpInventorySummary, McpRuntime, McpToolSummary};
+use crate::mcp_runtime::{McpInventorySummary, McpServerActionResult, McpToolSummary};
 use crate::process_manager;
 use crate::project_registry::{ProjectInput, ProjectSession};
 use crate::tool_interface::ToolOutput;
@@ -38,6 +38,12 @@ pub struct ToolDefinitionSummary {
 pub struct McpToolCallInput {
     pub tool_name: String,
     pub arguments: serde_json::Value,
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerActionInput {
+    pub server_id: String,
 }
 
 #[tauri::command]
@@ -151,25 +157,57 @@ pub fn list_tools() -> Result<Vec<ToolDefinitionSummary>, String> {
 }
 
 #[tauri::command]
-pub async fn list_mcp_tools() -> Result<Vec<McpToolSummary>, String> {
-    Ok(McpRuntime::load_from_default_config()
-        .await?
-        .map(|runtime| runtime.tool_summaries())
-        .unwrap_or_default())
+pub fn list_skills(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<agent_runner::CodeforgeSkillSummary>, String> {
+    let project = {
+        let projects = state.projects.lock().map_err(|_| lock_error())?;
+        projects.get(&project_id)?
+    };
+    Ok(agent_runner::list_codeforge_skill_summaries(
+        &project.repo_root,
+    ))
 }
 
 #[tauri::command]
-pub async fn inspect_mcp_inventory() -> Result<McpInventorySummary, String> {
-    McpRuntime::inspect_default_config().await
+pub async fn list_mcp_tools(state: State<'_, AppState>) -> Result<Vec<McpToolSummary>, String> {
+    let runtime = state.mcp_runtime.lock().await;
+    Ok(runtime.tool_summaries())
 }
 
 #[tauri::command]
-pub async fn call_mcp_tool(input: McpToolCallInput) -> Result<ToolOutput, String> {
-    let runtime = McpRuntime::load_from_default_config()
-        .await?
-        .ok_or_else(|| {
-            "No MCP tools are available. Run /mcp to inspect configured servers.".to_string()
-        })?;
+pub async fn inspect_mcp_inventory(
+    state: State<'_, AppState>,
+) -> Result<McpInventorySummary, String> {
+    let runtime = state.mcp_runtime.lock().await;
+    Ok(runtime.inventory())
+}
+
+#[tauri::command]
+pub async fn connect_mcp_server(
+    state: State<'_, AppState>,
+    input: McpServerActionInput,
+) -> Result<McpServerActionResult, String> {
+    let mut runtime = state.mcp_runtime.lock().await;
+    Ok(runtime.connect_server_by_id(&input.server_id).await)
+}
+
+#[tauri::command]
+pub async fn disconnect_mcp_server(
+    state: State<'_, AppState>,
+    input: McpServerActionInput,
+) -> Result<McpServerActionResult, String> {
+    let mut runtime = state.mcp_runtime.lock().await;
+    Ok(runtime.disconnect_server_by_id(&input.server_id))
+}
+
+#[tauri::command]
+pub async fn call_mcp_tool(
+    state: State<'_, AppState>,
+    input: McpToolCallInput,
+) -> Result<ToolOutput, String> {
+    let runtime = state.mcp_runtime.lock().await;
     Ok(runtime.call_tool(&input.tool_name, &input.arguments).await)
 }
 
@@ -272,7 +310,7 @@ pub struct ToolCallTestInput {
 pub async fn run_agent(
     app_handle: AppHandle,
     state: State<'_, AppState>,
-    input: AgentRunInput,
+    mut input: AgentRunInput,
 ) -> Result<MockAgentRun, String> {
     let project = {
         let projects = state.projects.lock().map_err(|_| lock_error())?;
@@ -287,6 +325,7 @@ pub async fn run_agent(
     let live_session_id = session_id.clone();
     let provider_id = input.provider_id.clone();
     let model_id = input.model_id.clone();
+    input.mcp_runtime = Some(state.mcp_runtime.clone());
 
     let run = agent_runner::run_agent(&project, &settings, input, move |event| {
         if let Ok(mut traces) = trace_state.traces.lock() {

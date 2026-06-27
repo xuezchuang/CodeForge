@@ -23,7 +23,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tiny_http = "0.12"
 toml_edit = { version = "0.23", features = ["serde"] }
-tokio = { version = "1", features = ["process", "time"] }
+tokio = { version = "1", features = ["process", "sync", "time"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(windows)'.dependencies]

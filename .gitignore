@@ -26,6 +26,10 @@ projects.json
 
 # Local runtime/runtime artifacts
 .codeforge/
+!.codeforge/
+.codeforge/*
+!.codeforge/skills/
+!.codeforge/skills/**
 .tmp-codebuddy-inspect/
 .vs/
 src/components/ChatMessage.tsx.bak

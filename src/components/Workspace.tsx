@@ -2,9 +2,22 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
+  ChevronDown,
+  Clipboard,
+  Plug,
+  RefreshCw,
+  Server,
+  Unplug,
+  Wrench,
+  X,
+} from 'lucide-react'
+import {
   callMcpTool,
+  connectMcpServer,
   deleteWorkspaceSessions,
+  disconnectMcpServer,
   inspectMcpInventory,
+  listSkills,
   listTools,
   listTraces,
   loadWorkspaceSession,
@@ -12,6 +25,7 @@ import {
   runAgent,
   saveWorkspaceSession,
   updateSettings,
+  type CodeforgeSkillSummary,
   type McpInventorySummary,
   type ToolDefinitionSummary,
   type ToolOutput,
@@ -110,6 +124,11 @@ function Workspace({
 }: WorkspaceProps) {
   const workspaceRef = useRef<HTMLElement>(null)
   const [busy, setBusy] = useState(false)
+  const [mcpInventory, setMcpInventory] = useState<McpInventorySummary | null>(null)
+  const [mcpLoading, setMcpLoading] = useState(false)
+  const [mcpError, setMcpError] = useState<string | null>(null)
+  const [mcpActionServerId, setMcpActionServerId] = useState<string | null>(null)
+  const [mcpPanelOpen, setMcpPanelOpen] = useState(false)
   const [composerDraftsByKey, setComposerDraftsByKey] = useState<Record<string, string>>({})
   const [workspaceToast, setWorkspaceToast] = useState<ToastState | null>(null)
   const [headerDivided, setHeaderDivided] = useState(false)
@@ -440,6 +459,66 @@ function Workspace({
     window.setTimeout(() => {
       setWorkspaceToast((current) => (current?.id === id ? null : current))
     }, 3000)
+  }
+
+  const refreshMcpInventory = useCallback(async () => {
+    setMcpLoading(true)
+    setMcpError(null)
+    try {
+      setMcpInventory(await inspectMcpInventory())
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught)
+      setMcpError(message)
+      setMcpInventory(null)
+    } finally {
+      setMcpLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!activeProjectId) {
+      setMcpInventory(null)
+      setMcpError(null)
+      return
+    }
+    void refreshMcpInventory()
+  }, [activeProjectId, refreshMcpInventory])
+
+  const connectMcp = async (serverId: string) => {
+    setMcpActionServerId(serverId)
+    try {
+      const result = await connectMcpServer(serverId)
+      if (result.status === 'connected') {
+        showWorkspaceToast('notice', `${result.name} connected (${result.toolCount} tools).`)
+      } else {
+        showWorkspaceToast('error', result.error ?? result.message)
+      }
+      await refreshMcpInventory()
+    } catch (caught) {
+      showWorkspaceToast('error', caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setMcpActionServerId(null)
+    }
+  }
+
+  const disconnectMcp = async (serverId: string) => {
+    setMcpActionServerId(serverId)
+    try {
+      const result = await disconnectMcpServer(serverId)
+      showWorkspaceToast('notice', result.message)
+      await refreshMcpInventory()
+    } catch (caught) {
+      showWorkspaceToast('error', caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setMcpActionServerId(null)
+    }
+  }
+
+  const copyMcpError = (serverId: string, error: string) => {
+    void navigator.clipboard
+      .writeText(error)
+      .then(() => showWorkspaceToast('notice', `${serverId} error copied.`))
+      .catch(() => showWorkspaceToast('notice', 'Clipboard copy is unavailable.'))
   }
 
   const persistComposerModelSelection = useCallback(
@@ -879,8 +958,9 @@ function Workspace({
 
     setBusy(true)
     try {
-      const [tools, mcpResult] = await Promise.all([
+      const [tools, skills, mcpResult] = await Promise.all([
         listTools(),
+        listSkills(projectId),
         inspectMcpInventory()
           .then((inventory) => ({ inventory, error: null }))
           .catch((caught) => ({
@@ -891,7 +971,7 @@ function Workspace({
       const assistantMessage = createMessage(
         sessionTaskId,
         'assistant',
-        formatToolsListMessage(tools, mcpResult.inventory, mcpResult.error),
+        formatToolsListMessage(tools, skills, mcpResult.inventory, mcpResult.error),
       )
       setSelectedTrace(null)
       setState((current) => ({
@@ -1214,13 +1294,18 @@ function Workspace({
   }
 
   return (
-    <section className="workspace-page" ref={workspaceRef}>
+    <section
+      className={mcpPanelOpen ? 'workspace-page has-side-rail' : 'workspace-page'}
+      ref={workspaceRef}
+    >
       <Toast toast={workspaceToast} onDismiss={() => setWorkspaceToast(null)} />
       <WorkspaceHeader
         project={activeProject}
         busy={busy || currentTaskIsRunning}
         divided={headerDivided}
+        mcpPanelOpen={mcpPanelOpen}
         onOpenVisualStudio={launchVs}
+        onToggleMcpPanel={() => setMcpPanelOpen((open) => !open)}
         onRefreshBridge={refreshBridge}
         onClearWorkspace={clearWorkspace}
         onNotice={(message) => showWorkspaceToast('notice', message)}
@@ -1228,7 +1313,7 @@ function Workspace({
 
       <div className="workspace-body">
         <main className="chat-shell">
-          <div className="chat-main">
+          <div className={mcpPanelOpen ? 'chat-main has-side-rail' : 'chat-main'}>
             <ChatTimeline
               task={currentTask}
               projectId={activeProject.id}
@@ -1284,6 +1369,27 @@ function Workspace({
           </div>
         </main>
       </div>
+      {mcpPanelOpen ? (
+        <div className="workspace-side-rail mcp-status-rail">
+          <McpServerPanel
+            inventory={mcpInventory}
+            loading={mcpLoading}
+            error={mcpError}
+            actionServerId={mcpActionServerId}
+            onRefresh={() => {
+              void refreshMcpInventory()
+            }}
+            onConnect={(serverId) => {
+              void connectMcp(serverId)
+            }}
+            onDisconnect={(serverId) => {
+              void disconnectMcp(serverId)
+            }}
+            onCopyError={copyMcpError}
+            onClose={() => setMcpPanelOpen(false)}
+          />
+        </div>
+      ) : null}
       <TraceDrawer
         open={state.traceDrawerOpen}
         taskId={selectedTrace?.taskId ?? null}
@@ -1296,6 +1402,198 @@ function Workspace({
         }
       />
     </section>
+  )
+}
+
+interface McpServerPanelProps {
+  inventory: McpInventorySummary | null
+  loading: boolean
+  error: string | null
+  actionServerId: string | null
+  onRefresh: () => void
+  onConnect: (serverId: string) => void
+  onDisconnect: (serverId: string) => void
+  onCopyError: (serverId: string, error: string) => void
+  onClose: () => void
+}
+
+function McpServerPanel({
+  inventory,
+  loading,
+  error,
+  actionServerId,
+  onRefresh,
+  onConnect,
+  onDisconnect,
+  onCopyError,
+  onClose,
+}: McpServerPanelProps) {
+  const [expandedServerId, setExpandedServerId] = useState<string | null>(null)
+  const toolsByServerId = useMemo(() => {
+    const groups = new Map<string, McpInventorySummary['tools']>()
+    for (const tool of inventory?.tools ?? []) {
+      const tools = groups.get(tool.serverId) ?? []
+      tools.push(tool)
+      groups.set(tool.serverId, tools)
+    }
+    return groups
+  }, [inventory])
+  const servers = inventory?.servers ?? []
+
+  return (
+    <aside id="mcp-server-panel" className="mcp-server-panel" aria-label="MCP servers">
+      <header className="mcp-panel-header">
+        <div>
+          <span className="mcp-panel-kicker">MCP</span>
+          <h3>Servers</h3>
+        </div>
+        <div className="mcp-panel-actions">
+          <button
+            type="button"
+            className="icon-button mcp-icon-button"
+            onClick={onRefresh}
+            disabled={loading}
+            title="Refresh MCP servers"
+            aria-label="Refresh MCP servers"
+          >
+            <RefreshCw size={15} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className="icon-button mcp-icon-button"
+            onClick={onClose}
+            title="Hide MCP servers"
+            aria-label="Hide MCP servers"
+          >
+            <X size={15} aria-hidden="true" />
+          </button>
+        </div>
+      </header>
+
+      {inventory?.configPath ? (
+        <code className="mcp-config-path" title={inventory.configPath}>
+          {inventory.configPath}
+        </code>
+      ) : null}
+
+      {error || inventory?.configError ? (
+        <div className="mcp-panel-error">{error ?? inventory?.configError}</div>
+      ) : null}
+
+      <div className="mcp-server-list">
+        {loading && servers.length === 0 ? (
+          <div className="mcp-panel-empty">Loading...</div>
+        ) : null}
+        {!loading && servers.length === 0 ? (
+          <div className="mcp-panel-empty">No MCP servers configured.</div>
+        ) : null}
+        {servers.map((server) => {
+          const serverTools = toolsByServerId.get(server.id) ?? []
+          const expanded = expandedServerId === server.id
+          const busy = actionServerId === server.id
+          const connected = server.status === 'connected'
+          return (
+            <section className="mcp-server-card" key={server.id}>
+              <div className="mcp-server-title">
+                <Server size={15} aria-hidden="true" />
+                <div>
+                  <strong>{server.id}</strong>
+                  <span>{server.name}</span>
+                </div>
+                <span className={`mcp-status-pill ${server.status}`}>
+                  {server.status}
+                </span>
+              </div>
+              <dl className="mcp-server-meta">
+                <div>
+                  <dt>Tools</dt>
+                  <dd>{server.toolCount}</dd>
+                </div>
+                <div>
+                  <dt>Transport</dt>
+                  <dd>{server.transport}</dd>
+                </div>
+                <div>
+                  <dt>Auto</dt>
+                  <dd>{server.autoConnect ? 'yes' : 'no'}</dd>
+                </div>
+              </dl>
+              {server.url ? (
+                <code className="mcp-server-url" title={server.url}>
+                  {server.url}
+                </code>
+              ) : null}
+              {server.error ? (
+                <div className="mcp-server-error">
+                  <span>{server.error}</span>
+                  <button
+                    type="button"
+                    className="icon-button mcp-mini-button"
+                    onClick={() => onCopyError(server.id, server.error ?? '')}
+                    title="Copy error"
+                    aria-label={`Copy ${server.id} MCP error`}
+                  >
+                    <Clipboard size={13} aria-hidden="true" />
+                  </button>
+                </div>
+              ) : null}
+              <div className="mcp-server-actions">
+                {connected ? (
+                  <button
+                    type="button"
+                    className="ghost-button mcp-action-button"
+                    onClick={() => onDisconnect(server.id)}
+                    disabled={busy}
+                  >
+                    <Unplug size={14} aria-hidden="true" />
+                    Disconnect
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="ghost-button mcp-action-button"
+                    onClick={() => onConnect(server.id)}
+                    disabled={busy || !server.enabled}
+                  >
+                    <Plug size={14} aria-hidden="true" />
+                    Connect
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="ghost-button mcp-action-button"
+                  onClick={() =>
+                    setExpandedServerId((current) =>
+                      current === server.id ? null : server.id,
+                    )
+                  }
+                  disabled={serverTools.length === 0}
+                  aria-expanded={expanded}
+                >
+                  <Wrench size={14} aria-hidden="true" />
+                  Tools
+                  <ChevronDown
+                    className={expanded ? 'expanded' : undefined}
+                    size={14}
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
+              {expanded ? (
+                <ul className="mcp-tool-list">
+                  {serverTools.map((tool) => (
+                    <li key={tool.name}>
+                      <code>{tool.name}</code>
+                      <span>{tool.description || tool.rawName}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </section>
+          )
+        })}
+      </div>
+    </aside>
   )
 }
 
@@ -2634,32 +2932,51 @@ function formatStatusCommandMessage(usage: {
 
 function formatToolsListMessage(
   tools: ToolDefinitionSummary[],
+  skills: CodeforgeSkillSummary[],
   mcpInventory: McpInventorySummary | null,
   mcpError: string | null,
 ): string {
   const mcpTools = mcpInventory?.tools ?? []
   const mcpServers = mcpInventory?.servers ?? []
-  if (tools.length === 0 && mcpTools.length === 0 && mcpServers.length === 0 && !mcpError) {
-    return 'No tools are currently registered.'
+  if (
+    tools.length === 0 &&
+    skills.length === 0 &&
+    mcpTools.length === 0 &&
+    mcpServers.length === 0 &&
+    !mcpError
+  ) {
+    return 'No tools or skills are currently registered.'
   }
   const builtinLines = tools.map((tool) => {
     const description = tool.description.trim()
     return description ? `- \`${tool.name}\` - ${description}` : `- \`${tool.name}\``
   })
+  const skillLines = skills.map((skill) => {
+    const description = skill.description.trim()
+    const suffix = description ? ` - ${description}` : ''
+    return `- \`${skill.name}\` (${skill.path})${suffix}`
+  })
   const mcpLines = mcpTools.map((tool) => {
     const description = tool.description.trim()
     const suffix = description ? ` - ${description}` : ''
-    return `- \`${tool.name}\` (${tool.serverName}/${tool.rawName})${suffix}`
+    return `- \`${tool.name}\` (${tool.serverId}/${tool.rawName})${suffix}`
   })
   const mcpServerLines = mcpServers.map((server) => {
     const required = server.required ? ', required' : ''
+    const auto = server.autoConnect ? ', auto_connect' : ''
+    const url = server.url ? `, ${server.url}` : ''
     const error = server.error ? ` - ${server.error}` : ''
-    return `- \`${server.name}\` - ${server.status}, ${server.toolCount} tool(s)${required}${error}`
+    const label = server.name === server.id ? server.id : `${server.id} (${server.name})`
+    return `- \`${label}\` - ${server.status}, ${server.toolCount} tool(s), ${server.transport}${auto}${required}${url}${error}`
   })
   const sections = [
     `Built-in tools (${tools.length}):`,
     '',
     ...(builtinLines.length ? builtinLines : ['- None']),
+    '',
+    `Project skills (${skills.length}):`,
+    '',
+    ...(skillLines.length ? skillLines : ['- None found under `.codeforge/skills`']),
     '',
     `MCP servers (${mcpServers.length}):`,
     '',
@@ -2674,6 +2991,9 @@ function formatToolsListMessage(
   }
   if (mcpError) {
     sections.push('', `MCP inventory error: ${mcpError}`)
+  }
+  if (mcpInventory?.configError) {
+    sections.push('', `MCP config error: ${mcpInventory.configError}`)
   }
   return sections.join('\n')
 }

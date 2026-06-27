@@ -152,7 +152,7 @@ function Composer({
       return
     }
     textarea.style.height = '0px'
-    const nextHeight = Math.min(Math.max(textarea.scrollHeight, 42), 128)
+    const nextHeight = Math.min(Math.max(textarea.scrollHeight, 36), 128)
     textarea.style.height = `${nextHeight}px`
   }, [value])
 

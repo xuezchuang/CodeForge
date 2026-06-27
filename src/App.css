@@ -5116,11 +5116,11 @@ pre {
 
 .app-root.codex-style .composer-surface {
   width: 100%;
-  min-height: 146px;
+  min-height: 100px;
   max-height: none;
   border-color: #363636;
   border-radius: 24px;
-  padding: 27px 18px 18px;
+  padding: 16px 18px 12px;
   background: #2d2d2d;
   box-shadow: none;
 }
@@ -5140,7 +5140,7 @@ pre {
 }
 
 .app-root.codex-style .composer-input {
-  min-height: 38px;
+  min-height: 36px;
   border: 0;
   padding: 0;
   background: transparent;
@@ -9206,9 +9206,9 @@ pre {
   }
 
   .app-root.codex-style .composer-surface {
-    min-height: 118px;
+    min-height: 98px;
     border-radius: 18px;
-    padding: 18px 12px 12px;
+    padding: 14px 12px 12px;
   }
 
   .app-root.codex-style .composer-progress {

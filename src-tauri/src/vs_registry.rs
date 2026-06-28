@@ -134,7 +134,11 @@ pub struct ProviderModel {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelReasoningConfig {
-    #[serde(default, alias = "request_field", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        alias = "request_field",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub request_field: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default: String,
@@ -682,12 +686,8 @@ fn read_model_catalog(config_path: &Path, catalog_path: Option<String>) -> Vec<P
                 &model.supported_reasoning_levels,
                 model.default_reasoning_level.as_deref(),
             );
-            let reasoning_mode = normalize_model_reasoning_mode_with_config(
-                "",
-                id,
-                &name,
-                reasoning.as_ref(),
-            );
+            let reasoning_mode =
+                normalize_model_reasoning_mode_with_config("", id, &name, reasoning.as_ref());
             let default_reasoning = normalize_model_default_reasoning_with_config(
                 &reasoning_mode,
                 model.default_reasoning_level.as_deref().unwrap_or(""),
@@ -1063,7 +1063,10 @@ impl NonEmptyString for String {
 }
 
 fn supported_reasoning_level(value: &serde_json::Value) -> Option<ModelReasoningLevel> {
-    if let Some(level) = value.as_str().and_then(|value| value.trim().to_string().or_non_empty()) {
+    if let Some(level) = value
+        .as_str()
+        .and_then(|value| value.trim().to_string().or_non_empty())
+    {
         return Some(ModelReasoningLevel {
             label: reasoning_level_label(&level),
             description: String::new(),

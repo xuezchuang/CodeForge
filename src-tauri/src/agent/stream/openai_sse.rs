@@ -2,6 +2,8 @@ use serde_json::{json, Value};
 
 use super::tool_call_merge::StreamingToolCall;
 
+const MIN_STREAMING_OVERLAP_CHARS: usize = 4;
+
 #[derive(Default)]
 pub struct StreamingChatCompletionAccumulator {
     saw_data: bool,
@@ -56,7 +58,7 @@ impl StreamingChatCompletionAccumulator {
                 self.role = delta_role.to_string();
             }
             if let Some(delta_content) = delta.get("content").and_then(Value::as_str) {
-                self.content.push_str(delta_content);
+                merge_streaming_text(&mut self.content, delta_content);
             }
             if let Some(delta_reasoning) = delta
                 .get("reasoning_content")
@@ -133,7 +135,10 @@ fn merge_streaming_text(accumulated: &mut String, fragment: &str) {
         return;
     }
 
-    if fragment == accumulated.as_str() || accumulated.ends_with(fragment) {
+    let fragment_chars = fragment.chars().count();
+    if fragment == accumulated.as_str()
+        || (fragment_chars >= MIN_STREAMING_OVERLAP_CHARS && accumulated.ends_with(fragment))
+    {
         return;
     }
     if fragment.starts_with(accumulated.as_str()) {
@@ -143,7 +148,11 @@ fn merge_streaming_text(accumulated: &mut String, fragment: &str) {
     }
 
     let overlap = largest_suffix_prefix_overlap(accumulated, fragment);
-    accumulated.push_str(&fragment[overlap..]);
+    if overlap_char_count(fragment, overlap) >= MIN_STREAMING_OVERLAP_CHARS {
+        accumulated.push_str(&fragment[overlap..]);
+    } else {
+        accumulated.push_str(fragment);
+    }
 }
 
 fn largest_suffix_prefix_overlap(accumulated: &str, fragment: &str) -> usize {
@@ -157,6 +166,10 @@ fn largest_suffix_prefix_overlap(accumulated: &str, fragment: &str) -> usize {
         }
     }
     0
+}
+
+fn overlap_char_count(fragment: &str, overlap: usize) -> usize {
+    fragment[..overlap].chars().count()
 }
 
 pub fn stream_error_message(error: &Value) -> String {
@@ -195,6 +208,55 @@ mod tests {
         );
         assert_eq!(response["choices"][0]["message"]["content"], json!("hello"));
         assert_eq!(response["choices"][0]["finish_reason"], json!("stop"));
+    }
+
+    #[test]
+    fn content_snapshot_frames_replace_instead_of_duplicate() {
+        let response = response_from_lines(&[
+            r#"data: {"choices":[{"delta":{"content":"The answer starts."},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"The answer starts. It continues."},"finish_reason":"stop"}]}"#,
+        ]);
+
+        assert_eq!(
+            response["choices"][0]["message"]["content"],
+            json!("The answer starts. It continues.")
+        );
+    }
+
+    #[test]
+    fn content_overlapping_frames_append_only_new_suffix() {
+        let response = response_from_lines(&[
+            r#"data: {"choices":[{"delta":{"content":"The available tools were: "},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"tools were: list_tools"},"finish_reason":"stop"}]}"#,
+        ]);
+
+        assert_eq!(
+            response["choices"][0]["message"]["content"],
+            json!("The available tools were: list_tools")
+        );
+    }
+
+    #[test]
+    fn repeated_content_frames_are_not_duplicated() {
+        let response = response_from_lines(&[
+            r#"data: {"choices":[{"delta":{"content":"Check the workspace."},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"Check the workspace."},"finish_reason":"stop"}]}"#,
+        ]);
+
+        assert_eq!(
+            response["choices"][0]["message"]["content"],
+            json!("Check the workspace.")
+        );
+    }
+
+    #[test]
+    fn short_incidental_content_overlap_is_appended() {
+        let response = response_from_lines(&[
+            r#"data: {"choices":[{"delta":{"content":"hel"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}]}"#,
+        ]);
+
+        assert_eq!(response["choices"][0]["message"]["content"], json!("hello"));
     }
 
     #[test]
@@ -247,6 +309,19 @@ mod tests {
         assert_eq!(
             response["choices"][0]["message"]["reasoning_content"],
             json!("检查媒体查询。")
+        );
+    }
+
+    #[test]
+    fn short_incidental_reasoning_overlap_is_appended() {
+        let response = response_from_lines(&[
+            r#"data: {"choices":[{"delta":{"reasoning_content":"hel"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_content":"lo"},"finish_reason":"stop"}]}"#,
+        ]);
+
+        assert_eq!(
+            response["choices"][0]["message"]["reasoning_content"],
+            json!("hello")
         );
     }
 

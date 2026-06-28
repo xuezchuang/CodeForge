@@ -8,10 +8,10 @@ description: Generate clear git commit messages from uncommitted changes and opt
 ## Workflow
 
 1. Inspect the worktree before writing:
-   - Run `git status --short`.
-   - Run `git diff --stat` for unstaged changes.
-   - Run `git diff --cached --stat` for staged changes.
-   - Read the relevant `git diff` and `git diff --cached`; for untracked files, inspect file names and contents when they affect the message.
+   - Use `git/status` with default arguments.
+   - Use `git/diff` with `stat=true` for unstaged changes.
+   - Use `git/diff` with `cached=true` and `stat=true` for staged changes.
+   - Read the relevant `git/diff` output, using `cached=true` for staged changes; for untracked files, inspect file names and contents when they affect the message.
 
 2. Separate intent:
    - Identify whether changes form one logical commit or multiple commits.
@@ -27,8 +27,8 @@ description: Generate clear git commit messages from uncommitted changes and opt
 
 4. Commit only when requested:
    - Confirm the staged file set matches the intended commit.
-   - If nothing is staged and the user clearly asked to commit all relevant dirty work, stage the intended files explicitly.
-   - Use `git commit -m "summary" -m "body..."` or a temporary message file for multi-line bodies.
+   - If nothing is staged and the user clearly asked to commit all relevant dirty work, stage the intended files explicitly with `git/add`.
+   - Use `git/commit` with `message`, `body`, or `body_paragraphs`.
    - Report the resulting commit hash and exact message.
 
 ## Message Patterns

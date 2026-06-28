@@ -32,6 +32,13 @@ pub const WORKSPACE_WRITE_FILE_TOOL_NAME: &str = "workspace/write_file";
 pub const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
 pub const WORKSPACE_SHELL_COMMAND_TOOL_NAME: &str = "workspace/shell_command";
 pub const APPLY_PATCH_RAW_TOOL_NAME: &str = "apply_patch_raw";
+pub const GIT_STATUS_TOOL_NAME: &str = "git/status";
+pub const GIT_DIFF_TOOL_NAME: &str = "git/diff";
+pub const GIT_LOG_TOOL_NAME: &str = "git/log";
+pub const GIT_SHOW_TOOL_NAME: &str = "git/show";
+pub const GIT_ADD_TOOL_NAME: &str = "git/add";
+pub const GIT_RESET_TOOL_NAME: &str = "git/reset";
+pub const GIT_COMMIT_TOOL_NAME: &str = "git/commit";
 pub const GET_FILE_CONTEXT_TOOL_NAME: &str = "get_file_context";
 pub const WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME: &str = "workspace/get_file_context";
 pub const DOCUMENT_READ_DOCX_TOOL_NAME: &str = "document/read_docx";
@@ -132,6 +139,7 @@ fn workspace_alias(name: &str, definition: &Value) -> Value {
 }
 pub fn tool_definitions() -> Vec<Value> {
     let mut tools = workspace_tool_definitions();
+    tools.extend(git_tool_definitions());
     tools.extend([
         list_dir_definition(),
         get_file_context_definition(),
@@ -155,6 +163,7 @@ pub fn tool_definitions() -> Vec<Value> {
 
 pub fn read_only_tool_definitions() -> Vec<Value> {
     let mut tools = read_only_workspace_tool_definitions();
+    tools.extend(read_only_git_tool_definitions());
     tools.extend([
         list_dir_definition(),
         get_file_context_definition(),
@@ -192,6 +201,7 @@ pub fn cli_tool_definitions(
     shell_enabled: bool,
 ) -> Vec<Value> {
     let mut tools = workspace_tool_definitions();
+    tools.extend(git_tool_definitions());
     tools.extend(workspace_namespace_aliases());
     if shell_enabled {
         tools.push(shell_command_definition());
@@ -218,6 +228,25 @@ fn read_only_workspace_tool_definitions() -> Vec<Value> {
         search_file_definition(),
         search_content_definition(),
     ]
+}
+
+fn read_only_git_tool_definitions() -> Vec<Value> {
+    vec![
+        git_status_definition(),
+        git_diff_definition(),
+        git_log_definition(),
+        git_show_definition(),
+    ]
+}
+
+fn git_tool_definitions() -> Vec<Value> {
+    let mut tools = read_only_git_tool_definitions();
+    tools.extend([
+        git_add_definition(),
+        git_reset_definition(),
+        git_commit_definition(),
+    ]);
+    tools
 }
 
 pub fn mcp_management_tool_definitions() -> Vec<Value> {
@@ -283,6 +312,95 @@ fn ensure_write_scope_allows(
         "rejected: {name} target `{target}` is outside this subagent write scope: {}",
         scope.paths().join(", ")
     ))
+}
+
+fn ensure_git_pathspec_scope_allows(
+    context: &ToolExecutionContext<'_>,
+    name: &str,
+    arguments: &Value,
+) -> Result<(), String> {
+    let Some(scope) = context.write_scope else {
+        return Ok(());
+    };
+    if arguments
+        .get("all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "rejected: {name} with all=true is outside this subagent write scope: {}",
+            scope.paths().join(", ")
+        ));
+    }
+    let pathspecs = git_pathspecs(arguments)?;
+    if pathspecs.is_empty() {
+        return Err(format!(
+            "rejected: {name} requires explicit pathspecs inside this subagent write scope: {}",
+            scope.paths().join(", ")
+        ));
+    }
+    for pathspec in pathspecs {
+        if git_pathspec_is_dynamic(&pathspec) {
+            return Err(format!(
+                "rejected: {name} pathspec `{pathspec}` is too broad for this subagent write scope"
+            ));
+        }
+        if !scope.allows(context.workspace_root, &pathspec)? {
+            return Err(format!(
+                "rejected: {name} pathspec `{pathspec}` is outside this subagent write scope: {}",
+                scope.paths().join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_git_commit_scope_allows(context: &ToolExecutionContext<'_>) -> Result<(), String> {
+    let Some(scope) = context.write_scope else {
+        return Ok(());
+    };
+    let staged_paths = workspace_tools::git_staged_paths(context.workspace_root)?;
+    for path in staged_paths {
+        if !scope.allows(context.workspace_root, &path)? {
+            return Err(format!(
+                "rejected: git/commit staged path `{path}` is outside this subagent write scope: {}",
+                scope.paths().join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn git_pathspecs(arguments: &Value) -> Result<Vec<String>, String> {
+    match arguments.get("pathspecs") {
+        Some(Value::Null) | None => Ok(Vec::new()),
+        Some(Value::String(value)) => Ok(vec![value.trim().to_string()]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        "invalid_arguments: `pathspecs` entries must be strings".to_string()
+                    })
+            })
+            .collect(),
+        _ => Err("invalid_arguments: `pathspecs` must be a string or array of strings".to_string()),
+    }
+}
+
+fn git_pathspec_is_dynamic(pathspec: &str) -> bool {
+    let pathspec = pathspec.trim();
+    pathspec.starts_with(':')
+        || pathspec.contains('*')
+        || pathspec.contains('?')
+        || pathspec.contains('[')
+        || pathspec.contains(']')
 }
 
 fn normalize_write_target_path(workspace_root: &str, raw_path: &str) -> Result<String, String> {
@@ -443,6 +561,8 @@ fn tool_timeout(name: &str) -> Duration {
             Duration::from_secs(30)
         }
         SHELL_COMMAND_TOOL_NAME => Duration::from_secs(60),
+        GIT_COMMIT_TOOL_NAME => Duration::from_secs(120),
+        GIT_ADD_TOOL_NAME | GIT_RESET_TOOL_NAME => Duration::from_secs(60),
         _ => Duration::from_secs(30),
     }
 }
@@ -465,6 +585,22 @@ async fn execute_tool_inner(
         WRITE_FILE_TOOL_NAME | WORKSPACE_WRITE_FILE_TOOL_NAME => {
             ensure_write_scope_allows(context, name, arguments)?;
             workspace_tools::write_file(context.workspace_root, arguments)
+        },
+        GIT_STATUS_TOOL_NAME => workspace_tools::git_status(context.workspace_root, arguments),
+        GIT_DIFF_TOOL_NAME => workspace_tools::git_diff(context.workspace_root, arguments),
+        GIT_LOG_TOOL_NAME => workspace_tools::git_log(context.workspace_root, arguments),
+        GIT_SHOW_TOOL_NAME => workspace_tools::git_show(context.workspace_root, arguments),
+        GIT_ADD_TOOL_NAME => {
+            ensure_git_pathspec_scope_allows(context, name, arguments)?;
+            workspace_tools::git_add(context.workspace_root, arguments)
+        },
+        GIT_RESET_TOOL_NAME => {
+            ensure_git_pathspec_scope_allows(context, name, arguments)?;
+            workspace_tools::git_reset(context.workspace_root, arguments)
+        },
+        GIT_COMMIT_TOOL_NAME => {
+            ensure_git_commit_scope_allows(context)?;
+            workspace_tools::git_commit(context.workspace_root, arguments)
         },
         SHELL_COMMAND_TOOL_NAME | WORKSPACE_SHELL_COMMAND_TOOL_NAME => workspace_tools::shell_command(
             context.workspace_root,
@@ -829,6 +965,165 @@ fn apply_patch_raw_definition() -> Value {
                     "patch": { "type": "string" }
                 },
                 "required": ["patch"]
+            }
+        }
+    })
+}
+
+fn git_status_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": GIT_STATUS_TOOL_NAME,
+            "description": "Run git status in the workspace and return stdout/stderr. Use this before summarizing or committing changes. Defaults to `git status --short --branch`.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "porcelain": { "type": "boolean", "default": true, "description": "Use short porcelain-style output." },
+                    "branch": { "type": "boolean", "default": true, "description": "Include branch information." },
+                    "pathspecs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional workspace-relative pathspecs to limit status."
+                    },
+                    "max_bytes": { "type": "integer", "minimum": 1, "default": 200000 }
+                }
+            }
+        }
+    })
+}
+
+fn git_diff_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": GIT_DIFF_TOOL_NAME,
+            "description": "Run git diff in the workspace and return stdout/stderr. Use cached=true for staged changes, stat=true for a summary, and pathspecs to limit large diffs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cached": { "type": "boolean", "default": false, "description": "Diff staged changes with --cached." },
+                    "stat": { "type": "boolean", "default": false, "description": "Return --stat summary output." },
+                    "name_only": { "type": "boolean", "default": false, "description": "Return changed path names only." },
+                    "unified": { "type": "integer", "minimum": 0, "default": 3, "description": "Number of context lines for patch output." },
+                    "pathspecs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional workspace-relative pathspecs to limit the diff."
+                    },
+                    "max_bytes": { "type": "integer", "minimum": 1, "default": 200000 }
+                }
+            }
+        }
+    })
+}
+
+fn git_log_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": GIT_LOG_TOOL_NAME,
+            "description": "Run git log in the workspace. Defaults to the latest 10 commits in one-line format.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_count": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 },
+                    "oneline": { "type": "boolean", "default": true },
+                    "max_bytes": { "type": "integer", "minimum": 1, "default": 200000 }
+                }
+            }
+        }
+    })
+}
+
+fn git_show_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": GIT_SHOW_TOOL_NAME,
+            "description": "Run git show for a revision in the workspace. Defaults to HEAD with --stat.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "revision": { "type": "string", "default": "HEAD", "description": "Revision, commit, tag, or ref to show." },
+                    "stat": { "type": "boolean", "default": true },
+                    "name_only": { "type": "boolean", "default": false },
+                    "pathspecs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional workspace-relative pathspecs to limit output."
+                    },
+                    "max_bytes": { "type": "integer", "minimum": 1, "default": 200000 }
+                }
+            }
+        }
+    })
+}
+
+fn git_add_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": GIT_ADD_TOOL_NAME,
+            "description": "Stage workspace changes with git add. Use explicit pathspecs for intended files; use all=true only when the user clearly asked to stage all relevant dirty work.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pathspecs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Workspace-relative files or directories to stage."
+                    },
+                    "all": { "type": "boolean", "default": false, "description": "Run git add --all." },
+                    "max_bytes": { "type": "integer", "minimum": 1, "default": 200000 }
+                }
+            }
+        }
+    })
+}
+
+fn git_reset_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": GIT_RESET_TOOL_NAME,
+            "description": "Unstage paths with git reset. This does not discard working tree changes. Use all=true to unstage everything.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pathspecs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Workspace-relative files or directories to unstage."
+                    },
+                    "all": { "type": "boolean", "default": false, "description": "Run git reset with no pathspecs to unstage all." },
+                    "max_bytes": { "type": "integer", "minimum": 1, "default": 200000 }
+                }
+            }
+        }
+    })
+}
+
+fn git_commit_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": GIT_COMMIT_TOOL_NAME,
+            "description": "Create a git commit from the currently staged changes. Always inspect git/status and staged git/diff evidence first, and only commit when the user requested a commit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string", "description": "Commit summary line." },
+                    "body": { "type": "string", "description": "Optional commit body paragraph." },
+                    "body_paragraphs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional additional body paragraphs, each passed as a separate -m argument."
+                    },
+                    "allow_empty": { "type": "boolean", "default": false },
+                    "max_bytes": { "type": "integer", "minimum": 1, "default": 200000 }
+                },
+                "required": ["message"]
             }
         }
     })
@@ -1551,6 +1846,13 @@ mod tests {
         assert!(names.contains(&WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME.to_string()));
         assert!(names.contains(&DOCUMENT_READ_DOCX_TOOL_NAME.to_string()));
         assert!(names.contains(&PRESENTATION_READ_PPTX_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_STATUS_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_DIFF_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_LOG_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_SHOW_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_ADD_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_RESET_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_COMMIT_TOOL_NAME.to_string()));
         assert!(names.contains(&WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_CURRENT_SOLUTION_TOOL_NAME.to_string()));
@@ -1594,10 +1896,17 @@ mod tests {
         assert!(names.contains(&WORKSPACE_SEARCH_CONTENT_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_GET_ERROR_LIST_TOOL_NAME.to_string()));
         assert!(names.contains(&PROGRESS_UPDATE_STEPS_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_STATUS_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_DIFF_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_LOG_TOOL_NAME.to_string()));
+        assert!(names.contains(&GIT_SHOW_TOOL_NAME.to_string()));
         assert!(!names.contains(&EDIT_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&WRITE_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&GIT_ADD_TOOL_NAME.to_string()));
+        assert!(!names.contains(&GIT_RESET_TOOL_NAME.to_string()));
+        assert!(!names.contains(&GIT_COMMIT_TOOL_NAME.to_string()));
         assert!(!names.contains(&SHELL_COMMAND_TOOL_NAME.to_string()));
     }
 
@@ -1719,6 +2028,7 @@ mod cli_runtime_tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::process::Command;
     use std::thread;
 
     fn workspace() -> std::path::PathBuf {
@@ -1783,6 +2093,10 @@ mod cli_runtime_tests {
         assert!(!names.contains(&APPLY_PATCH_RAW_TOOL_NAME));
         assert!(names.contains(&EDIT_FILE_TOOL_NAME));
         assert!(names.contains(&WORKSPACE_EDIT_FILE_TOOL_NAME));
+        assert!(names.contains(&GIT_STATUS_TOOL_NAME));
+        assert!(names.contains(&GIT_DIFF_TOOL_NAME));
+        assert!(names.contains(&GIT_ADD_TOOL_NAME));
+        assert!(names.contains(&GIT_COMMIT_TOOL_NAME));
         assert!(!names.contains(&CALCULATOR_ADD_TOOL_NAME));
     }
 
@@ -1978,5 +2292,68 @@ mod cli_runtime_tests {
             &json!({ "command": command, "timeout_ms": 1 }),
         ));
         assert_eq!(result.status, ToolOutputStatus::Timeout);
+    }
+
+    #[test]
+    fn git_add_and_commit_tools_run_in_workspace() {
+        if !git_available() {
+            return;
+        }
+        let root = workspace();
+        run_git(&root, &["init"]);
+        run_git(&root, &["config", "user.email", "codeforge@example.test"]);
+        run_git(&root, &["config", "user.name", "CodeForge Test"]);
+        fs::write(root.join("sample.txt"), "hello\n").unwrap();
+        let root_text = root.to_string_lossy().to_string();
+
+        let status = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context(&root_text, false),
+            GIT_STATUS_TOOL_NAME,
+            &json!({}),
+        ));
+        assert_eq!(status.status, ToolOutputStatus::Ok);
+        assert!(status.output.unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("sample.txt"));
+
+        let added = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context(&root_text, false),
+            GIT_ADD_TOOL_NAME,
+            &json!({ "pathspecs": ["sample.txt"] }),
+        ));
+        assert_eq!(added.status, ToolOutputStatus::Ok);
+        assert_eq!(added.output.unwrap()["success"], json!(true));
+
+        let committed = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context(&root_text, false),
+            GIT_COMMIT_TOOL_NAME,
+            &json!({ "message": "test: commit sample" }),
+        ));
+        assert_eq!(committed.status, ToolOutputStatus::Ok);
+        let output = committed.output.unwrap();
+        assert_eq!(output["success"], json!(true));
+        assert!(output["commit"].as_str().unwrap_or_default().len() >= 7);
+    }
+
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn run_git(root: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

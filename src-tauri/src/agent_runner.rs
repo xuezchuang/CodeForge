@@ -2043,6 +2043,10 @@ fn is_parallel_readonly_tool(tool_name: &str) -> bool {
             | tool_registry::WORKSPACE_SEARCH_CONTENT_ALIAS_TOOL_NAME
             | tool_registry::GET_FILE_CONTEXT_TOOL_NAME
             | tool_registry::WORKSPACE_GET_FILE_CONTEXT_TOOL_NAME
+            | tool_registry::GIT_STATUS_TOOL_NAME
+            | tool_registry::GIT_DIFF_TOOL_NAME
+            | tool_registry::GIT_LOG_TOOL_NAME
+            | tool_registry::GIT_SHOW_TOOL_NAME
             | tool_registry::DOCUMENT_READ_DOCX_TOOL_NAME
             | tool_registry::PRESENTATION_READ_PPTX_TOOL_NAME
             | tool_registry::VS_CURRENT_SOLUTION_TOOL_NAME
@@ -4536,6 +4540,11 @@ fn classify_intent_mode(prompt: &str) -> IntentClassification {
             "做成",
             "弄一下",
             "搞一下",
+            "帮我提交",
+            "直接提交",
+            "提交一下",
+            "提交改动",
+            "提交这些",
             "implement",
             "fix ",
             "fix the",
@@ -4547,6 +4556,11 @@ fn classify_intent_mode(prompt: &str) -> IntentClassification {
             "refactor",
             "optimize",
             "wire ",
+            "git commit",
+            "commit changes",
+            "commit it",
+            "create a commit",
+            "make a commit",
         ],
     ) {
         return IntentClassification {
@@ -5014,6 +5028,7 @@ fn developer_prompt(project: &ProjectSession, cli_mode: bool) -> String {
     }
     prompt.push_str("Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Use document/read_docx for .docx files and presentation/read_pptx for .pptx files; do not use text read_file for Office packages.\n");
     prompt.push_str("Read-only file tools can inspect local absolute paths outside the workspace. When the user asks to read, inspect, search, or verify local files or logs, call list_dir/read_file/search_file/search_content (or their workspace/ aliases) before answering. If a target path was not already returned by a current-turn tool result, treat it as unverified: first run list_dir on the parent/starting directory or search_file/search_content to confirm exact path segments (for example, never assume `codex-config` vs `config`, or a UE header's module directory from its include name), then read the confirmed path. If read_file returns a recovered result, explain that the requested path was missing and that a unique same-name file was read instead. Do not claim a read/search tool failed unless a tool_result in the current turn shows that failure. A successful read_file/search_content result is fresh current-filesystem evidence for that turn; do not dismiss it as a stale snapshot, do not ask the user to open VS Code or run git just to confirm the same file state, and do not treat \"verify against current source\" as a reason to avoid read/search tools.\n");
+    prompt.push_str("Use the dedicated git/status, git/diff, git/log, and git/show tools for repository state, history, and diffs; these are not arbitrary shell commands. In write-capable runs, use git/add, git/reset, and git/commit when the user asks to stage, unstage, or commit. Before committing, inspect git/status plus staged and unstaged git/diff evidence, stage only the intended paths, and report the resulting commit hash when git/commit succeeds.\n");
     prompt.push_str("Treat user statements about the code as hypotheses until they are verified against workspace code, tool output, logs, or diagnostics. For code-specific answers, gather enough concrete evidence before concluding. If you did not inspect fresh code in the current turn, say whether the answer is based on previous context or inference. Distinguish verified facts, reused prior evidence, and inference when the distinction matters.\n");
     prompt.push_str("Do not claim rg or text search is precise semantic analysis. Prefer exact definitions, call sites, implementations, and diagnostics over name-only search results. Keep edits surgical and cite concrete code locations when relevant.\n");
     prompt.push_str("If an AI context index is provided from doc/ai-context/README.md, treat it as a navigation map only. Do not read every linked doc by default. Read only the context docs that are directly relevant to the user's task, then verify any code-specific conclusion against current source code before answering or editing.\n");
@@ -5724,12 +5739,87 @@ fn build_assistant_tool_call_message(response_body: &Value) -> Result<Value, Str
 }
 
 fn build_tool_result_message(tool_call: &OpenAiToolCall, result: &Value) -> Value {
+    let model_result = sanitize_tool_result_for_model(result);
     json!({
         "role": "tool",
         "tool_call_id": tool_call.id.clone(),
         "name": tool_call.function.name.clone(),
-        "content": result.to_string(),
+        "content": model_result.to_string(),
     })
+}
+
+fn sanitize_tool_result_for_model(value: &Value) -> Value {
+    sanitize_tool_result_value(value).unwrap_or_else(|| value.clone())
+}
+
+fn sanitize_tool_result_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(text) => sanitize_json_string_tool_result(text),
+        Value::Array(items) => {
+            let mut changed = false;
+            let sanitized = items
+                .iter()
+                .map(|item| {
+                    if let Some(sanitized) = sanitize_tool_result_value(item) {
+                        changed = true;
+                        sanitized
+                    } else {
+                        item.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            changed.then_some(Value::Array(sanitized))
+        }
+        Value::Object(entries) => {
+            let mime_type = entries
+                .get("mimeType")
+                .or_else(|| entries.get("mime_type"))
+                .and_then(Value::as_str);
+            if mime_type.is_some_and(|mime_type| mime_type.starts_with("image/")) {
+                if let Some(data) = entries.get("data").and_then(Value::as_str) {
+                    let mut sanitized = entries.clone();
+                    sanitized.insert(
+                        "data".to_string(),
+                        Value::String(format!("<omitted image base64: {} chars>", data.len())),
+                    );
+                    sanitized.insert("dataOmitted".to_string(), Value::Bool(true));
+                    sanitized.insert(
+                        "omissionReason".to_string(),
+                        Value::String(
+                            "Image binary data omitted from model text context.".to_string(),
+                        ),
+                    );
+                    return Some(Value::Object(sanitized));
+                }
+            }
+
+            let mut changed = false;
+            let sanitized = entries
+                .iter()
+                .map(|(key, item)| {
+                    if let Some(sanitized) = sanitize_tool_result_value(item) {
+                        changed = true;
+                        (key.clone(), sanitized)
+                    } else {
+                        (key.clone(), item.clone())
+                    }
+                })
+                .collect();
+            changed.then_some(Value::Object(sanitized))
+        }
+        _ => None,
+    }
+}
+
+fn sanitize_json_string_tool_result(text: &str) -> Option<Value> {
+    let trimmed = text.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+
+    let parsed = serde_json::from_str::<Value>(text).ok()?;
+    let sanitized = sanitize_tool_result_value(&parsed)?;
+    serde_json::to_string(&sanitized).ok().map(Value::String)
 }
 
 fn tool_error_result(error: &str) -> Value {
@@ -6151,6 +6241,54 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_message_omits_direct_image_base64_from_model_content() {
+        let response = tool_call_response();
+        let tool_call = parse_tool_calls(&response).unwrap().remove(0);
+        let tool_message = build_tool_result_message(
+            &tool_call,
+            &json!({
+                "returnValue": {
+                    "mimeType": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+                },
+            }),
+        );
+        let content = tool_message["content"].as_str().unwrap();
+
+        assert!(content.contains("\"mimeType\":\"image/png\""));
+        assert!(content.contains("\"dataOmitted\":true"));
+        assert!(content.contains("<omitted image base64: 32 chars>"));
+        assert!(!content.contains("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"));
+    }
+
+    #[test]
+    fn tool_result_message_omits_mcp_text_image_base64_from_model_content() {
+        let response = tool_call_response();
+        let tool_call = parse_tool_calls(&response).unwrap().remove(0);
+        let tool_message = build_tool_result_message(
+            &tool_call,
+            &json!({
+                "status": "ok",
+                "ok": true,
+                "output": {
+                    "server": "ue",
+                    "tool": "call_tool",
+                    "content": [{
+                        "type": "text",
+                        "text": "{\"returnValue\":{\"mimeType\":\"image/png\",\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB\"}}",
+                    }],
+                },
+            }),
+        );
+        let content = tool_message["content"].as_str().unwrap();
+
+        assert!(content.contains("\\\"mimeType\\\":\\\"image/png\\\""));
+        assert!(content.contains("\\\"dataOmitted\\\":true"));
+        assert!(content.contains("<omitted image base64: 32 chars>"));
+        assert!(!content.contains("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"));
+    }
+
+    #[test]
     fn openai_messages_use_developer_role_when_provider_supports_it() {
         let root = test_workspace();
         fs::create_dir_all(root.join(".codeforge")).unwrap();
@@ -6535,6 +6673,8 @@ Read the `.uproject`, locate UE source, and verify MCP transport from source or 
         assert!(prompt.contains("fresh current-filesystem evidence"));
         assert!(prompt.contains("do not dismiss it as a stale snapshot"));
         assert!(prompt.contains("do not ask the user to open VS Code or run git"));
+        assert!(prompt.contains("git/status"));
+        assert!(prompt.contains("git/commit"));
         assert!(prompt.contains("prefer grouped bullet/list sections over wide Markdown tables"));
         assert!(prompt.contains("at most 3 columns"));
         assert!(local_read_tool_required_message().contains("not stale snapshots"));
@@ -6567,11 +6707,15 @@ Read the `.uproject`, locate UE source, and verify MCP transport from source or 
 
         assert!(names.contains(&tool_registry::WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&tool_registry::WORKSPACE_SEARCH_CONTENT_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::GIT_STATUS_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::GIT_DIFF_TOOL_NAME.to_string()));
         assert!(names.contains(&tool_registry::AGENT_SPAWN_TOOL_NAME.to_string()));
         assert!(names.contains(&crate::mcp_runtime::MCP_LIST_SERVERS_TOOL_NAME.to_string()));
         assert!(names.contains(&crate::mcp_runtime::MCP_CONNECT_SERVER_TOOL_NAME.to_string()));
         assert!(!names.contains(&tool_registry::WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
         assert!(!names.contains(&tool_registry::WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
+        assert!(!names.contains(&tool_registry::GIT_ADD_TOOL_NAME.to_string()));
+        assert!(!names.contains(&tool_registry::GIT_COMMIT_TOOL_NAME.to_string()));
         assert!(!names.contains(&tool_registry::SHELL_COMMAND_TOOL_NAME.to_string()));
     }
 
@@ -6603,6 +6747,10 @@ Read the `.uproject`, locate UE source, and verify MCP transport from source or 
         assert!(names.contains(&tool_registry::AGENT_SPAWN_TOOL_NAME.to_string()));
         assert!(names.contains(&tool_registry::WORKSPACE_EDIT_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&tool_registry::WORKSPACE_WRITE_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::GIT_STATUS_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::GIT_DIFF_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::GIT_ADD_TOOL_NAME.to_string()));
+        assert!(names.contains(&tool_registry::GIT_COMMIT_TOOL_NAME.to_string()));
         assert!(!names.contains(&tool_registry::SHELL_COMMAND_TOOL_NAME.to_string()));
     }
 

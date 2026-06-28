@@ -29,6 +29,9 @@ const SEARCH_SCAN_TIMEOUT_MS: u128 = 12_000;
 const READ_FILE_RECOVERY_SCAN_LIMIT: usize = 8_000;
 const READ_FILE_RECOVERY_MAX_CANDIDATES: usize = 8;
 const READ_FILE_RECOVERY_MAX_ROOTS: usize = 8;
+const DEFAULT_GIT_OUTPUT_MAX_BYTES: usize = 200_000;
+const MAX_GIT_OUTPUT_MAX_BYTES: usize = 500_000;
+const GIT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -481,6 +484,337 @@ pub async fn shell_command(
         "stdout": String::from_utf8_lossy(&output.stdout),
         "stderr": String::from_utf8_lossy(&output.stderr),
     }))
+}
+
+pub fn git_status(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let porcelain = optional_bool(arguments, "porcelain", true)?;
+    let branch = optional_bool(arguments, "branch", true)?;
+    let pathspecs = optional_string_array(arguments, "pathspecs")?;
+    let max_bytes = git_max_bytes(arguments)?;
+    let mut args = vec!["status".to_string()];
+    if porcelain {
+        args.push("--short".to_string());
+    }
+    if branch {
+        args.push("--branch".to_string());
+    }
+    add_pathspec_args(&mut args, &pathspecs);
+    run_git_command(&workspace, args, max_bytes)
+}
+
+pub fn git_diff(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let cached = optional_bool(arguments, "cached", false)?;
+    let stat = optional_bool(arguments, "stat", false)?;
+    let name_only = optional_bool(arguments, "name_only", false)?;
+    let pathspecs = optional_string_array(arguments, "pathspecs")?;
+    let max_bytes = git_max_bytes(arguments)?;
+    let mut args = vec!["diff".to_string(), "--no-ext-diff".to_string()];
+    if cached {
+        args.push("--cached".to_string());
+    }
+    if stat {
+        args.push("--stat".to_string());
+    }
+    if name_only {
+        args.push("--name-only".to_string());
+    }
+    if let Some(unified) = optional_usize_value(arguments, "unified")? {
+        args.push(format!("--unified={}", unified.min(200)));
+    }
+    add_pathspec_args(&mut args, &pathspecs);
+    run_git_command(&workspace, args, max_bytes)
+}
+
+pub fn git_log(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let max_count = optional_usize(arguments, "max_count", 10)?.clamp(1, 100);
+    let oneline = optional_bool(arguments, "oneline", true)?;
+    let max_bytes = git_max_bytes(arguments)?;
+    let mut args = vec!["log".to_string(), format!("--max-count={max_count}")];
+    if oneline {
+        args.push("--oneline".to_string());
+        args.push("--decorate".to_string());
+    } else {
+        args.push("--stat".to_string());
+    }
+    run_git_command(&workspace, args, max_bytes)
+}
+
+pub fn git_show(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let revision = optional_string(arguments, "revision")?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "HEAD".to_string());
+    let stat = optional_bool(arguments, "stat", true)?;
+    let name_only = optional_bool(arguments, "name_only", false)?;
+    let pathspecs = optional_string_array(arguments, "pathspecs")?;
+    let max_bytes = git_max_bytes(arguments)?;
+    let mut args = vec!["show".to_string(), "--no-ext-diff".to_string()];
+    if stat {
+        args.push("--stat".to_string());
+    }
+    if name_only {
+        args.push("--name-only".to_string());
+    }
+    args.push(revision);
+    add_pathspec_args(&mut args, &pathspecs);
+    run_git_command(&workspace, args, max_bytes)
+}
+
+pub fn git_add(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let all = optional_bool(arguments, "all", false)?;
+    let pathspecs = optional_string_array(arguments, "pathspecs")?;
+    let max_bytes = git_max_bytes(arguments)?;
+    let mut args = vec!["add".to_string()];
+    if all {
+        args.push("--all".to_string());
+    } else if pathspecs.is_empty() {
+        return Err("invalid_arguments: git/add requires `pathspecs` or all=true".to_string());
+    }
+    add_pathspec_args(&mut args, &pathspecs);
+    run_git_command(&workspace, args, max_bytes)
+}
+
+pub fn git_reset(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let all = optional_bool(arguments, "all", false)?;
+    let pathspecs = optional_string_array(arguments, "pathspecs")?;
+    let max_bytes = git_max_bytes(arguments)?;
+    if all && !pathspecs.is_empty() {
+        return Err("invalid_arguments: use either all=true or pathspecs, not both".to_string());
+    }
+    if !all && pathspecs.is_empty() {
+        return Err("invalid_arguments: git/reset requires `pathspecs` or all=true".to_string());
+    }
+    let mut args = vec!["reset".to_string()];
+    add_pathspec_args(&mut args, &pathspecs);
+    run_git_command(&workspace, args, max_bytes)
+}
+
+pub fn git_commit(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let message = required_string(arguments, "message")?;
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("invalid_arguments: message must not be empty".to_string());
+    }
+    let allow_empty = optional_bool(arguments, "allow_empty", false)?;
+    let max_bytes = git_max_bytes(arguments)?;
+    let mut args = vec!["commit".to_string()];
+    if allow_empty {
+        args.push("--allow-empty".to_string());
+    }
+    args.push("-m".to_string());
+    args.push(message.to_string());
+    for paragraph in optional_body_paragraphs(arguments)? {
+        args.push("-m".to_string());
+        args.push(paragraph);
+    }
+    let mut result = run_git_command(&workspace, args, max_bytes)?;
+    if result.get("success").and_then(Value::as_bool) == Some(true) {
+        if let Ok(hash) = git_head_short_hash(&workspace) {
+            result["commit"] = json!(hash);
+        }
+    }
+    Ok(result)
+}
+
+pub fn git_staged_paths(workspace_root: &str) -> Result<Vec<String>, String> {
+    let workspace = canonical_workspace_root(workspace_root)?;
+    let args = vec![
+        "diff".to_string(),
+        "--cached".to_string(),
+        "--name-only".to_string(),
+        "-z".to_string(),
+    ];
+    let output = run_git_process(&workspace, &args, GIT_COMMAND_TIMEOUT_MS)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git_failed: {}", stderr));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| normalize_display_path(path).replace('\\', "/"))
+        .collect())
+}
+
+fn run_git_command(workspace: &Path, args: Vec<String>, max_bytes: usize) -> Result<Value, String> {
+    let output = run_git_process(workspace, &args, GIT_COMMAND_TIMEOUT_MS)?;
+    let (stdout, stdout_truncated) = truncate_output(&output.stdout, max_bytes);
+    let (stderr, stderr_truncated) = truncate_output(&output.stderr, max_bytes);
+    Ok(json!({
+        "command": command_vector(&args),
+        "displayCommand": display_git_command(&args),
+        "statusCode": output.status.code(),
+        "success": output.status.success(),
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdoutTruncated": stdout_truncated,
+        "stderrTruncated": stderr_truncated,
+        "maxBytes": max_bytes,
+    }))
+}
+
+fn run_git_process(
+    workspace: &Path,
+    args: &[String],
+    timeout_ms: u64,
+) -> Result<std::process::Output, String> {
+    let mut process = Command::new("git");
+    hide_child_console(&mut process);
+    process
+        .args(args)
+        .current_dir(workspace)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("git_spawn_failed: {error}"))?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| format!("git_wait_failed: {error}"))?
+            .is_some()
+        {
+            break;
+        }
+        if started.elapsed() >= Duration::from_millis(timeout_ms) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("timeout: git command exceeded {timeout_ms}ms"));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    child
+        .wait_with_output()
+        .map_err(|error| format!("git_wait_failed: {error}"))
+}
+
+fn git_head_short_hash(workspace: &Path) -> Result<String, String> {
+    let args = vec![
+        "rev-parse".to_string(),
+        "--short".to_string(),
+        "HEAD".to_string(),
+    ];
+    let output = run_git_process(workspace, &args, GIT_COMMAND_TIMEOUT_MS)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git_failed: {}", stderr));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn command_vector(args: &[String]) -> Vec<String> {
+    std::iter::once("git".to_string())
+        .chain(args.iter().cloned())
+        .collect()
+}
+
+fn display_git_command(args: &[String]) -> String {
+    command_vector(args)
+        .iter()
+        .map(|arg| {
+            if arg.chars().any(char::is_whitespace) {
+                format!("\"{}\"", arg.replace('"', "\\\""))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate_output(bytes: &[u8], max_bytes: usize) -> (String, bool) {
+    if bytes.len() <= max_bytes {
+        return (String::from_utf8_lossy(bytes).to_string(), false);
+    }
+    let mut text = String::from_utf8_lossy(&bytes[..max_bytes]).to_string();
+    text.push_str(&format!("\n<truncated: output exceeded {max_bytes} bytes>"));
+    (text, true)
+}
+
+fn add_pathspec_args(args: &mut Vec<String>, pathspecs: &[String]) {
+    if pathspecs.is_empty() {
+        return;
+    }
+    args.push("--".to_string());
+    args.extend(pathspecs.iter().cloned());
+}
+
+fn git_max_bytes(arguments: &Value) -> Result<usize, String> {
+    let max_bytes = optional_usize(arguments, "max_bytes", DEFAULT_GIT_OUTPUT_MAX_BYTES)?;
+    if max_bytes == 0 {
+        return Err("invalid_arguments: max_bytes must be >= 1".to_string());
+    }
+    Ok(max_bytes.min(MAX_GIT_OUTPUT_MAX_BYTES))
+}
+
+fn optional_string_array(arguments: &Value, key: &str) -> Result<Vec<String>, String> {
+    match arguments.get(key) {
+        Some(Value::Null) | None => Ok(Vec::new()),
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![trimmed.to_string()])
+            }
+        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("invalid_arguments: `{key}` entries must be strings"))
+            })
+            .collect(),
+        _ => Err(format!(
+            "invalid_arguments: `{key}` must be a string or array of strings"
+        )),
+    }
+}
+
+fn optional_body_paragraphs(arguments: &Value) -> Result<Vec<String>, String> {
+    let mut paragraphs = Vec::new();
+    if let Some(body) = optional_string(arguments, "body")? {
+        let body = body.trim();
+        if !body.is_empty() {
+            paragraphs.push(body.to_string());
+        }
+    }
+    match arguments.get("body_paragraphs") {
+        Some(Value::Null) | None => {}
+        Some(Value::Array(items)) => {
+            for item in items {
+                let paragraph = item
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        "invalid_arguments: `body_paragraphs` entries must be strings".to_string()
+                    })?;
+                paragraphs.push(paragraph.to_string());
+            }
+        }
+        _ => {
+            return Err(
+                "invalid_arguments: `body_paragraphs` must be an array of strings".to_string(),
+            )
+        }
+    }
+    Ok(paragraphs)
 }
 
 fn resolve_write_path(workspace: &Path, raw_path: &str) -> Result<PathBuf, String> {

@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-use crate::tool_interface::ToolOutput;
+use crate::tool_interface::{ToolOutput, ToolOutputStatus};
 
 pub const MCP_LIST_SERVERS_TOOL_NAME: &str = "mcp_list_servers";
 pub const MCP_CONNECT_SERVER_TOOL_NAME: &str = "mcp_connect_server";
@@ -22,6 +22,7 @@ pub const MCP_LIST_TOOLS_TOOL_NAME: &str = "mcp_list_tools";
 
 const MCP_TOOL_PREFIX: &str = "mcp__";
 const MAX_TOOL_NAME_BYTES: usize = 64;
+const MCP_ERROR_TEXT_MAX_CHARS: usize = 1200;
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
@@ -444,7 +445,8 @@ impl McpRuntime {
                 let raw_tool_name = tool.name.to_string();
                 let model_tool_name =
                     unique_model_tool_name(server_id, &raw_tool_name, &mut used_model_tool_names);
-                let definition = openai_tool_definition(&model_tool_name, &tool);
+                let definition =
+                    openai_tool_definition(server_id, &raw_tool_name, &model_tool_name, &tool);
                 McpToolDefinition {
                     server_name: server_id.to_string(),
                     raw_tool_name,
@@ -822,19 +824,53 @@ async fn list_server_tools(
         .collect())
 }
 
-fn openai_tool_definition(model_tool_name: &str, tool: &Tool) -> Value {
+fn openai_tool_definition(
+    server_id: &str,
+    raw_tool_name: &str,
+    model_tool_name: &str,
+    tool: &Tool,
+) -> Value {
     let mut parameters = Value::Object(tool.input_schema.as_ref().clone());
     if !parameters.is_object() {
         parameters = json!({ "type": "object", "properties": {} });
     }
+    let base_description = tool.description.as_deref().unwrap_or("MCP tool");
+    let description =
+        mcp_tool_description(server_id, raw_tool_name, model_tool_name, base_description);
     json!({
         "type": "function",
         "function": {
             "name": model_tool_name,
-            "description": tool.description.as_deref().unwrap_or("MCP tool"),
+            "description": description,
             "parameters": parameters,
         }
     })
+}
+
+fn mcp_tool_description(
+    server_id: &str,
+    raw_tool_name: &str,
+    model_tool_name: &str,
+    base_description: &str,
+) -> String {
+    let mut description = format!(
+        "MCP server `{server_id}` tool `{raw_tool_name}`, exposed as model tool `{model_tool_name}`. Call this wrapper directly; do not pass the CodeForge wrapper name, server id, or `mcp__...` prefix as an argument. {base_description}"
+    );
+
+    match raw_tool_name {
+        "call_tool" => description.push_str(
+            " For tool-search MCP servers, set `toolset_name` to an exact toolset name returned by the server's list_toolsets tool. Set `tool_name` to the unqualified tool name inside that toolset; if describe_toolset lists a fully qualified name like `ToolsetName.ToolName`, pass only `ToolName`.",
+        ),
+        "describe_toolset" => description.push_str(
+            " Set `toolset_name` to an exact toolset name returned by this same MCP server's list_toolsets tool.",
+        ),
+        "list_toolsets" => description.push_str(
+            " Use the returned toolset names verbatim in this server's describe_toolset or call_tool arguments.",
+        ),
+        _ => {}
+    }
+
+    description
 }
 
 fn unique_model_tool_name(
@@ -901,7 +937,13 @@ fn call_tool_result_to_output(
     });
     let summary = mcp_result_summary(server_name, raw_tool_name, &output);
     if result.is_error.unwrap_or(false) {
-        ToolOutput::error(summary, elapsed_ms)
+        ToolOutput {
+            status: ToolOutputStatus::Error,
+            output: Some(output.clone()),
+            error: Some(mcp_error_message(&summary, &output)),
+            elapsed_ms,
+            summary: Some(summary),
+        }
     } else {
         ToolOutput::ok_with_summary(output, elapsed_ms, summary)
     }
@@ -914,6 +956,40 @@ fn mcp_result_summary(server_name: &str, raw_tool_name: &str, output: &Value) ->
         .map(Vec::len)
         .unwrap_or_default();
     format!("MCP {server_name}/{raw_tool_name} returned {content_count} content item(s)")
+}
+
+fn mcp_error_message(summary: &str, output: &Value) -> String {
+    if let Some(text) = mcp_content_text_excerpt(output) {
+        return format!("{summary}: {text}");
+    }
+    summary.to_string()
+}
+
+fn mcp_content_text_excerpt(output: &Value) -> Option<String> {
+    let content = output.get("content").and_then(Value::as_array)?;
+    let mut parts = Vec::new();
+    for item in content {
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            let text = text.trim();
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(&parts.join("\n"), MCP_ERROR_TEXT_MAX_CHARS))
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut iter = value.chars();
+    let truncated = iter.by_ref().take(max_chars).collect::<String>();
+    if iter.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 fn action_result(
@@ -1061,6 +1137,40 @@ mod tests {
         assert_eq!(first.len(), MAX_TOOL_NAME_BYTES);
         assert_eq!(second.len(), MAX_TOOL_NAME_BYTES);
         assert!(second.ends_with("_2"));
+    }
+
+    #[test]
+    fn call_tool_description_teaches_tool_search_argument_shape() {
+        let description = mcp_tool_description(
+            "ue",
+            "call_tool",
+            "mcp__ue__call_tool",
+            "Call a tool by name.",
+        );
+
+        assert!(description.contains("do not pass the CodeForge wrapper name"));
+        assert!(description.contains("mcp__..."));
+        assert!(description.contains("exact toolset name returned"));
+        assert!(description.contains("unqualified tool name"));
+        assert!(description.contains("pass only `ToolName`"));
+    }
+
+    #[test]
+    fn mcp_error_message_includes_text_content() {
+        let output = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Toolset 'mcp__ue' not found. Available toolsets: editor_toolset.toolsets.scene.SceneTools"
+                }
+            ]
+        });
+
+        let message = mcp_error_message("MCP ue/call_tool returned 1 content item(s)", &output);
+
+        assert!(message.contains("MCP ue/call_tool returned 1 content item(s):"));
+        assert!(message.contains("Toolset 'mcp__ue' not found"));
+        assert!(message.contains("editor_toolset.toolsets.scene.SceneTools"));
     }
 
     #[test]

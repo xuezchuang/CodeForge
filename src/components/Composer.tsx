@@ -1,5 +1,6 @@
 import {
   ArrowUp,
+  Box,
   Check,
   ChevronDown,
   ChevronRight,
@@ -10,6 +11,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, ClipboardEvent, KeyboardEvent } from 'react'
+import type { CodeforgeSkillSummary } from '../api/tauriApi'
 import type { ModelReasoningMode, ProviderConfig, ProviderModel } from '../types/provider'
 import type { MessageAttachment } from '../types/task'
 import {
@@ -23,6 +25,7 @@ interface ComposerProps {
   busy: boolean
   sendBlocked?: boolean
   sendBlockTitle?: string
+  skills?: CodeforgeSkillSummary[]
   value: string
   onChange: (value: string) => void
   onSend: (
@@ -53,9 +56,15 @@ type SlashCommand = {
   command: string
   title: string
   description: string
+  insertText?: string
+  keywords?: string[]
 }
 
-const slashCommands: SlashCommand[] = [
+type ActiveSkillDisplay = {
+  label: string
+}
+
+const builtinSlashCommands: SlashCommand[] = [
   {
     command: '/init',
     title: 'Init AI context',
@@ -73,6 +82,7 @@ function Composer({
   busy,
   sendBlocked = false,
   sendBlockTitle = 'Send unavailable',
+  skills = [],
   value,
   onChange,
   onSend,
@@ -90,6 +100,7 @@ function Composer({
   const [composerFocused, setComposerFocused] = useState(false)
   const [dismissedSlashValue, setDismissedSlashValue] = useState('')
   const selectableModels = useMemo(() => getSelectableModels(providers), [providers])
+  const slashCommands = useMemo(() => buildSlashCommands(skills), [skills])
   const defaultSelectableModel = useMemo(
     () => getDefaultSelectableModel(providers, selectableModels),
     [providers, selectableModels],
@@ -114,7 +125,14 @@ function Composer({
     () => buildReasoningChoices(selectedModelReasoningMode, selectedProviderModel),
     [selectedModelReasoningMode, selectedProviderModel],
   )
-  const slashMatches = useMemo(() => matchingSlashCommands(value), [value])
+  const slashMatches = useMemo(
+    () => matchingSlashCommands(value, slashCommands),
+    [slashCommands, value],
+  )
+  const activeSkillDisplay = useMemo(
+    () => selectedSkillDisplayFromValue(value, skills),
+    [skills, value],
+  )
   const showSlashMenu =
     composerFocused &&
     !busy &&
@@ -156,10 +174,14 @@ function Composer({
     if (!textarea) {
       return
     }
+    if (activeSkillDisplay) {
+      textarea.style.height = '0px'
+      return
+    }
     textarea.style.height = '0px'
     const nextHeight = Math.min(Math.max(textarea.scrollHeight, 36), 128)
     textarea.style.height = `${nextHeight}px`
-  }, [value])
+  }, [activeSkillDisplay, value])
 
   useEffect(() => {
     if (!pickerOpen) {
@@ -231,7 +253,7 @@ function Composer({
   }
 
   const selectSlashCommand = (command: SlashCommand) => {
-    onChange(command.command)
+    onChange(command.insertText ?? command.command)
     setDismissedSlashValue('')
     window.requestAnimationFrame(() => textareaRef.current?.focus())
   }
@@ -322,9 +344,23 @@ function Composer({
         {attachmentError ? (
           <div className="composer-attachment-error">{attachmentError}</div>
         ) : null}
+        {activeSkillDisplay ? (
+          <button
+            type="button"
+            className="composer-active-skill"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => textareaRef.current?.focus()}
+            title={value}
+          >
+            <Box size={18} aria-hidden="true" />
+            <span>{activeSkillDisplay.label}</span>
+          </button>
+        ) : null}
         <textarea
           ref={textareaRef}
-          className="composer-input"
+          className={
+            activeSkillDisplay ? 'composer-input composer-input-skill-value' : 'composer-input'
+          }
           value={value}
           onChange={(event) => {
             setDismissedSlashValue('')
@@ -610,14 +646,80 @@ function fileToImageAttachment(file: File): Promise<MessageAttachment> {
 
 export default Composer
 
-function matchingSlashCommands(value: string): SlashCommand[] {
+function buildSlashCommands(skills: CodeforgeSkillSummary[]): SlashCommand[] {
+  const commands = [...builtinSlashCommands]
+  const seenCommands = new Set(commands.map((command) => command.command.toLowerCase()))
+
+  for (const skill of skills) {
+    const name = skill.name.trim()
+    if (!name) {
+      continue
+    }
+    const command = `/${name}`
+    const commandKey = command.toLowerCase()
+    if (seenCommands.has(commandKey)) {
+      continue
+    }
+    seenCommands.add(commandKey)
+
+    const description = skill.description.trim()
+    commands.push({
+      command,
+      title: skillDisplayLabel(name),
+      description: description || `Use the ${name} workspace skill.`,
+      insertText: `/skill ${name}`,
+      keywords: [name, `skill ${name}`, name.replace(/-/g, ' ')],
+    })
+  }
+
+  return commands
+}
+
+function selectedSkillDisplayFromValue(
+  value: string,
+  skills: CodeforgeSkillSummary[],
+): ActiveSkillDisplay | null {
+  const match = value.trim().match(/^\/skills?\s+([^\s]+)$/i)
+  if (!match) {
+    return null
+  }
+
+  const requestedName = match[1].toLowerCase()
+  const skill = skills.find((item) => item.name.trim().toLowerCase() === requestedName)
+  if (!skill) {
+    return null
+  }
+
+  return {
+    label: skillDisplayLabel(skill.name),
+  }
+}
+
+function skillDisplayLabel(name: string): string {
+  return name
+    .trim()
+    .split(/[-_\s]+/)
+    .filter((part) => part.length > 0)
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(' ')
+}
+
+function matchingSlashCommands(
+  value: string,
+  slashCommands: SlashCommand[],
+): SlashCommand[] {
   if (!value.startsWith('/') || /\s/.test(value)) {
     return []
   }
   const query = value.slice(1).toLowerCase()
-  return slashCommands.filter((command) =>
-    command.command.slice(1).toLowerCase().startsWith(query),
-  )
+  return slashCommands.filter((command) => {
+    const candidates = [
+      command.command.slice(1),
+      command.title,
+      ...(command.keywords ?? []),
+    ]
+    return candidates.some((candidate) => candidate.toLowerCase().startsWith(query))
+  })
 }
 
 function resolveReasoningMode(

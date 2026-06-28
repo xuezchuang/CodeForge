@@ -84,8 +84,6 @@ function ConversationChatMessage({
     displayContent,
     isRunningAssistant,
   )
-  const animateThinkingPrefix =
-    isRunningAssistant && bufferedDisplayContent.startsWith(THINKING_PREFIX)
   const [copiedTarget, setCopiedTarget] = useState<'user' | 'assistant' | null>(null)
   const [activeToolTrace, setActiveToolTrace] = useState<ToolTraceEvent | null>(null)
   const [editDraft, setEditDraft] = useState(message.content)
@@ -212,16 +210,18 @@ function ConversationChatMessage({
               </button>
             </div>
           </div>
-        ) : !animateThinkingPrefix && (bufferedDisplayContent.trim().length > 0 || !message.attachments?.length) ? (
+        ) : (bufferedDisplayContent.trim().length > 0 || !message.attachments?.length) ? (
           <div className={isRunningAssistant ? 'message-content running-message-content' : 'message-content'}>
             {isRunningAssistant ? (
-              <RunningStreamContent
+              <RunningAssistantContent
                 text={bufferedDisplayContent}
+                thinkingSummary={thinkingSummary}
                 projectId={projectId}
                 taskId={message.taskId}
                 onCodeLinkResult={onCodeLinkResult}
                 onCodeLinkError={onCodeLinkError}
                 onTraceChanged={() => onTraceChanged(message.taskId)}
+                onToolTraceOpen={setActiveToolTrace}
               />
             ) : (
               <MarkdownMessage
@@ -285,20 +285,6 @@ function ConversationChatMessage({
                 />
               ))}
             </div>
-          </div>
-        ) : null}
-        {animateThinkingPrefix ? (
-          <div className="message-content running-message-content">
-            <RunningAssistantContent
-              text={bufferedDisplayContent}
-              thinkingSummary={thinkingSummary}
-              projectId={projectId}
-              taskId={message.taskId}
-              onCodeLinkResult={onCodeLinkResult}
-              onCodeLinkError={onCodeLinkError}
-              onTraceChanged={() => onTraceChanged(message.taskId)}
-              onToolTraceOpen={setActiveToolTrace}
-            />
           </div>
         ) : null}
         {!isUser && !hideAssistantActions ? (
@@ -627,23 +613,23 @@ function RunningAssistantContent({
   onTraceChanged,
   onToolTraceOpen,
 }: RunningAssistantContentProps) {
-  const detail = text.startsWith(THINKING_PREFIX) ? text.slice(THINKING_PREFIX.length) : text
-  const hasDetail = detail.trim().length > 0
-  const panelSummary =
-    hasDetail ? thinkingSummaryWithoutModelText(thinkingSummary) : thinkingSummary
+  const hasThinkingPrefix = text.startsWith(THINKING_PREFIX)
+  const bodyText = hasThinkingPrefix ? '' : text
+  const hasBodyText = bodyText.trim().length > 0
+  const hasThinkingItems = Boolean(thinkingSummary && thinkingSummary.items.length > 0)
 
   return (
     <>
-      {panelSummary && panelSummary.items.length > 0 ? (
+      {hasThinkingItems && thinkingSummary ? (
         <ThinkingPanel
-          summary={panelSummary}
+          summary={thinkingSummary}
           defaultOpen
           onToolTraceOpen={onToolTraceOpen}
         />
       ) : null}
-      {hasDetail ? (
+      {hasBodyText ? (
         <RunningStreamContent
-          text={detail}
+          text={bodyText}
           projectId={projectId}
           taskId={taskId}
           onCodeLinkResult={onCodeLinkResult}
@@ -651,7 +637,7 @@ function RunningAssistantContent({
           onTraceChanged={onTraceChanged}
         />
       ) : null}
-      {!hasDetail ? (
+      {!hasBodyText && !hasThinkingItems ? (
         <p className="markdown-paragraph running-thinking-line" aria-label={THINKING_RUNNING_TEXT}>
           {THINKING_RUNNING_TEXT.split('').map((character, index) => (
             <span
@@ -667,18 +653,6 @@ function RunningAssistantContent({
       ) : null}
     </>
   )
-}
-
-function thinkingSummaryWithoutModelText(summary: ThinkingSummary | null): ThinkingSummary | null {
-  if (!summary) {
-    return null
-  }
-  const items = summary.items.filter((item) => item.kind !== 'model')
-  return {
-    ...summary,
-    items,
-    omitted: summary.omitted,
-  }
 }
 
 function RunningStreamContent({
@@ -1705,10 +1679,28 @@ function ThinkingItemRow({
 }
 
 function useProgressiveText(text: string, enabled: boolean): string {
-  const [visibleChars, setVisibleChars] = useState(text.length)
+  const previousTextRef = useRef(text)
+  const previousEnabledRef = useRef(enabled)
+  const [visibleChars, setVisibleChars] = useState(() => enabled ? 0 : text.length)
 
   useEffect(() => {
-    setVisibleChars(enabled ? 0 : text.length)
+    setVisibleChars((current) => {
+      const previousText = previousTextRef.current
+      const wasEnabled = previousEnabledRef.current
+      previousTextRef.current = text
+      previousEnabledRef.current = enabled
+
+      if (!enabled) {
+        return text.length
+      }
+      if (!wasEnabled) {
+        return 0
+      }
+      if (text.startsWith(previousText)) {
+        return Math.min(current, text.length)
+      }
+      return 0
+    })
   }, [enabled, text])
 
   useEffect(() => {
@@ -1729,7 +1721,7 @@ function useProgressiveText(text: string, enabled: boolean): string {
     }
   }, [enabled, text, visibleChars])
 
-  return text.slice(0, visibleChars)
+  return text.slice(0, Math.min(visibleChars, text.length))
 }
 
 function ThinkingIcon({ kind }: { kind: ThinkingItem['kind'] }) {
@@ -2434,7 +2426,7 @@ function modelMessageContent(
 }
 
 function modelThinkingContent(
-  input: Record<string, unknown>,
+  _input: Record<string, unknown>,
   output: Record<string, unknown>,
   event: ToolTraceEvent,
 ): string {
@@ -2461,12 +2453,6 @@ function modelThinkingContent(
   )
   if (thinkBlock) {
     return normalizeThinkingText(thinkBlock)
-  }
-
-  if (event.type === 'model_message') {
-    return normalizeThinkingText(
-      firstRawText([input.content, output.content, output.message, event.outputSummary]),
-    )
   }
 
   return ''

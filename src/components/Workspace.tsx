@@ -129,6 +129,7 @@ function Workspace({
   const [mcpError, setMcpError] = useState<string | null>(null)
   const [mcpActionServerId, setMcpActionServerId] = useState<string | null>(null)
   const [mcpPanelOpen, setMcpPanelOpen] = useState(false)
+  const [workspaceSkills, setWorkspaceSkills] = useState<CodeforgeSkillSummary[]>([])
   const [composerDraftsByKey, setComposerDraftsByKey] = useState<Record<string, string>>({})
   const [workspaceToast, setWorkspaceToast] = useState<ToastState | null>(null)
   const [headerDivided, setHeaderDivided] = useState(false)
@@ -483,6 +484,30 @@ function Workspace({
     }
     void refreshMcpInventory()
   }, [activeProjectId, refreshMcpInventory])
+
+  useEffect(() => {
+    if (!activeProjectId) {
+      setWorkspaceSkills([])
+      return undefined
+    }
+
+    let cancelled = false
+    listSkills(activeProjectId)
+      .then((skills) => {
+        if (!cancelled) {
+          setWorkspaceSkills(skills)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setWorkspaceSkills([])
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeProjectId])
 
   const connectMcp = async (serverId: string) => {
     setMcpActionServerId(serverId)
@@ -968,6 +993,7 @@ function Workspace({
             error: caught instanceof Error ? caught.message : String(caught),
           })),
       ])
+      setWorkspaceSkills(skills)
       const assistantMessage = createMessage(
         sessionTaskId,
         'assistant',
@@ -1358,6 +1384,7 @@ function Workspace({
               <Composer
                 providers={state.providers}
                 busy={busy || currentTaskIsRunning || currentTask?.messagesLoaded === false}
+                skills={workspaceSkills}
                 value={composerDraft}
                 onChange={setComposerDraft}
                 onSend={runTask}
@@ -2244,23 +2271,6 @@ function latestStreamingModelContent(traces: ToolTraceEvent[]): string {
     if (content) {
       return content
     }
-    const reasoning = streamingReasoningContent(output)
-    if (reasoning) {
-      return `Thinking...\n\n${reasoning}`
-    }
-  }
-  return ''
-}
-
-function streamingReasoningContent(output: Record<string, unknown>): string {
-  for (const key of ['reasoning_content', 'reasoningContent', 'reasoning']) {
-    const value = output[key]
-    if (typeof value === 'string') {
-      const reasoning = sanitizeModelMessage(value)
-      if (reasoning) {
-        return reasoning
-      }
-    }
   }
   return ''
 }
@@ -2484,8 +2494,7 @@ function createAgentProgressDisplay({
   const terminalStatus = taskTerminalProgressStatus(task)
   const displaySnapshot =
     snapshot ??
-    (running ? createPreparingProgressSnapshot()
-    : terminalStatus ? createTerminalProgressSnapshot(terminalStatus)
+    (terminalStatus ? createTerminalProgressSnapshot(terminalStatus)
     : null)
   if (!displaySnapshot) {
     return null
@@ -2544,23 +2553,6 @@ function createTerminalProgressSnapshot(status: ProgressTaskStatus): ProgressSna
       },
     ],
     completedCount: status === 'completed' ? 1 : 0,
-    totalCount: 1,
-  }
-}
-
-function createPreparingProgressSnapshot(): ProgressSnapshot {
-  return {
-    title: 'Agent progress',
-    mode: '',
-    summary: '',
-    steps: [
-      {
-        id: 'waiting-for-agent-steps',
-        title: 'Waiting for agent steps',
-        status: 'in_progress',
-      },
-    ],
-    completedCount: 0,
     totalCount: 1,
   }
 }

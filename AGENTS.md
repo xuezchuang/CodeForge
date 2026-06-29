@@ -45,3 +45,9 @@ a request to inspect the saved conversation messages for those IDs before answer
 ## Scope
 
 Keep changes focused on the user's request. Do not revert unrelated dirty worktree changes.
+
+## MIDAS Gateway Source
+
+The active MIDAS gateway code has been moved to the NAS server. When investigating
+or changing gateway behavior, do not assume `D:\work\midas-ai-gateway` is current;
+ask for or access the NAS copy first.

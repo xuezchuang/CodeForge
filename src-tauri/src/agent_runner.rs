@@ -41,7 +41,8 @@ const EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT: usize = 1;
 const MODEL_REQUEST_TIMEOUT_SECONDS: u64 = 360;
 const MCP_AGENT_STARTUP_BUDGET: Duration = Duration::from_secs(2);
 const STREAMING_TRACE_INTERVAL_MS: u64 = 750;
-const MODEL_RATE_LIMIT_RETRY_DELAYS_MS: [u64; 3] = [3_000, 10_000, 30_000];
+const MODEL_REQUEST_MAX_ATTEMPTS: usize = 3;
+const MODEL_REQUEST_RETRY_DELAYS_MS: [u64; 2] = [1_000, 3_000];
 const PPTX_IMAGE_ANALYSIS_BATCH_SIZE: usize = 16;
 const PARALLEL_READONLY_TOOL_LIMIT: usize = 4;
 const CONTEXT_COMPACTION_ESTIMATED_TOKEN_LIMIT: usize = 96_000;
@@ -3767,21 +3768,28 @@ async fn send_chat_completion(
     streaming_trace: Option<StreamingTraceSink<'_>>,
 ) -> Result<ChatCompletionResult, String> {
     let mut streaming_trace = streaming_trace;
-    let mut last_error = String::new();
-    for attempt in 0..=MODEL_RATE_LIMIT_RETRY_DELAYS_MS.len() {
+    for attempt in 0..MODEL_REQUEST_MAX_ATTEMPTS {
         match send_chat_completion_once(selected, request_body, streaming_trace.as_mut()).await {
             Ok(completion) => return Ok(completion),
             Err(error) => {
-                if !is_rate_limit_error(&error) || attempt >= MODEL_RATE_LIMIT_RETRY_DELAYS_MS.len()
+                let attempts_used = attempt + 1;
+                if !is_retryable_model_request_error(&error)
+                    || attempts_used >= MODEL_REQUEST_MAX_ATTEMPTS
                 {
+                    if attempts_used >= MODEL_REQUEST_MAX_ATTEMPTS
+                        && is_retryable_model_request_error(&error)
+                    {
+                        return Err(format!(
+                            "{error} after {MODEL_REQUEST_MAX_ATTEMPTS} attempts"
+                        ));
+                    }
                     return Err(error);
                 }
-                last_error = error;
-                sleep_rate_limit_retry(MODEL_RATE_LIMIT_RETRY_DELAYS_MS[attempt]).await;
+                sleep_model_request_retry(MODEL_REQUEST_RETRY_DELAYS_MS[attempt]).await;
             }
         }
     }
-    Err(last_error)
+    Err("Model request failed before any attempt was made".to_string())
 }
 
 async fn send_chat_completion_once(
@@ -3872,7 +3880,25 @@ fn is_rate_limit_error(error: &str) -> bool {
         || lower.contains("\"type\":\"toomanyrequests\"")
 }
 
-async fn sleep_rate_limit_retry(delay_ms: u64) {
+fn is_retryable_model_request_error(error: &str) -> bool {
+    is_rate_limit_error(error)
+        || is_transport_send_error(error)
+        || is_transient_gateway_status(error)
+}
+
+fn is_transport_send_error(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("error sending request")
+}
+
+fn is_transient_gateway_status(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("status=500")
+        || lower.contains("status=502")
+        || lower.contains("status=503")
+        || lower.contains("status=504")
+}
+
+async fn sleep_model_request_retry(delay_ms: u64) {
     let delay = Duration::from_millis(delay_ms);
     let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(delay)).await;
 }
@@ -6174,6 +6200,31 @@ mod tests {
             "Model request failed. status=429; body=too many requests"
         ));
         assert!(!is_rate_limit_error(
+            r#"{"error":{"code":"InvalidParameter","type":"BadRequest"}}"#
+        ));
+    }
+
+    #[test]
+    fn model_request_retry_limit_is_three_attempts() {
+        assert_eq!(MODEL_REQUEST_MAX_ATTEMPTS, 3);
+        assert_eq!(
+            MODEL_REQUEST_RETRY_DELAYS_MS.len() + 1,
+            MODEL_REQUEST_MAX_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn model_request_errors_are_retryable_only_when_transient() {
+        assert!(is_retryable_model_request_error(
+            "Model request failed: error sending request for url (https://api.snowsome.com/v1/chat/completions)"
+        ));
+        assert!(is_retryable_model_request_error(
+            "Model request failed. status=502; body=bad gateway"
+        ));
+        assert!(!is_retryable_model_request_error(
+            r#"Model request failed. status=401; body={"error":{"message":"Invalid API key"}}"#
+        ));
+        assert!(!is_retryable_model_request_error(
             r#"{"error":{"code":"InvalidParameter","type":"BadRequest"}}"#
         ));
     }

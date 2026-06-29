@@ -71,6 +71,7 @@ interface WorkspaceProps {
 interface SelectedTrace {
   taskId: string
   events: ToolTraceEvent[]
+  source: 'auto' | 'manual'
 }
 
 interface ComposerModelSelection {
@@ -444,7 +445,7 @@ function Workspace({
         }
         if (!current) {
           const firstTrace = task.traceEvents[0]
-          return firstTrace ? { taskId: firstTrace.taskId, events: task.traceEvents } : null
+          return firstTrace ? { taskId: firstTrace.taskId, events: task.traceEvents, source: 'auto' } : null
         }
         return taskHasTraceSelection(task, current.taskId) ? current : null
       })
@@ -758,13 +759,19 @@ function Workspace({
           return
         }
         if (currentWorkspaceTaskIdRef.current === sessionTaskId) {
-          setSelectedTrace((current) => ({
-            taskId: traceEvent.taskId,
-            events:
-              current?.taskId === traceEvent.taskId ?
-                upsertTraceEvent(current.events, traceEvent)
-              : [traceEvent],
-          }))
+          setSelectedTrace((current) => {
+            if (current?.source === 'manual' && current.taskId !== traceEvent.taskId) {
+              return current
+            }
+            return {
+              taskId: traceEvent.taskId,
+              events:
+                current?.taskId === traceEvent.taskId ?
+                  upsertTraceEvent(current.events, traceEvent)
+                : [traceEvent],
+              source: current?.taskId === traceEvent.taskId ? current.source : 'auto',
+            }
+          })
         }
         setState((current) =>
           appendTraceEventToSession(
@@ -793,7 +800,16 @@ function Workspace({
         pendingAssistantMessage.id,
       )
       if (currentWorkspaceTaskIdRef.current === sessionTaskId) {
-        setSelectedTrace({ taskId: run.taskId, events: run.traces })
+        setSelectedTrace((current) => {
+          if (current?.source === 'manual' && current.taskId !== run.taskId) {
+            return current
+          }
+          return {
+            taskId: run.taskId,
+            events: run.traces,
+            source: current?.taskId === run.taskId ? current.source : 'auto',
+          }
+        })
       }
 
       setState((current) =>
@@ -1075,7 +1091,7 @@ function Workspace({
       const traces = await listTraces(taskId)
       setSelectedTrace((current) =>
         current?.taskId === taskId ?
-          { taskId, events: mergeTraceEvents(current.events, traces) }
+          { taskId, events: mergeTraceEvents(current.events, traces), source: current.source }
         : current,
       )
       setState((current) => updateTraceEventsForMessage(current, taskId, traces))
@@ -1095,7 +1111,7 @@ function Workspace({
         currentTraceEvents
       : [])
 
-    setSelectedTrace({ taskId: message.taskId, events })
+    setSelectedTrace({ taskId: message.taskId, events, source: 'manual' })
     setState((current) => ({
       ...current,
       traceDrawerOpen: true,

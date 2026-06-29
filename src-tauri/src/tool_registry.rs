@@ -911,7 +911,7 @@ fn edit_file_definition() -> Value {
         "type": "function",
         "function": {
             "name": EDIT_FILE_TOOL_NAME,
-            "description": "Edit a text file inside the workspace by replacing one exact text block. Prefer this over raw patch tools for third-party models.",
+            "description": "Edit an existing text file inside the workspace by replacing one exact text block. Prefer this for existing-file changes. The match is CRLF/LF tolerant and preserves the target file's existing line endings.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -930,7 +930,7 @@ fn write_file_definition() -> Value {
         "type": "function",
         "function": {
             "name": WRITE_FILE_TOOL_NAME,
-            "description": "Write UTF-8 text to a workspace-relative file. Creates parent directories inside the workspace.",
+            "description": "Write UTF-8 text to a workspace-relative file. Use this mainly for new files or intentional full-file writes; use edit_file for existing-file modifications. Existing-file overwrites are protected against placeholder/test content and large destructive shrinkage. Line endings use the existing file style, or .vscode/settings.json files.eol, or CRLF by default.",
             "parameters": {
                 "type": "object",
                 "properties": {

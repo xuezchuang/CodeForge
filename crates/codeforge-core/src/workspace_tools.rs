@@ -32,6 +32,8 @@ const READ_FILE_RECOVERY_MAX_ROOTS: usize = 8;
 const DEFAULT_GIT_OUTPUT_MAX_BYTES: usize = 200_000;
 const MAX_GIT_OUTPUT_MAX_BYTES: usize = 500_000;
 const GIT_COMMAND_TIMEOUT_MS: u64 = 120_000;
+const LARGE_OVERWRITE_MIN_BYTES: usize = 1024;
+const LARGE_OVERWRITE_MIN_LINES: usize = 100;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -53,6 +55,36 @@ const DEFAULT_CONTENT_EXTENSIONS: &[&str] = &[
     ".jsx", ".css", ".scss", ".sass", ".less", ".html", ".sln", ".vcxproj", ".props",
     ".targets", ".json", ".xml", ".txt", ".md", ".log",
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineEnding {
+    Crlf,
+    Lf,
+}
+
+impl LineEnding {
+    fn sequence(self) -> &'static str {
+        match self {
+            Self::Crlf => "\r\n",
+            Self::Lf => "\n",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Crlf => "crlf",
+            Self::Lf => "lf",
+        }
+    }
+
+    fn from_setting(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "\r\n" | "\\r\\n" | "crlf" => Some(Self::Crlf),
+            "\n" | "\\n" | "lf" => Some(Self::Lf),
+            _ => None,
+        }
+    }
+}
 
 pub fn list_dir(workspace_root: &str, arguments: &Value) -> Result<Value, String> {
     let workspace = canonical_workspace_root(workspace_root)?;
@@ -130,6 +162,7 @@ pub fn read_file(workspace_root: &str, arguments: &Value) -> Result<Value, Strin
     };
     let file = resolved.file;
     ensure_regular_text_file(&workspace, &file)?;
+    let line_ending = detect_file_line_ending(&file).unwrap_or_else(|| workspace_line_ending(&workspace));
 
     let start_line = optional_usize(arguments, "start_line", 1)?;
     if start_line == 0 {
@@ -175,6 +208,7 @@ pub fn read_file(workspace_root: &str, arguments: &Value) -> Result<Value, Strin
         "maxLines": DEFAULT_MAX_READ_LINES,
         "truncated": truncated,
         "message": message,
+        "lineEnding": line_ending.label(),
         "text": text,
         "lines": lines,
     });
@@ -376,13 +410,18 @@ pub fn edit_file(workspace_root: &str, arguments: &Value) -> Result<Value, Strin
     }
     let file = resolve_existing_path(&workspace, &raw_file)?;
     ensure_regular_text_file(&workspace, &file)?;
+    let configured_line_ending = workspace_line_ending(&workspace);
     let original = fs::read_to_string(&file).map_err(|error| {
         format!(
             "read_failed: {}: {error}",
             relative_or_display(&workspace, &file)
         )
     })?;
-    let count = original.matches(&search).count();
+    let line_ending = detect_text_line_ending(&original).unwrap_or(configured_line_ending);
+    let normalized_search = normalize_line_endings(&search, line_ending);
+    let normalized_replace = normalize_line_endings(&replace, line_ending);
+    let search_text = select_unique_edit_search(&workspace, &file, &original, &search, &normalized_search)?;
+    let count = original.matches(search_text).count();
     if count == 0 {
         return Err(format!(
             "edit_not_applied: search text not found in {}",
@@ -392,7 +431,7 @@ pub fn edit_file(workspace_root: &str, arguments: &Value) -> Result<Value, Strin
     if count > 1 {
         return Err(format!("ambiguous_edit: search text matched {count} times in {}; provide a larger unique block", relative_path(&workspace, &file)));
     }
-    let updated = original.replacen(&search, &replace, 1);
+    let updated = original.replacen(search_text, &normalized_replace, 1);
     fs::write(&file, updated).map_err(|error| {
         format!(
             "write_failed: {}: {error}",
@@ -402,6 +441,8 @@ pub fn edit_file(workspace_root: &str, arguments: &Value) -> Result<Value, Strin
     Ok(json!({
         "file": relative_path(&workspace, &file),
         "replacements": 1,
+        "lineEnding": line_ending.label(),
+        "lineEndingsNormalized": search_text != search || normalized_replace != replace,
     }))
 }
 
@@ -410,6 +451,25 @@ pub fn write_file(workspace_root: &str, arguments: &Value) -> Result<Value, Stri
     let raw_file = required_string(arguments, "file")?;
     let content = required_string(arguments, "content")?;
     let file = resolve_write_path(&workspace, &raw_file)?;
+    let existing = if file.exists() {
+        ensure_regular_text_file(&workspace, &file)?;
+        Some(fs::read_to_string(&file).map_err(|error| {
+            format!(
+                "read_failed: {}: {error}",
+                relative_or_display(&workspace, &file)
+            )
+        })?)
+    } else {
+        None
+    };
+    let line_ending = existing
+        .as_deref()
+        .and_then(detect_text_line_ending)
+        .unwrap_or_else(|| workspace_line_ending(&workspace));
+    let content = normalize_line_endings(&content, line_ending);
+    if let Some(original) = existing.as_deref() {
+        protect_existing_file_overwrite(&workspace, &file, original, &content)?;
+    }
     let bytes = content.len();
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent)
@@ -424,6 +484,7 @@ pub fn write_file(workspace_root: &str, arguments: &Value) -> Result<Value, Stri
     Ok(json!({
         "file": relative_path(&workspace, &file),
         "bytes": bytes,
+        "lineEnding": line_ending.label(),
     }))
 }
 
@@ -1204,6 +1265,154 @@ fn search_limited_recovery_hint() -> &'static str {
     "Do not repeat the same broad search. Retry with a narrower root/path or file_glob; if a likely file is known, search that file directly or use get_file_context around a known returned line. Do not manually sweep large files by random chunks."
 }
 
+fn workspace_line_ending(workspace: &Path) -> LineEnding {
+    let settings_path = workspace.join(".vscode").join("settings.json");
+    let Ok(settings) = fs::read_to_string(settings_path) else {
+        return LineEnding::Crlf;
+    };
+
+    parse_files_eol_from_settings(&settings).unwrap_or(LineEnding::Crlf)
+}
+
+fn parse_files_eol_from_settings(settings: &str) -> Option<LineEnding> {
+    if let Ok(value) = serde_json::from_str::<Value>(settings) {
+        if let Some(eol) = value.get("files.eol").and_then(Value::as_str) {
+            if let Some(line_ending) = LineEnding::from_setting(eol) {
+                return Some(line_ending);
+            }
+        }
+    }
+
+    let regex = Regex::new(r#""files\.eol"\s*:\s*"([^"]+)""#).ok()?;
+    let raw = regex.captures(settings)?.get(1)?.as_str();
+    LineEnding::from_setting(raw)
+}
+
+fn detect_file_line_ending(file: &Path) -> Option<LineEnding> {
+    fs::read_to_string(file)
+        .ok()
+        .and_then(|content| detect_text_line_ending(&content))
+}
+
+fn detect_text_line_ending(text: &str) -> Option<LineEnding> {
+    let bytes = text.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            return if index > 0 && bytes[index - 1] == b'\r' {
+                Some(LineEnding::Crlf)
+            } else {
+                Some(LineEnding::Lf)
+            };
+        }
+    }
+    None
+}
+
+fn normalize_line_endings(text: &str, line_ending: LineEnding) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    match line_ending {
+        LineEnding::Lf => normalized,
+        LineEnding::Crlf => normalized.replace('\n', line_ending.sequence()),
+    }
+}
+
+fn select_unique_edit_search<'a>(
+    workspace: &Path,
+    file: &Path,
+    original: &str,
+    search: &'a str,
+    normalized_search: &'a str,
+) -> Result<&'a str, String> {
+    let search_count = original.matches(search).count();
+    if search_count == 1 {
+        return Ok(search);
+    }
+
+    if normalized_search != search {
+        let normalized_count = original.matches(normalized_search).count();
+        if normalized_count == 1 {
+            return Ok(normalized_search);
+        }
+        if normalized_count > 1 {
+            return Err(format!("ambiguous_edit: search text matched {normalized_count} times in {}; provide a larger unique block", relative_path(workspace, file)));
+        }
+    }
+
+    if search_count > 1 {
+        return Err(format!("ambiguous_edit: search text matched {search_count} times in {}; provide a larger unique block", relative_path(workspace, file)));
+    }
+
+    Err(format!(
+        "edit_not_applied: search text not found in {}",
+        relative_path(workspace, file)
+    ))
+}
+
+fn protect_existing_file_overwrite(
+    workspace: &Path,
+    file: &Path,
+    original: &str,
+    content: &str,
+) -> Result<(), String> {
+    if original == content || original.is_empty() {
+        return Ok(());
+    }
+
+    if looks_like_placeholder_content(content) {
+        return Err(format!(
+            "unsafe_write_file: refusing to overwrite existing {} with placeholder, test, or empty content; use edit_file for existing-file changes",
+            relative_path(workspace, file)
+        ));
+    }
+
+    let original_bytes = original.len();
+    let new_bytes = content.len();
+    if original_bytes >= LARGE_OVERWRITE_MIN_BYTES && new_bytes.saturating_mul(4) < original_bytes
+    {
+        return Err(format!(
+            "unsafe_write_file: refusing to shrink existing {} from {original_bytes} bytes to {new_bytes} bytes; use edit_file for targeted changes",
+            relative_path(workspace, file)
+        ));
+    }
+
+    let original_lines = text_line_count(original);
+    let new_lines = text_line_count(content);
+    if original_lines >= LARGE_OVERWRITE_MIN_LINES
+        && new_lines.saturating_mul(4) < original_lines
+    {
+        return Err(format!(
+            "unsafe_write_file: refusing to shrink existing {} from {original_lines} lines to {new_lines} lines; use edit_file for targeted changes",
+            relative_path(workspace, file)
+        ));
+    }
+
+    Ok(())
+}
+
+fn looks_like_placeholder_content(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    matches!(
+        lowered.as_str(),
+        "placeholder" | "todo" | "test" | "test2" | "test3"
+    )
+}
+
+fn text_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let newline_count = text.as_bytes().iter().filter(|byte| **byte == b'\n').count();
+    if text.ends_with('\n') {
+        newline_count
+    } else {
+        newline_count + 1
+    }
+}
+
 fn canonical_workspace_root(workspace_root: &str) -> Result<PathBuf, String> {
     let raw = normalize_display_path(workspace_root);
     let path = PathBuf::from(raw.trim());
@@ -1961,6 +2170,17 @@ mod tests {
     }
 
     #[test]
+    fn read_file_reports_detected_line_ending() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text("style.css", "one\r\ntwo\r\n");
+
+        let result = read_file(&workspace.root_str(), &json!({ "path": "style.css" })).unwrap();
+
+        assert_eq!(result["lineEnding"], json!("crlf"));
+        assert_eq!(result["text"], json!("one\ntwo"));
+    }
+
+    #[test]
     fn read_file_rejects_binary_files() {
         let workspace = TestWorkspace::new();
         workspace.write_bytes("data.bin", &[0, 1, 2, 3]);
@@ -2072,6 +2292,129 @@ mod tests {
 
         assert!(error.contains("path_outside_workspace"));
         assert!(!outside.exists());
+    }
+
+    #[test]
+    fn write_file_defaults_new_files_to_crlf() {
+        let workspace = TestWorkspace::new();
+
+        let result = write_file(
+            &workspace.root_str(),
+            &json!({ "file": "new.txt", "content": "one\ntwo\n" }),
+        )
+        .unwrap();
+        let bytes = fs::read(workspace.path("new.txt")).unwrap();
+
+        assert_eq!(result["lineEnding"], json!("crlf"));
+        assert_eq!(bytes, b"one\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn write_file_honors_vscode_files_eol_for_new_files() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text(".vscode/settings.json", "{ \"files.eol\": \"\\n\" }\n");
+
+        let result = write_file(
+            &workspace.root_str(),
+            &json!({ "file": "new.txt", "content": "one\r\ntwo\r\n" }),
+        )
+        .unwrap();
+        let bytes = fs::read(workspace.path("new.txt")).unwrap();
+
+        assert_eq!(result["lineEnding"], json!("lf"));
+        assert_eq!(bytes, b"one\ntwo\n");
+    }
+
+    #[test]
+    fn edit_file_matches_lf_search_in_crlf_file_and_preserves_crlf() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text(
+            "src/App.css",
+            ".toggle-row {\r\n  display: flex;\r\n}\r\n\r\n.toggle-row input {\r\n  width: auto;\r\n}\r\n",
+        );
+
+        let result = edit_file(
+            &workspace.root_str(),
+            &json!({
+                "file": "src/App.css",
+                "search": ".toggle-row input {\n  width: auto;\n}",
+                "replace": ".toggle-row input {\n  width: 44px;\n  height: 26px;\n}"
+            }),
+        )
+        .unwrap();
+        let bytes = fs::read(workspace.path("src/App.css")).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+
+        assert_eq!(result["lineEnding"], json!("crlf"));
+        assert_eq!(result["lineEndingsNormalized"], json!(true));
+        assert!(text.contains(".toggle-row input {\r\n  width: 44px;\r\n  height: 26px;\r\n}"));
+        assert!(!text.contains("width: auto"));
+        assert!(!bytes.windows(2).any(|window| window == b"\n\n"));
+    }
+
+    #[test]
+    fn edit_file_preserves_lf_when_existing_file_uses_lf() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text(".vscode/settings.json", "{ \"files.eol\": \"\\r\\n\" }\n");
+        workspace.write_text("src/App.css", ".toggle-row input {\n  width: auto;\n}\n");
+
+        let result = edit_file(
+            &workspace.root_str(),
+            &json!({
+                "file": "src/App.css",
+                "search": ".toggle-row input {\r\n  width: auto;\r\n}",
+                "replace": ".toggle-row input {\r\n  width: 44px;\r\n}"
+            }),
+        )
+        .unwrap();
+        let bytes = fs::read(workspace.path("src/App.css")).unwrap();
+
+        assert_eq!(result["lineEnding"], json!("lf"));
+        assert!(!bytes.windows(2).any(|window| window == b"\r\n"));
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            ".toggle-row input {\n  width: 44px;\n}\n"
+        );
+    }
+
+    #[test]
+    fn write_file_rejects_placeholder_overwrite_of_existing_file() {
+        let workspace = TestWorkspace::new();
+        let large = (1..=200)
+            .map(|line| format!(".line-{line} {{ color: red; }}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        workspace.write_text("src/App.css", &large);
+
+        let error = write_file(
+            &workspace.root_str(),
+            &json!({ "file": "src/App.css", "content": "PLACEHOLDER" }),
+        )
+        .unwrap_err();
+        let current = fs::read_to_string(workspace.path("src/App.css")).unwrap();
+
+        assert!(error.contains("unsafe_write_file"));
+        assert!(error.contains("placeholder"));
+        assert_eq!(current, large);
+    }
+
+    #[test]
+    fn write_file_rejects_large_existing_file_shrink() {
+        let workspace = TestWorkspace::new();
+        let large = (1..=200)
+            .map(|line| format!(".line-{line} {{ color: red; }}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        workspace.write_text("src/App.css", &large);
+
+        let error = write_file(
+            &workspace.root_str(),
+            &json!({ "file": "src/App.css", "content": ".toggle-row {}\n" }),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("unsafe_write_file"));
+        assert!(error.contains("shrink"));
     }
 
     #[test]

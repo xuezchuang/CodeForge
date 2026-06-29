@@ -232,7 +232,18 @@ enum AgentIntentMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IntentClassification {
     mode: AgentIntentMode,
-    reason: &'static str,
+    reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedIntentClassification {
+    classification: IntentClassification,
+    classified_prompt: String,
+    prompt_source: &'static str,
+    source: &'static str,
+    confidence_percent: Option<u8>,
+    model_reason: Option<String>,
+    classifier_error: Option<String>,
 }
 
 impl AgentIntentMode {
@@ -244,6 +255,18 @@ impl AgentIntentMode {
             AgentIntentMode::Implement => "implement",
             AgentIntentMode::Review => "review",
             AgentIntentMode::Verify => "verify",
+        }
+    }
+
+    fn from_classifier_mode(mode: &str) -> Option<Self> {
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "default" | "answer" | "chat" => Some(AgentIntentMode::Default),
+            "research" | "explain" | "question" | "plan" => Some(AgentIntentMode::Research),
+            "debug" => Some(AgentIntentMode::Debug),
+            "implement" | "edit" | "write" => Some(AgentIntentMode::Implement),
+            "review" => Some(AgentIntentMode::Review),
+            "verify" | "test" => Some(AgentIntentMode::Verify),
+            _ => None,
         }
     }
 
@@ -558,18 +581,6 @@ pub async fn run_agent(
         .take()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let init_command = is_init_command(&input.user_prompt);
-    let intent_classification = if init_command {
-        IntentClassification {
-            mode: AgentIntentMode::Implement,
-            reason: "init_command",
-        }
-    } else {
-        classify_intent_mode(&input.user_prompt)
-    };
-    let intent_mode = intent_classification.mode;
-    let intent_forces_read_only =
-        !init_command && input.subagent_depth == 0 && intent_mode.enforces_read_only();
-    let effective_read_only = input.read_only || intent_forces_read_only;
     let mut conversation_messages = if init_command {
         vec![chat_message("user", ai_context_init_prompt(project))]
     } else {
@@ -598,37 +609,6 @@ pub async fn run_agent(
         &mut on_trace,
     );
 
-    push_trace(
-        &mut traces,
-        trace(
-            &task_id,
-            2,
-            TraceEventType::SystemEvent,
-            None,
-            "intent_mode",
-            Some(json!({
-                "prompt": input.user_prompt,
-            })),
-            Some(json!({
-                "mode": intent_mode.as_str(),
-                "reason": intent_classification.reason,
-                "readOnly": effective_read_only,
-            })),
-            Some(format!(
-                "Mode: {}{}",
-                intent_mode.as_str(),
-                if effective_read_only {
-                    " (read-only)"
-                } else {
-                    ""
-                }
-            )),
-            TraceStatus::Success,
-            0,
-        ),
-        &mut on_trace,
-    );
-
     let selected = match select_model(
         settings,
         input.provider_id.as_deref(),
@@ -642,7 +622,7 @@ pub async fn run_agent(
                 &mut traces,
                 error_trace(
                     &task_id,
-                    3,
+                    2,
                     "select_model failed",
                     Some(json!({
                         "providerId": input.provider_id,
@@ -667,7 +647,7 @@ pub async fn run_agent(
         &mut traces,
         trace(
             &task_id,
-            3,
+            2,
             TraceEventType::SystemEvent,
             None,
             "select_model",
@@ -690,6 +670,65 @@ pub async fn run_agent(
                 "{} / {}",
                 selected.provider.name, selected.model_id
             )),
+            TraceStatus::Success,
+            0,
+        ),
+        &mut on_trace,
+    );
+
+    let intent_classification = if init_command {
+        ResolvedIntentClassification {
+            classification: intent_classification(AgentIntentMode::Implement, "init_command"),
+            classified_prompt: input.user_prompt.trim().to_string(),
+            prompt_source: "input_user_prompt",
+            source: "local_init_command",
+            confidence_percent: Some(100),
+            model_reason: None,
+            classifier_error: None,
+        }
+    } else {
+        classify_conversation_intent_mode(&selected, &input.user_prompt, &conversation_messages)
+            .await
+    };
+    let intent_mode = intent_classification.classification.mode;
+    let intent_forces_read_only =
+        !init_command && input.subagent_depth == 0 && intent_mode.enforces_read_only();
+    let effective_read_only = input.read_only || intent_forces_read_only;
+    let intent_summary = if effective_read_only {
+        format!("Mode: {} (read-only)", intent_mode.as_str())
+    } else {
+        format!("Mode: {}", intent_mode.as_str())
+    };
+    let intent_reason = intent_classification.classification.reason.clone();
+    let classified_prompt = intent_classification.classified_prompt.clone();
+    let intent_input_prompt_matches = classified_prompt == input.user_prompt.trim();
+
+    push_trace(
+        &mut traces,
+        trace(
+            &task_id,
+            3,
+            TraceEventType::SystemEvent,
+            None,
+            "intent_mode",
+            Some(json!({
+                "prompt": input.user_prompt,
+                "classifiedPrompt": classified_prompt,
+                "promptSource": intent_classification.prompt_source,
+                "inputPromptMatchesClassifiedPrompt": intent_input_prompt_matches,
+            })),
+            Some(json!({
+                "mode": intent_mode.as_str(),
+                "reason": intent_reason,
+                "source": intent_classification.source,
+                "confidencePercent": intent_classification.confidence_percent,
+                "modelReason": intent_classification.model_reason,
+                "classifierError": intent_classification.classifier_error,
+                "inputReadOnly": input.read_only,
+                "intentForcesReadOnly": intent_forces_read_only,
+                "readOnly": effective_read_only,
+            })),
+            Some(intent_summary),
             TraceStatus::Success,
             0,
         ),
@@ -4415,6 +4454,270 @@ fn normalize_conversation_messages(
     normalized
 }
 
+const INTENT_CLASSIFIER_MIN_CONFIDENCE_PERCENT: u8 = 60;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelIntentClassifierOutput {
+    mode: String,
+    #[serde(default)]
+    write_intent: Option<bool>,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn classify_conversation_intent_mode(
+    selected: &SelectedModel,
+    user_prompt: &str,
+    messages: &[ChatMessage],
+) -> ResolvedIntentClassification {
+    let (classified_prompt, prompt_source) = intent_classification_prompt(user_prompt, messages);
+
+    if let Some(classification) = classify_hard_read_only_intent(classified_prompt) {
+        return ResolvedIntentClassification {
+            classification,
+            classified_prompt: classified_prompt.to_string(),
+            prompt_source,
+            source: "local_hard_read_only",
+            confidence_percent: Some(100),
+            model_reason: None,
+            classifier_error: None,
+        };
+    }
+
+    if !supports_model_intent_classifier(selected) {
+        return local_read_only_intent_resolution(
+            classified_prompt,
+            prompt_source,
+            "model_intent_classifier_unsupported_provider",
+            Some(format!(
+                "provider type {} does not support chat-completions intent classification",
+                selected.provider.provider_type
+            )),
+        );
+    }
+
+    let request_body = build_intent_classifier_request(
+        selected,
+        user_prompt,
+        classified_prompt,
+        prompt_source,
+        messages,
+    );
+    let completion = match send_chat_completion(selected, &request_body, None).await {
+        Ok(completion) => completion,
+        Err(error) => {
+            return local_read_only_intent_resolution(
+                classified_prompt,
+                prompt_source,
+                "model_intent_classifier_failed",
+                Some(error),
+            );
+        }
+    };
+    let Some(message) = extract_message_from_response(&completion.response_body) else {
+        return local_read_only_intent_resolution(
+            classified_prompt,
+            prompt_source,
+            "model_intent_classifier_empty_response",
+            Some("intent classifier response had no assistant message content".to_string()),
+        );
+    };
+    let classifier = match parse_model_intent_classifier_output(&message) {
+        Ok(classifier) => classifier,
+        Err(error) => {
+            return local_read_only_intent_resolution(
+                classified_prompt,
+                prompt_source,
+                "model_intent_classifier_parse_failed",
+                Some(error),
+            );
+        }
+    };
+    let confidence_percent = model_confidence_percent(classifier.confidence);
+    if confidence_percent < INTENT_CLASSIFIER_MIN_CONFIDENCE_PERCENT {
+        return local_read_only_intent_resolution(
+            classified_prompt,
+            prompt_source,
+            "model_intent_classifier_low_confidence",
+            Some(format!(
+                "classifier confidence {} below threshold {}",
+                confidence_percent, INTENT_CLASSIFIER_MIN_CONFIDENCE_PERCENT
+            )),
+        );
+    }
+    let Some(mode) = AgentIntentMode::from_classifier_mode(&classifier.mode) else {
+        return local_read_only_intent_resolution(
+            classified_prompt,
+            prompt_source,
+            "model_intent_classifier_invalid_mode",
+            Some(format!("invalid classifier mode: {}", classifier.mode)),
+        );
+    };
+    let mode = if classifier.write_intent.unwrap_or(false) {
+        AgentIntentMode::Implement
+    } else if mode == AgentIntentMode::Implement {
+        AgentIntentMode::Default
+    } else {
+        mode
+    };
+    let model_reason = classifier.reason.filter(|reason| !reason.trim().is_empty());
+    ResolvedIntentClassification {
+        classification: intent_classification(mode, "model_intent_classifier"),
+        classified_prompt: classified_prompt.to_string(),
+        prompt_source,
+        source: "model_intent_classifier",
+        confidence_percent: Some(confidence_percent),
+        model_reason,
+        classifier_error: None,
+    }
+}
+
+fn supports_model_intent_classifier(selected: &SelectedModel) -> bool {
+    !matches!(
+        selected.provider.provider_type.as_str(),
+        "claude" | "ollama" | CODEX_CLI_PROVIDER_TYPE
+    )
+}
+
+fn build_intent_classifier_request(
+    selected: &SelectedModel,
+    user_prompt: &str,
+    classified_prompt: &str,
+    prompt_source: &str,
+    messages: &[ChatMessage],
+) -> Value {
+    let mut request = build_chat_completion_request(
+        selected,
+        build_intent_classifier_messages(user_prompt, classified_prompt, prompt_source, messages),
+        None,
+    );
+    request["stream"] = json!(false);
+    if let Some(object) = request.as_object_mut() {
+        object.remove("stream_options");
+    }
+    request
+}
+
+fn build_intent_classifier_messages(
+    user_prompt: &str,
+    classified_prompt: &str,
+    prompt_source: &str,
+    messages: &[ChatMessage],
+) -> Vec<Value> {
+    let recent_messages = messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user" || message.role == "assistant")
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|message| {
+            json!({
+                "role": message.role,
+                "content": truncate_for_intent_classifier(&message.content, 1200),
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "currentPrompt": user_prompt.trim(),
+        "classifiedPrompt": classified_prompt,
+        "promptSource": prompt_source,
+        "recentMessages": recent_messages,
+    });
+
+    vec![
+        json!({
+            "role": "system",
+            "content": concat!(
+                "You are a strict intent classifier for a local coding agent. ",
+                "Return only one JSON object with fields: ",
+                "mode, writeIntent, confidence, reason. ",
+                "mode must be one of: default, research, debug, implement, review, verify. ",
+                "writeIntent is true only when the user wants the agent to edit/write files, run write-capable tools, commit, or proceed with a previously proposed code change. ",
+                "For short confirmations such as OK/yes/好/可以, infer from recentMessages whether the user is approving a proposed edit. ",
+                "If the user asks only for explanation, analysis, review, verification, or says not to edit, writeIntent must be false. ",
+                "confidence is a number from 0 to 1. Keep the reason short."
+            ),
+        }),
+        json!({
+            "role": "user",
+            "content": payload.to_string(),
+        }),
+    ]
+}
+
+fn truncate_for_intent_classifier(value: &str, max_chars: usize) -> String {
+    let mut output = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        output.push_str("...");
+    }
+    output
+}
+
+fn parse_model_intent_classifier_output(
+    message: &str,
+) -> Result<ModelIntentClassifierOutput, String> {
+    let json_text = extract_json_object_text(message)
+        .ok_or_else(|| format!("intent classifier did not return a JSON object: {message}"))?;
+    serde_json::from_str::<ModelIntentClassifierOutput>(json_text)
+        .map_err(|error| format!("intent classifier JSON parse failed: {error}; body={json_text}"))
+}
+
+fn extract_json_object_text(message: &str) -> Option<&str> {
+    let start = message.find('{')?;
+    let end = message.rfind('}')?;
+    (start <= end).then_some(&message[start..=end])
+}
+
+fn model_confidence_percent(confidence: Option<f64>) -> u8 {
+    let confidence = confidence.unwrap_or(0.0).clamp(0.0, 1.0);
+    (confidence * 100.0).round() as u8
+}
+
+fn local_read_only_intent_resolution(
+    classified_prompt: &str,
+    prompt_source: &'static str,
+    reason: &'static str,
+    classifier_error: Option<String>,
+) -> ResolvedIntentClassification {
+    ResolvedIntentClassification {
+        classification: classify_intent_mode_with_reason(classified_prompt, reason),
+        classified_prompt: classified_prompt.to_string(),
+        prompt_source,
+        source: "local_read_only_fallback",
+        confidence_percent: None,
+        model_reason: None,
+        classifier_error,
+    }
+}
+
+fn intent_classification_prompt<'a>(
+    user_prompt: &'a str,
+    messages: &'a [ChatMessage],
+) -> (&'a str, &'static str) {
+    let trimmed_prompt = user_prompt.trim();
+    if let Some(latest_user) = latest_user_message_content(messages) {
+        let trimmed_latest_user = latest_user.trim();
+        if !trimmed_latest_user.is_empty() && trimmed_latest_user != trimmed_prompt {
+            return (trimmed_latest_user, "latest_user_message");
+        }
+    }
+
+    (trimmed_prompt, "input_user_prompt")
+}
+
+fn latest_user_message_content(messages: &[ChatMessage]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !message.content.trim().is_empty())
+        .map(|message| message.content.as_str())
+}
+
 fn should_require_local_read_tool_call(messages: &[ChatMessage], user_prompt: &str) -> bool {
     let current = normalize_intent_text(user_prompt);
     if current.is_empty() {
@@ -4502,17 +4805,43 @@ fn should_require_local_read_tool_call(messages: &[ChatMessage], user_prompt: &s
     )
 }
 
+#[cfg(test)]
 fn classify_intent_mode(prompt: &str) -> IntentClassification {
+    classify_intent_mode_with_reason(prompt, "default_read_only")
+}
+
+fn classify_intent_mode_with_reason(
+    prompt: &str,
+    fallback_reason: &'static str,
+) -> IntentClassification {
     let normalized = normalize_intent_text(prompt);
     if normalized.is_empty() {
-        return IntentClassification {
-            mode: AgentIntentMode::Default,
-            reason: "empty_prompt",
-        };
+        return intent_classification(AgentIntentMode::Default, "empty_prompt");
     }
 
-    let read_only_requested = contains_any(
+    let read_only_requested = contains_explicit_read_only_request(&normalized);
+    if read_only_requested || looks_like_question(&normalized) {
+        return classify_read_only_intent(&normalized, "question_or_read_only");
+    }
+
+    classify_read_only_intent(&normalized, fallback_reason)
+}
+
+fn classify_hard_read_only_intent(prompt: &str) -> Option<IntentClassification> {
+    let normalized = normalize_intent_text(prompt);
+    if normalized.is_empty() || !contains_explicit_read_only_request(&normalized) {
+        return None;
+    }
+
+    Some(classify_read_only_intent(
         &normalized,
+        "explicit_read_only_request",
+    ))
+}
+
+fn contains_explicit_read_only_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
         &[
             "先回答",
             "只回答",
@@ -4531,71 +4860,7 @@ fn classify_intent_mode(prompt: &str) -> IntentClassification {
             "read only",
             "answer first",
         ],
-    );
-    if read_only_requested || looks_like_question(&normalized) {
-        return classify_read_only_intent(&normalized, "question_or_read_only");
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "do it",
-            "start doing",
-            "开始做",
-            "动手",
-            "实现",
-            "改成",
-            "修改",
-            "更改",
-            "修复",
-            "修一下",
-            "帮我改",
-            "给我改",
-            "加一个",
-            "加上",
-            "新增",
-            "删除",
-            "替换",
-            "重构",
-            "优化",
-            "接入",
-            "写一个",
-            "补上",
-            "做一下",
-            "做下",
-            "做成",
-            "弄一下",
-            "搞一下",
-            "帮我提交",
-            "直接提交",
-            "提交一下",
-            "提交改动",
-            "提交这些",
-            "implement",
-            "fix ",
-            "fix the",
-            "add ",
-            "remove ",
-            "delete ",
-            "update ",
-            "change ",
-            "refactor",
-            "optimize",
-            "wire ",
-            "git commit",
-            "commit changes",
-            "commit it",
-            "create a commit",
-            "make a commit",
-        ],
-    ) {
-        return IntentClassification {
-            mode: AgentIntentMode::Implement,
-            reason: "explicit_write_intent",
-        };
-    }
-
-    classify_read_only_intent(&normalized, "default_read_only")
+    )
 }
 
 fn classify_read_only_intent(
@@ -4603,38 +4868,27 @@ fn classify_read_only_intent(
     fallback_reason: &'static str,
 ) -> IntentClassification {
     if contains_capability_question(normalized) {
-        return IntentClassification {
-            mode: AgentIntentMode::Research,
-            reason: "capability_question",
-        };
+        return intent_classification(AgentIntentMode::Research, "capability_question");
     }
     if contains_review_intent(normalized) {
-        return IntentClassification {
-            mode: AgentIntentMode::Review,
-            reason: "review_keywords",
-        };
+        return intent_classification(AgentIntentMode::Review, "review_keywords");
     }
     if contains_verify_intent(normalized) {
-        return IntentClassification {
-            mode: AgentIntentMode::Verify,
-            reason: "verify_keywords",
-        };
+        return intent_classification(AgentIntentMode::Verify, "verify_keywords");
     }
     if contains_debug_intent(normalized) {
-        return IntentClassification {
-            mode: AgentIntentMode::Debug,
-            reason: "debug_keywords",
-        };
+        return intent_classification(AgentIntentMode::Debug, "debug_keywords");
     }
     if contains_research_intent(normalized) || looks_like_question(normalized) {
-        return IntentClassification {
-            mode: AgentIntentMode::Research,
-            reason: "research_or_question_keywords",
-        };
+        return intent_classification(AgentIntentMode::Research, "research_or_question_keywords");
     }
+    intent_classification(AgentIntentMode::Default, fallback_reason)
+}
+
+fn intent_classification(mode: AgentIntentMode, reason: &str) -> IntentClassification {
     IntentClassification {
-        mode: AgentIntentMode::Default,
-        reason: fallback_reason,
+        mode,
+        reason: reason.to_string(),
     }
 }
 
@@ -6655,7 +6909,7 @@ Read the `.uproject`, locate UE source, and verify MCP transport from source or 
     }
 
     #[test]
-    fn intent_classifier_keeps_questions_readonly_and_detects_modes() {
+    fn local_intent_fallback_keeps_readonly_modes_without_granting_write() {
         assert_eq!(
             classify_intent_mode("看看我现在有代码审查的功能吗?").mode,
             AgentIntentMode::Research
@@ -6678,16 +6932,85 @@ Read the `.uproject`, locate UE source, and verify MCP transport from source or 
         );
         assert_eq!(
             classify_intent_mode("把按钮改成蓝色").mode,
-            AgentIntentMode::Implement
+            AgentIntentMode::Default
+        );
+        assert_eq!(
+            classify_intent_mode("好改下").mode,
+            AgentIntentMode::Default
+        );
+        assert_eq!(
+            classify_intent_mode("可以改").mode,
+            AgentIntentMode::Default
         );
         assert_eq!(
             classify_intent_mode("可以把这个做成自动识别吗?先回答").mode,
             AgentIntentMode::Research
         );
+        assert_eq!(classify_intent_mode("do it").mode, AgentIntentMode::Default);
+    }
+
+    #[test]
+    fn model_intent_classifier_marks_write_confirmation_implement() {
+        let (base_url, server_thread) = start_mock_intent_classifier_server(
+            final_message_response(
+                r#"{"mode":"implement","writeIntent":true,"confidence":0.93,"reason":"The user approved the assistant's proposed edit."}"#,
+            ),
+        );
+        let mut selected = test_selected_model("openai");
+        selected.provider.base_url = base_url;
+        let messages = vec![
+            chat_message(
+                "assistant",
+                "我可以直接修改这段代码，你确认我就改。".to_string(),
+            ),
+            chat_message("user", "好".to_string()),
+        ];
+        let classification = tauri::async_runtime::block_on(classify_conversation_intent_mode(
+            &selected, "好", &messages,
+        ));
+        let request = server_thread.join().unwrap();
+
         assert_eq!(
-            classify_intent_mode("do it").mode,
+            classification.classification.mode,
             AgentIntentMode::Implement
         );
+        assert_eq!(
+            classification.classification.reason,
+            "model_intent_classifier"
+        );
+        assert_eq!(classification.source, "model_intent_classifier");
+        assert_eq!(classification.confidence_percent, Some(93));
+        assert!(classification
+            .model_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("approved")));
+        assert_eq!(request["stream"], json!(false));
+        assert!(request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("strict intent classifier"));
+    }
+
+    #[test]
+    fn hard_readonly_request_skips_model_intent_classifier() {
+        let mut selected = test_selected_model("openai");
+        selected.provider.base_url = "http://127.0.0.1:9".to_string();
+        let messages = vec![chat_message(
+            "user",
+            "可以把这个做成自动识别吗?先回答".to_string(),
+        )];
+        let classification = tauri::async_runtime::block_on(classify_conversation_intent_mode(
+            &selected,
+            "可以把这个做成自动识别吗?先回答",
+            &messages,
+        ));
+
+        assert_eq!(
+            classification.classification.mode,
+            AgentIntentMode::Research
+        );
+        assert_eq!(classification.source, "local_hard_read_only");
+        assert!(classification.classifier_error.is_none());
     }
 
     #[test]
@@ -8003,15 +8326,22 @@ Read the `.uproject`, locate UE source, and verify MCP transport from source or 
         let server = Server::http("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", server.server_addr());
         let handle = thread::spawn(move || {
-            responses
-                .into_iter()
-                .map(|response_body| {
+            let mut responses = responses.into_iter();
+            let mut requests = Vec::new();
+            while let Some(response_body) = responses.next() {
+                loop {
                     let mut request = server
                         .recv_timeout(Duration::from_secs(10))
                         .unwrap()
                         .expect("expected chat completion request");
                     let request_body = read_request_body(&mut request);
                     let parsed_request = serde_json::from_str::<Value>(&request_body).unwrap();
+                    if is_intent_classifier_request(&parsed_request) {
+                        request
+                            .respond(json_response(default_intent_classifier_response()))
+                            .expect("mock intent classifier response should be sent");
+                        continue;
+                    }
                     let wants_stream = parsed_request
                         .get("stream")
                         .and_then(Value::as_bool)
@@ -8023,11 +8353,51 @@ Read the `.uproject`, locate UE source, and verify MCP transport from source or 
                             json_response(response_body)
                         })
                         .expect("mock response should be sent");
-                    parsed_request
-                })
-                .collect::<Vec<_>>()
+                    requests.push(parsed_request);
+                    break;
+                }
+            }
+            requests
         });
         (base_url, handle)
+    }
+
+    fn start_mock_intent_classifier_server(response: Value) -> (String, thread::JoinHandle<Value>) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", server.server_addr());
+        let handle = thread::spawn(move || {
+            let mut request = server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .expect("expected intent classifier request");
+            let request_body = read_request_body(&mut request);
+            let parsed_request = serde_json::from_str::<Value>(&request_body).unwrap();
+            request
+                .respond(json_response(response))
+                .expect("mock intent classifier response should be sent");
+            parsed_request
+        });
+        (base_url, handle)
+    }
+
+    fn is_intent_classifier_request(request: &Value) -> bool {
+        !request
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && request
+                .get("messages")
+                .and_then(Value::as_array)
+                .and_then(|messages| messages.first())
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("strict intent classifier"))
+    }
+
+    fn default_intent_classifier_response() -> Value {
+        final_message_response(
+            r#"{"mode":"research","writeIntent":false,"confidence":0.95,"reason":"test default"}"#,
+        )
     }
 
     fn read_request_body(request: &mut Request) -> String {

@@ -1789,14 +1789,17 @@ name = "codeforge-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "crossbeam-channel",
  "ignore",
  "nucleo",
+ "quick-xml 0.39.4",
  "regex",
  "serde",
  "serde_json",
  "tracing",
+ "zip",
 ]
 
 [[package]]

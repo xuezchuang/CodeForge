@@ -5944,7 +5944,16 @@ fn intent_mode_guidance(intent_mode: AgentIntentMode) -> &'static str {
             "Internal mode: debug. The user is reporting or investigating wrong behavior. For non-trivial debugging, call progress/update_steps early with task-specific diagnosis steps, then update those steps as evidence is gathered; do not use a fixed template. Start read-only: define expected versus actual behavior, gather evidence from code, diagnostics, logs available through tools, and VS context, then identify the most likely cause. Do not edit files unless the user explicitly asked for a fix and the requested change is clear."
         }
         AgentIntentMode::Implement => {
-            "Internal mode: implement. The user has explicitly asked for a code or documentation change. For non-trivial implementation, call progress/update_steps before editing with task-specific implementation and validation steps, then update progress after meaningful milestones; do not use a fixed template. Before editing, make sure the goal, scope, and expected result are clear enough to execute safely; if not, ask a concise clarification question. Make the smallest change that satisfies the request, avoid unrelated cleanup, and verify honestly with the best available check."
+            concat!(
+                "Internal mode: implement. The user has explicitly asked for a code or documentation change. ",
+                "For non-trivial implementation, call progress/update_steps before editing with task-specific implementation and validation steps, then update progress after meaningful milestones; do not use a fixed template. ",
+                "Before editing, make sure the goal, scope, and expected result are clear enough to execute safely; if not, ask a concise clarification question. ",
+                "Before editing a located behavior, identify the exact component/function/config and the exact file/line region to change. ",
+                "When a search result says search_limited, do not repeat the same broad search and do not manually sweep large files by random chunks; immediately retry with a narrower root/path or file_glob, or search the likely file directly and use get_file_context around returned lines. ",
+                "When a component or identifier is found, use that evidence to scope the next search to likely sibling files, style files, or the specific file path instead of restarting from the repository root. ",
+                "If the exact edit target still cannot be located within the tool budget, report that blocker instead of claiming you are starting or making changes. ",
+                "Make the smallest change that satisfies the request, avoid unrelated cleanup, and verify honestly with the best available check."
+            )
         }
         AgentIntentMode::Review => {
             "Internal mode: review. Use a code-review stance. Work read-only. For non-trivial review, call progress/update_steps early with task-specific review areas, then update those steps as findings are checked; do not use a fixed template. Inspect the relevant code or active VS context before judging. Prioritize correctness bugs, regressions, safety issues, architecture mismatches, and missing tests. Report findings first, ordered by severity, with concrete evidence and file locations. If no actionable issues are found, say so and note residual risk or unreviewed scope."
@@ -7037,6 +7046,29 @@ Read the `.uproject`, locate UE source, and verify MCP transport from source or 
         assert!(developer.contains("working interpretation"));
         assert!(developer.contains("each user-named category"));
         assert!(developer.contains("do not finish with only a clarification question"));
+    }
+
+    #[test]
+    fn openai_messages_include_implement_location_guidance() {
+        let root = test_workspace();
+        let project = test_project_with_root(root.to_str().unwrap());
+        let selected = test_selected_model("openai");
+        let messages = build_openai_messages_for_mode(
+            &project,
+            &[chat_message("user", "Fix this UI behavior.".to_string())],
+            false,
+            &selected,
+            false,
+            Some(AgentIntentMode::Implement),
+        );
+        let developer = messages[1]["content"].as_str().unwrap();
+
+        assert!(developer.contains("Internal mode: implement"));
+        assert!(developer.contains("exact file/line region"));
+        assert!(developer.contains("search_limited"));
+        assert!(developer.contains("narrower root/path or file_glob"));
+        assert!(developer.contains("do not manually sweep large files by random chunks"));
+        assert!(developer.contains("report that blocker instead of claiming"));
     }
 
     #[test]

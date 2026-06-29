@@ -49,7 +49,8 @@ const IGNORED_DIRS: &[&str] = &[
 const IGNORED_SEARCH_PATHS: &[&[&str]] = &[&[".claude", "worktrees"]];
 
 const DEFAULT_CONTENT_EXTENSIONS: &[&str] = &[
-    ".h", ".hpp", ".c", ".cpp", ".cc", ".cxx", ".inl", ".ixx", ".cs", ".sln", ".vcxproj", ".props",
+    ".h", ".hpp", ".c", ".cpp", ".cc", ".cxx", ".inl", ".ixx", ".cs", ".ts", ".tsx", ".js",
+    ".jsx", ".css", ".scss", ".sass", ".less", ".html", ".sln", ".vcxproj", ".props",
     ".targets", ".json", ".xml", ".txt", ".md", ".log",
 ];
 
@@ -305,6 +306,11 @@ fn search_file_with_wildcard(
         "engine": "wildcard-file-search",
         "message": if truncated {
             Some(format!("search_limited: returned {max_results} matches before scanning all files"))
+        } else {
+            None
+        },
+        "recoveryHint": if truncated {
+            Some(search_limited_recovery_hint())
         } else {
             None
         }
@@ -1186,7 +1192,16 @@ fn search_content_with_fallback(
         } else {
             None
         },
+        "recoveryHint": if scan_limited {
+            Some(search_limited_recovery_hint())
+        } else {
+            None
+        },
     }))
+}
+
+fn search_limited_recovery_hint() -> &'static str {
+    "Do not repeat the same broad search. Retry with a narrower root/path or file_glob; if a likely file is known, search that file directly or use get_file_context around a known returned line. Do not manually sweep large files by random chunks."
 }
 
 fn canonical_workspace_root(workspace_root: &str) -> Result<PathBuf, String> {
@@ -1419,7 +1434,7 @@ fn is_filesystem_root(path: &Path) -> bool {
 }
 
 fn resolve_search_root(workspace: &Path, arguments: &Value) -> Result<PathBuf, String> {
-    let root = optional_string(arguments, "root")?.unwrap_or_else(|| ".".to_string());
+    let root = optional_search_root(arguments)?.unwrap_or_else(|| ".".to_string());
     let path = resolve_existing_read_path(workspace, &root)?;
     if !path.is_dir() {
         return Err(format!(
@@ -1431,7 +1446,7 @@ fn resolve_search_root(workspace: &Path, arguments: &Value) -> Result<PathBuf, S
 }
 
 fn resolve_search_path(workspace: &Path, arguments: &Value) -> Result<PathBuf, String> {
-    let root = optional_string(arguments, "root")?.unwrap_or_else(|| ".".to_string());
+    let root = optional_search_root(arguments)?.unwrap_or_else(|| ".".to_string());
     let path = resolve_existing_read_path(workspace, &root)?;
     if path.is_dir() || path.is_file() {
         return Ok(path);
@@ -1440,6 +1455,13 @@ fn resolve_search_path(workspace: &Path, arguments: &Value) -> Result<PathBuf, S
         "not_file_or_directory: {}",
         relative_or_display(workspace, &path)
     ))
+}
+
+fn optional_search_root(arguments: &Value) -> Result<Option<String>, String> {
+    match optional_string(arguments, "root")? {
+        Some(root) => Ok(Some(root)),
+        None => optional_string(arguments, "path"),
+    }
 }
 
 fn resolve_rg_path(_workspace: &Path, root: &Path, path_text: &str) -> Result<PathBuf, String> {
@@ -2176,6 +2198,63 @@ mod tests {
         assert_eq!(first["before"][0]["text"], json!("before"));
         assert_eq!(first["after"][0]["text"], json!("after"));
         assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_content_default_includes_frontend_source_and_style_files() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text("src/components/UiPreferences.tsx", "className=\"toggle-row\"\n");
+        workspace.write_text("src/App.css", ".toggle-row { display: flex; }\n");
+
+        let result = search_content(
+            &workspace.root_str(),
+            &json!({
+                "query": "toggle-row",
+                "max_results": 10,
+                "context_lines": 0
+            }),
+        )
+        .unwrap();
+        let files = result["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["file"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(files.contains(&"src/components/UiPreferences.tsx"));
+        assert!(files.contains(&"src/App.css"));
+    }
+
+    #[test]
+    fn search_content_accepts_path_alias_for_file_root() {
+        let workspace = TestWorkspace::new();
+        workspace.write_text("src/App.css", ".toggle-row { display: flex; }\n");
+        workspace.write_text("src/Other.css", ".toggle-row { display: block; }\n");
+
+        let result = search_content(
+            &workspace.root_str(),
+            &json!({
+                "query": "toggle-row",
+                "path": "src/App.css",
+                "max_results": 10,
+                "context_lines": 0
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result["root"], json!("src/App.css"));
+        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(result["matches"][0]["file"], json!("src/App.css"));
+    }
+
+    #[test]
+    fn search_limited_recovery_hint_names_required_narrowing() {
+        let hint = search_limited_recovery_hint();
+
+        assert!(hint.contains("Do not repeat the same broad search"));
+        assert!(hint.contains("root/path or file_glob"));
+        assert!(hint.contains("Do not manually sweep large files"));
     }
 
     #[test]

@@ -840,6 +840,10 @@ fn search_file_definition() -> Value {
                         "type": "string",
                         "description": "Optional root directory to search under, relative to the workspace or absolute."
                     },
+                    "path": {
+                        "type": "string",
+                        "description": "Compatibility alias for root. Prefer root in new calls."
+                    },
                     "max_results": {
                         "type": "integer",
                         "minimum": 1,
@@ -857,7 +861,7 @@ fn search_content_definition() -> Value {
         "type": "function",
         "function": {
             "name": SEARCH_CONTENT_TOOL_NAME,
-            "description": "Search text content. When Visual Studio Bridge is connected, searches active Visual Studio solution files first and falls back to local content search. Accepts workspace-relative and absolute roots. Returns structured matches with file, line, column, text, before, and after. Narrow root or file_glob for large repositories.",
+            "description": "Search text content. When Visual Studio Bridge is connected, searches active Visual Studio solution files first and falls back to local content search. Accepts workspace-relative and absolute roots. Returns structured matches with file, line, column, text, before, and after. Narrow root or file_glob for large repositories. If the result says search_limited, do not repeat the same broad search; retry with a narrower root/path or file_glob.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -868,6 +872,10 @@ fn search_content_definition() -> Value {
                     "root": {
                         "type": "string",
                         "description": "Optional root directory or file to search under, relative to the workspace or absolute."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Compatibility alias for root. Prefer root in new calls."
                     },
                     "file_glob": {
                         "type": "string",
@@ -2150,6 +2158,25 @@ mod cli_runtime_tests {
     }
 
     #[test]
+    fn search_content_accepts_path_alias_without_vs_bridge() {
+        let root = workspace();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("App.css"), ".toggle-row {}\n").unwrap();
+        fs::write(root.join("src").join("Other.css"), ".toggle-row {}\n").unwrap();
+        let result = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context(root.to_str().unwrap(), false),
+            SEARCH_CONTENT_TOOL_NAME,
+            &json!({ "query": "toggle-row", "path": "src/App.css", "max_results": 10 }),
+        ));
+        assert_eq!(result.status, ToolOutputStatus::Ok);
+        let output = result.output.unwrap();
+        assert_eq!(output["source"], json!("workspace"));
+        assert_eq!(output["root"], json!("src/App.css"));
+        assert_eq!(output["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(output["matches"][0]["file"], json!("src/App.css"));
+    }
+
+    #[test]
     fn search_file_prefers_vs_bridge_when_connected() {
         let root = workspace();
         fs::create_dir_all(root.join("src")).unwrap();
@@ -2207,7 +2234,7 @@ mod cli_runtime_tests {
         let result = tauri::async_runtime::block_on(execute_tool_result(
             &mut context,
             SEARCH_CONTENT_TOOL_NAME,
-            &json!({ "query": "target", "file_glob": "*.cpp", "max_results": 10 }),
+            &json!({ "query": "target", "path": "src/sample.cpp", "file_glob": "*.cpp", "max_results": 10 }),
         ));
         let request = handle.join().unwrap();
         assert_eq!(result.status, ToolOutputStatus::Ok);
@@ -2216,6 +2243,7 @@ mod cli_runtime_tests {
         assert_eq!(output["engine"], json!("stub-vsix-content-search"));
         assert!(request.starts_with("POST /searchContent "));
         assert!(request.contains("\"query\":\"target\""));
+        assert!(request.contains("\"root\":\"src/sample.cpp\""));
         assert!(request.contains("\"fileGlob\":\"*.cpp\""));
         assert!(request.contains("\"workspaceRoot\""));
     }

@@ -56,7 +56,7 @@ pub async fn call_vs_search_file(
     if let Some(pattern) = string_argument(arguments, "pattern", "pattern") {
         payload.insert("pattern".to_string(), Value::String(pattern));
     }
-    if let Some(root) = string_argument(arguments, "root", "root") {
+    if let Some(root) = root_or_path_argument(arguments) {
         payload.insert("root".to_string(), Value::String(root));
     }
     if let Some(max_results) = integer_argument(arguments, "maxResults", "max_results") {
@@ -90,7 +90,7 @@ pub async fn call_vs_search_content(
     if let Some(query) = string_argument(arguments, "query", "query") {
         payload.insert("query".to_string(), Value::String(query));
     }
-    if let Some(root) = string_argument(arguments, "root", "root") {
+    if let Some(root) = root_or_path_argument(arguments) {
         payload.insert("root".to_string(), Value::String(root));
     }
     if let Some(file_glob) = string_argument(arguments, "fileGlob", "file_glob") {
@@ -233,6 +233,11 @@ fn string_argument(arguments: &Value, camel_key: &str, snake_key: &str) -> Optio
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn root_or_path_argument(arguments: &Value) -> Option<String> {
+    string_argument(arguments, "root", "root")
+        .or_else(|| string_argument(arguments, "path", "path"))
 }
 
 fn integer_argument(arguments: &Value, camel_key: &str, snake_key: &str) -> Option<u64> {

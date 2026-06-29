@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tauri::{AppHandle, Emitter, State};
 
 use crate::agent_runner::{self, AgentRunInput};
@@ -316,6 +318,7 @@ pub async fn run_agent(
         let projects = state.projects.lock().map_err(|_| lock_error())?;
         projects.get(&input.project_id)?
     };
+    let project = wait_for_vs_bridge_endpoint(&state, project).await?;
     let settings = {
         let settings_store = state.settings.lock().map_err(|_| lock_error())?;
         current_settings(&settings_store)
@@ -400,6 +403,43 @@ pub async fn run_tool_call_test(
     let mut history = state.history.lock().map_err(|_| lock_error())?;
     history.update_agent_run_metadata(&run.task_id, provider_id.as_deref(), model_id.as_deref())?;
     Ok(run)
+}
+
+async fn wait_for_vs_bridge_endpoint(
+    state: &State<'_, AppState>,
+    project: ProjectSession,
+) -> Result<ProjectSession, String> {
+    if project
+        .vs_bridge_endpoint
+        .as_deref()
+        .is_some_and(|endpoint| !endpoint.trim().is_empty())
+        || project.vs_process_id.is_none()
+    {
+        return Ok(project);
+    }
+
+    const MAX_ATTEMPTS: usize = 80;
+    const RETRY_DELAY_MS: u64 = 250;
+
+    let mut latest = project;
+    for _ in 0..MAX_ATTEMPTS {
+        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+        let refreshed = {
+            let projects = state.projects.lock().map_err(|_| lock_error())?;
+            projects.get(&latest.id)?
+        };
+        let has_endpoint = refreshed
+            .vs_bridge_endpoint
+            .as_deref()
+            .is_some_and(|endpoint| !endpoint.trim().is_empty());
+        let still_waitable = refreshed.vs_process_id.is_some();
+        latest = refreshed;
+        if has_endpoint || !still_waitable {
+            break;
+        }
+    }
+
+    Ok(latest)
 }
 
 #[tauri::command]

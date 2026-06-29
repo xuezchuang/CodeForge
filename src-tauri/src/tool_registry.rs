@@ -48,6 +48,11 @@ pub const VS_CURRENT_DOCUMENT_TOOL_NAME: &str = "vs.current_document";
 pub const VS_CURRENT_SELECTION_TOOL_NAME: &str = "vs.current_selection";
 pub const VS_LIST_PROJECTS_TOOL_NAME: &str = "vs.list_projects";
 pub const VS_LIST_PROJECT_FILES_TOOL_NAME: &str = "vs.list_project_files";
+pub const VS_SEARCH_FILE_TOOL_NAME: &str = "vs.search_file";
+pub const VS_SEARCH_CONTENT_TOOL_NAME: &str = "vs.search";
+pub const VS_FIND_SYMBOL_TOOL_NAME: &str = "vs.find_symbol";
+pub const VS_FIND_REFERENCES_TOOL_NAME: &str = "vs.find_references";
+pub const VS_GO_TO_DEFINITION_TOOL_NAME: &str = "vs.go_to_definition";
 pub const VS_GET_ERROR_LIST_TOOL_NAME: &str = "vs.get_error_list";
 pub const GOAL_GET_TOOL_NAME: &str = "goal/get";
 pub const GOAL_SET_TOOL_NAME: &str = "goal/set";
@@ -138,19 +143,14 @@ fn workspace_alias(name: &str, definition: &Value) -> Value {
     cloned
 }
 pub fn tool_definitions() -> Vec<Value> {
-    let mut tools = workspace_tool_definitions();
+    let mut tools = vs_tool_definitions();
+    tools.extend(workspace_tool_definitions());
     tools.extend(git_tool_definitions());
     tools.extend([
         list_dir_definition(),
         get_file_context_definition(),
         document_read_docx_definition(),
         presentation_read_pptx_definition(),
-        vs_current_solution_definition(),
-        vs_current_document_definition(),
-        vs_current_selection_definition(),
-        vs_list_projects_definition(),
-        vs_list_project_files_definition(),
-        vs_get_error_list_definition(),
         goal_get_definition(),
         goal_set_definition(),
         goal_clear_definition(),
@@ -162,19 +162,14 @@ pub fn tool_definitions() -> Vec<Value> {
 }
 
 pub fn read_only_tool_definitions() -> Vec<Value> {
-    let mut tools = read_only_workspace_tool_definitions();
+    let mut tools = vs_tool_definitions();
+    tools.extend(read_only_workspace_tool_definitions());
     tools.extend(read_only_git_tool_definitions());
     tools.extend([
         list_dir_definition(),
         get_file_context_definition(),
         document_read_docx_definition(),
         presentation_read_pptx_definition(),
-        vs_current_solution_definition(),
-        vs_current_document_definition(),
-        vs_current_selection_definition(),
-        vs_list_projects_definition(),
-        vs_list_project_files_definition(),
-        vs_get_error_list_definition(),
         goal_get_definition(),
         progress_update_steps_definition(),
     ]);
@@ -227,6 +222,22 @@ fn read_only_workspace_tool_definitions() -> Vec<Value> {
         read_file_definition(),
         search_file_definition(),
         search_content_definition(),
+    ]
+}
+
+fn vs_tool_definitions() -> Vec<Value> {
+    vec![
+        vs_current_solution_definition(),
+        vs_current_document_definition(),
+        vs_current_selection_definition(),
+        vs_list_projects_definition(),
+        vs_list_project_files_definition(),
+        vs_search_file_definition(),
+        vs_search_content_definition(),
+        vs_find_symbol_definition(),
+        vs_find_references_definition(),
+        vs_go_to_definition_definition(),
+        vs_get_error_list_definition(),
     ]
 }
 
@@ -617,6 +628,9 @@ async fn execute_tool_inner(
         VS_CURRENT_SELECTION_TOOL_NAME => vs_bridge_client::call_vs_current_selection(context.vs_bridge_endpoint).await,
         VS_LIST_PROJECTS_TOOL_NAME => vs_bridge_client::call_vs_list_projects(context.vs_bridge_endpoint).await,
         VS_LIST_PROJECT_FILES_TOOL_NAME => vs_bridge_client::call_vs_list_project_files(context.vs_bridge_endpoint, arguments).await,
+        VS_SEARCH_FILE_TOOL_NAME => vs_bridge_client::call_vs_search_file(context.vs_bridge_endpoint, context.workspace_root, arguments).await,
+        VS_SEARCH_CONTENT_TOOL_NAME => vs_bridge_client::call_vs_search_content(context.vs_bridge_endpoint, context.workspace_root, arguments).await,
+        VS_FIND_SYMBOL_TOOL_NAME | VS_FIND_REFERENCES_TOOL_NAME | VS_GO_TO_DEFINITION_TOOL_NAME => Ok(vs_semantic_tool_not_implemented(context, name)),
         VS_GET_ERROR_LIST_TOOL_NAME => vs_bridge_client::call_vs_get_error_list(context.vs_bridge_endpoint).await,
         GOAL_GET_TOOL_NAME => goal_get(context),
         GOAL_SET_TOOL_NAME => goal_set(context, arguments),
@@ -709,6 +723,18 @@ async fn execute_search_content(
     let mut output = workspace_tools::search_content(context.workspace_root, arguments)?;
     annotate_search_source(&mut output, "workspace");
     Ok(output)
+}
+
+fn vs_semantic_tool_not_implemented(context: &ToolExecutionContext<'_>, name: &str) -> Value {
+    json!({
+        "ok": false,
+        "available": false,
+        "status": "not_implemented",
+        "source": "vsix",
+        "tool": name,
+        "bridgeConnected": bridge_endpoint_available(context.vs_bridge_endpoint),
+        "message": "This VS semantic tool is defined for the model but the VSIX endpoint is not implemented yet.",
+    })
 }
 
 fn bridge_endpoint_available(endpoint: Option<&str>) -> bool {
@@ -828,7 +854,7 @@ fn search_file_definition() -> Value {
         "type": "function",
         "function": {
             "name": SEARCH_FILE_TOOL_NAME,
-            "description": "Search for file paths. When Visual Studio Bridge is connected, searches the active Visual Studio solution first and falls back to local search. Supports fuzzy filename search and simple wildcard patterns such as *.log or wz_render_frame_trace_*.log. Use this to locate filenames or paths, not to search file contents.",
+            "description": "Fallback/general file path search. For code in the current Visual Studio solution/project, use vs.search_file first so the trace records an explicit VS search attempt. Use this workspace search after VS search is unavailable/insufficient, for files outside the VS solution, logs, generated artifacts, or non-VS workspaces. Supports fuzzy filename search and simple wildcard patterns such as *.log or wz_render_frame_trace_*.log. Use this to locate filenames or paths, not to search file contents.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -861,7 +887,7 @@ fn search_content_definition() -> Value {
         "type": "function",
         "function": {
             "name": SEARCH_CONTENT_TOOL_NAME,
-            "description": "Search text content. When Visual Studio Bridge is connected, searches active Visual Studio solution files first and falls back to local content search. Accepts workspace-relative and absolute roots. Returns structured matches with file, line, column, text, before, and after. Narrow root or file_glob for large repositories. If the result says search_limited, do not repeat the same broad search; retry with a narrower root/path or file_glob.",
+            "description": "Fallback/general text content search. For code in the current Visual Studio solution/project, use vs.search first so the trace records an explicit VS search attempt. Use this workspace search after VS search is unavailable/insufficient, for files outside the VS solution, logs, generated artifacts, or non-VS workspaces. Accepts workspace-relative and absolute roots. Returns structured matches with file, line, column, text, before, and after. Narrow root or file_glob for large repositories. If the result says search_limited, do not repeat the same broad search; retry with a narrower root/path or file_glob.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1301,6 +1327,209 @@ fn vs_list_project_files_definition() -> Value {
                         "minimum": 1,
                         "default": 2000,
                         "description": "Maximum files to return before truncating."
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn vs_search_file_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_SEARCH_FILE_TOOL_NAME,
+            "description": "Search file paths through the connected Visual Studio Bridge only. Searches the active VS solution/project file list and does not fall back to workspace search. Use this when the user is asking about the currently open Visual Studio project and trace attribution to VS search matters.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Filename or path pattern to search for. Use plain text for fuzzy search, or * and ? for wildcard matching."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Optional root directory or file to search under, relative to the workspace or absolute."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Compatibility alias for root. Prefer root in new calls."
+                    },
+                    "projectName": {
+                        "type": "string",
+                        "description": "Optional Visual Studio project display name to search."
+                    },
+                    "projectUniqueName": {
+                        "type": "string",
+                        "description": "Optional Visual Studio project UniqueName to search."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 100
+                    }
+                },
+                "required": ["pattern"]
+            }
+        }
+    })
+}
+
+fn vs_search_content_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_SEARCH_CONTENT_TOOL_NAME,
+            "description": "Search text content through the connected Visual Studio Bridge only. This is VS solution/project-scoped text search, not semantic symbol analysis, and it does not fall back to workspace search. Use this first when Visual Studio is connected and the user is asking about the currently open solution/project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Text or regex to search for."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Optional root directory or file to search under, relative to the workspace or absolute."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Compatibility alias for root. Prefer root in new calls."
+                    },
+                    "file_glob": {
+                        "type": "string",
+                        "description": "Optional glob such as *.cpp, **/*.h, or *.rs."
+                    },
+                    "projectName": {
+                        "type": "string",
+                        "description": "Optional Visual Studio project display name to search."
+                    },
+                    "projectUniqueName": {
+                        "type": "string",
+                        "description": "Optional Visual Studio project UniqueName to search."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 100
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 2
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "default": false
+                    },
+                    "regex": {
+                        "type": "boolean",
+                        "default": false
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    })
+}
+
+fn vs_find_symbol_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_FIND_SYMBOL_TOOL_NAME,
+            "description": "Planned VS semantic symbol lookup for the active solution/project. The current VSIX endpoint is not implemented yet; calls return available=false until the bridge adds semantic support.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Symbol name to find."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Optional symbol kind hint such as function, class, method, enum, or variable."
+                    },
+                    "projectName": {
+                        "type": "string",
+                        "description": "Optional Visual Studio project display name to search."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 50
+                    }
+                },
+                "required": ["symbol"]
+            }
+        }
+    })
+}
+
+fn vs_find_references_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_FIND_REFERENCES_TOOL_NAME,
+            "description": "Planned VS semantic reference lookup for the active solution/project. The current VSIX endpoint is not implemented yet; calls return available=false until the bridge adds semantic support.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Optional workspace-relative or absolute file path containing the symbol."
+                    },
+                    "line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional 1-based line number for cursor-based lookup."
+                    },
+                    "column": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional 1-based column number for cursor-based lookup."
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Optional symbol name when cursor location is not available."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 100
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn vs_go_to_definition_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VS_GO_TO_DEFINITION_TOOL_NAME,
+            "description": "Planned VS go-to-definition lookup for the active solution/project. The current VSIX endpoint is not implemented yet; calls return available=false until the bridge adds semantic support.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Optional workspace-relative or absolute file path containing the symbol."
+                    },
+                    "line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional 1-based line number for cursor-based lookup."
+                    },
+                    "column": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional 1-based column number for cursor-based lookup."
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Optional symbol name when cursor location is not available."
                     }
                 }
             }
@@ -1868,9 +2097,43 @@ mod tests {
         assert!(names.contains(&VS_CURRENT_SELECTION_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_LIST_PROJECTS_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_LIST_PROJECT_FILES_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_SEARCH_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_SEARCH_CONTENT_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_FIND_SYMBOL_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_FIND_REFERENCES_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_GO_TO_DEFINITION_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_GET_ERROR_LIST_TOOL_NAME.to_string()));
         assert!(names.contains(&PROGRESS_UPDATE_STEPS_TOOL_NAME.to_string()));
         assert!(!names.contains(&CALCULATOR_ADD_TOOL_NAME.to_string()));
+    }
+
+    #[test]
+    fn tool_definitions_list_vs_search_before_workspace_search() {
+        let names = tool_definitions()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+
+        let vs_search = names
+            .iter()
+            .position(|name| name == VS_SEARCH_CONTENT_TOOL_NAME)
+            .unwrap();
+        let workspace_search = names
+            .iter()
+            .position(|name| name == WORKSPACE_SEARCH_CONTENT_TOOL_NAME)
+            .unwrap();
+        let legacy_search = names
+            .iter()
+            .position(|name| name == SEARCH_CONTENT_TOOL_NAME)
+            .unwrap();
+
+        assert!(vs_search < workspace_search);
+        assert!(vs_search < legacy_search);
     }
 
     #[test]
@@ -1902,6 +2165,11 @@ mod tests {
 
         assert!(names.contains(&WORKSPACE_READ_FILE_TOOL_NAME.to_string()));
         assert!(names.contains(&WORKSPACE_SEARCH_CONTENT_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_SEARCH_FILE_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_SEARCH_CONTENT_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_FIND_SYMBOL_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_FIND_REFERENCES_TOOL_NAME.to_string()));
+        assert!(names.contains(&VS_GO_TO_DEFINITION_TOOL_NAME.to_string()));
         assert!(names.contains(&VS_GET_ERROR_LIST_TOOL_NAME.to_string()));
         assert!(names.contains(&PROGRESS_UPDATE_STEPS_TOOL_NAME.to_string()));
         assert!(names.contains(&GIT_STATUS_TOOL_NAME.to_string()));
@@ -2246,6 +2514,73 @@ mod cli_runtime_tests {
         assert!(request.contains("\"root\":\"src/sample.cpp\""));
         assert!(request.contains("\"fileGlob\":\"*.cpp\""));
         assert!(request.contains("\"workspaceRoot\""));
+    }
+
+    #[test]
+    fn explicit_vs_search_content_uses_bridge_tool_without_workspace_fallback() {
+        let root = workspace();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("sample.cpp"), "int target = 1;\n").unwrap();
+        let root_text = root.to_string_lossy().to_string();
+
+        let output = tauri::async_runtime::block_on(execute_tool(
+            &mut context(&root_text, false),
+            VS_SEARCH_CONTENT_TOOL_NAME,
+            &json!({ "query": "target", "path": "src/sample.cpp", "max_results": 10 }),
+        ))
+        .unwrap();
+
+        assert_eq!(output["source"], json!("vsix"));
+        assert_eq!(output["status"], json!("bridge_not_connected"));
+        assert!(output.get("matches").is_none());
+    }
+
+    #[test]
+    fn explicit_vs_search_file_calls_search_files_endpoint() {
+        let root = workspace();
+        let (endpoint, handle) = stub_bridge(
+            r#"{"ok":true,"source":"vsix","engine":"stub-vsix-file-search","matches":[],"paths":[],"count":0}"#,
+        );
+        let root_text = root.to_string_lossy().to_string();
+        let mut context = ToolExecutionContext {
+            workspace_root: &root_text,
+            vs_bridge_endpoint: Some(&endpoint),
+            allow_shell: false,
+            assume_yes: true,
+            cli_mode: true,
+            goal: None,
+            mcp_runtime: None,
+            write_scope: None,
+        };
+
+        let result = tauri::async_runtime::block_on(execute_tool_result(
+            &mut context,
+            VS_SEARCH_FILE_TOOL_NAME,
+            &json!({ "pattern": "sample.cpp", "max_results": 10 }),
+        ));
+        let request = handle.join().unwrap();
+
+        assert_eq!(result.status, ToolOutputStatus::Ok);
+        let output = result.output.unwrap();
+        assert_eq!(output["source"], json!("vsix"));
+        assert_eq!(output["engine"], json!("stub-vsix-file-search"));
+        assert!(request.starts_with("POST /searchFiles "));
+        assert!(request.contains("\"pattern\":\"sample.cpp\""));
+    }
+
+    #[test]
+    fn vs_semantic_tools_report_not_implemented() {
+        let output = tauri::async_runtime::block_on(execute_tool(
+            &mut context(".", false),
+            VS_FIND_SYMBOL_TOOL_NAME,
+            &json!({ "symbol": "CalcTransparencyFaceState" }),
+        ))
+        .unwrap();
+
+        assert_eq!(output["ok"], json!(false));
+        assert_eq!(output["available"], json!(false));
+        assert_eq!(output["status"], json!("not_implemented"));
+        assert_eq!(output["source"], json!("vsix"));
     }
 
     #[test]

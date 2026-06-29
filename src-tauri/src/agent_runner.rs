@@ -36,7 +36,7 @@ use crate::vs_registry::{
 };
 
 pub const TOOL_CALL_TEST_PROMPT: &str = "请必须调用 calculator.add 工具计算 1+1，然后告诉我结果。";
-const DEFAULT_MAX_TOOL_ROUNDS: usize = 32;
+const DEFAULT_MAX_TOOL_ROUNDS: usize = 64;
 const EMPTY_TOOL_CALL_RESPONSE_RETRY_LIMIT: usize = 1;
 const MODEL_REQUEST_TIMEOUT_SECONDS: u64 = 360;
 const MCP_AGENT_STARTUP_BUDGET: Duration = Duration::from_secs(2);
@@ -5306,7 +5306,8 @@ fn developer_prompt(project: &ProjectSession, cli_mode: bool) -> String {
     if cli_mode {
         prompt.push_str("Use a plain terminal style: no emoji, no marketing copy, and no generic capability list. Do not advertise tools or demo capabilities unless the user asks about them. Never mention calculator or arithmetic demo tools unless directly relevant to the user's request. For a simple greeting, reply with one short sentence asking what task to work on; do not include examples or bullet lists.\n");
     }
-    prompt.push_str("Prefer Visual Studio context tools when the bridge is connected, and use repository tools when VS context is unavailable or insufficient. Use document/read_docx for .docx files and presentation/read_pptx for .pptx files; do not use text read_file for Office packages.\n");
+    prompt.push_str(&visual_studio_tool_guidance(project));
+    prompt.push_str("Use document/read_docx for .docx files and presentation/read_pptx for .pptx files; do not use text read_file for Office packages.\n");
     prompt.push_str("Read-only file tools can inspect local absolute paths outside the workspace. When the user asks to read, inspect, search, or verify local files or logs, call list_dir/read_file/search_file/search_content (or their workspace/ aliases) before answering. If a target path was not already returned by a current-turn tool result, treat it as unverified: first run list_dir on the parent/starting directory or search_file/search_content to confirm exact path segments (for example, never assume `codex-config` vs `config`, or a UE header's module directory from its include name), then read the confirmed path. If read_file returns a recovered result, explain that the requested path was missing and that a unique same-name file was read instead. Do not claim a read/search tool failed unless a tool_result in the current turn shows that failure. A successful read_file/search_content result is fresh current-filesystem evidence for that turn; do not dismiss it as a stale snapshot, do not ask the user to open VS Code or run git just to confirm the same file state, and do not treat \"verify against current source\" as a reason to avoid read/search tools.\n");
     prompt.push_str("Use the dedicated git/status, git/diff, git/log, and git/show tools for repository state, history, and diffs; these are not arbitrary shell commands. In write-capable runs, use git/add, git/reset, and git/commit when the user asks to stage, unstage, or commit. Before committing, inspect git/status plus staged and unstaged git/diff evidence, stage only the intended paths, and report the resulting commit hash when git/commit succeeds.\n");
     prompt.push_str("Treat user statements about the code as hypotheses until they are verified against workspace code, tool output, logs, or diagnostics. For code-specific answers, gather enough concrete evidence before concluding. If you did not inspect fresh code in the current turn, say whether the answer is based on previous context or inference. Distinguish verified facts, reused prior evidence, and inference when the distinction matters.\n");
@@ -5329,6 +5330,29 @@ fn developer_prompt(project: &ProjectSession, cli_mode: bool) -> String {
     append_codeforge_skill_index(project, &mut prompt);
 
     prompt
+}
+
+fn visual_studio_tool_guidance(project: &ProjectSession) -> String {
+    let bridge_status = match project.vs_bridge_endpoint.as_deref() {
+        Some(endpoint) if !endpoint.trim().is_empty() => {
+            format!(
+                "Current project has VS Bridge Connected at {}. ",
+                endpoint.trim()
+            )
+        }
+        _ => "Current project has no recorded VS Bridge endpoint. ".to_string(),
+    };
+    let solution = project
+        .solution_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| format!("Solution: {}. ", path.trim()))
+        .unwrap_or_default();
+
+    format!(
+        "{}{}When the user asks about code in the current Visual Studio solution/project, first use Visual Studio tools: call vs.current_solution or vs.current_document to anchor the VS context when needed, then use vs.search / vs.search_file (model-visible aliases may appear as vs_search / vs_search_file) before workspace/search, search_content, or search_file. For current VS solution code, do not call workspace/list_dir, workspace/search, workspace/search_file, search_content, or search_file as the first investigation tool; a trace should contain at least one explicit VS tool call before workspace fallback. The explicit VS search tools are solution/project-scoped and trace as VS tool calls; they do not silently fall back to workspace search. If VS search returns bridge_not_connected, unsupported endpoint, not_implemented, available=false, or insufficient results, state that VS evidence is unavailable or partial, then fall back to workspace search/read tools for code evidence. Use workspace search first only for files outside the VS solution/project, logs, generated artifacts, or when the VS bridge is unavailable. Treat vs.find_symbol, vs.find_references, and vs.go_to_definition as planned semantic tools only when their result reports available=true.\n",
+        bridge_status, solution
+    )
 }
 
 fn append_unreal_workspace_guidance(project: &ProjectSession, prompt: &mut String) {
@@ -5744,7 +5768,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 }
 
 fn local_read_tool_required_message() -> &'static str {
-    "This turn is asking you to read or verify a local file/log. Before answering, call at least one read-only file tool: list_dir, read_file, search_file, search_content, workspace/list_dir, workspace/read_file, workspace/search_file, or workspace/search. These tools accept both workspace-relative paths and absolute local paths such as C:\\Users\\name\\AppData\\Local\\Temp. Successful read/search results are current filesystem evidence for this turn, not stale snapshots. Do not answer that you cannot read the path until an actual tool_result in this turn proves the path is unavailable."
+    "This turn is asking you to read or verify a local file/log. Before answering, call at least one read-only file tool: list_dir, read_file, search_file, search_content, vs.search_file, vs.search, workspace/list_dir, workspace/read_file, workspace/search_file, or workspace/search. These tools accept both workspace-relative paths and absolute local paths such as C:\\Users\\name\\AppData\\Local\\Temp, except VS tools are scoped to the connected Visual Studio solution/project. Successful read/search results are current filesystem evidence for this turn, not stale snapshots. Do not answer that you cannot read the path until an actual tool_result in this turn proves the path is unavailable."
 }
 
 fn required_tool_call_retry_message() -> &'static str {
@@ -5933,7 +5957,7 @@ fn intent_mode_guidance(intent_mode: AgentIntentMode) -> &'static str {
             concat!(
                 "Internal mode: research. The user is asking to understand the current code or behavior, not to change it. Work read-only. ",
                 "For non-trivial research, call progress/update_steps early with task-specific investigation steps, then update those steps as evidence is gathered; do not use a fixed template. ",
-                "Inspect fresh code, definitions, dispatch or call sites, implementations, configuration, docs, and VS context before concluding. ",
+                "Inspect fresh code, definitions, dispatch or call sites, implementations, configuration, docs, and VS context before concluding; for current VS solution code, prefer explicit vs.search / vs.search_file before workspace search. ",
                 "For code-flow or architecture questions, name-search results are only starting points: inspect the entry point, core data structures, implementations that create or mutate the behavior, and each user-named category before final answer. ",
                 "Ambiguous domain wording is not by itself a blocker for read-only research; state the working interpretation, continue with the most likely verifiable path, and separate verified facts, inferences, and unknowns. ",
                 "Ask a concise clarification question only when no useful evidence can be gathered or the ambiguity would make a requested edit or unsafe action guesswork. ",
@@ -5941,7 +5965,7 @@ fn intent_mode_guidance(intent_mode: AgentIntentMode) -> &'static str {
             )
         }
         AgentIntentMode::Debug => {
-            "Internal mode: debug. The user is reporting or investigating wrong behavior. For non-trivial debugging, call progress/update_steps early with task-specific diagnosis steps, then update those steps as evidence is gathered; do not use a fixed template. Start read-only: define expected versus actual behavior, gather evidence from code, diagnostics, logs available through tools, and VS context, then identify the most likely cause. Do not edit files unless the user explicitly asked for a fix and the requested change is clear."
+            "Internal mode: debug. The user is reporting or investigating wrong behavior. For non-trivial debugging, call progress/update_steps early with task-specific diagnosis steps, then update those steps as evidence is gathered; do not use a fixed template. Start read-only: define expected versus actual behavior, gather evidence from code, diagnostics, logs available through tools, and VS context; for current VS solution code, prefer explicit vs.search / vs.search_file before workspace search. Do not edit files unless the user explicitly asked for a fix and the requested change is clear."
         }
         AgentIntentMode::Implement => {
             concat!(
@@ -5956,7 +5980,7 @@ fn intent_mode_guidance(intent_mode: AgentIntentMode) -> &'static str {
             )
         }
         AgentIntentMode::Review => {
-            "Internal mode: review. Use a code-review stance. Work read-only. For non-trivial review, call progress/update_steps early with task-specific review areas, then update those steps as findings are checked; do not use a fixed template. Inspect the relevant code or active VS context before judging. Prioritize correctness bugs, regressions, safety issues, architecture mismatches, and missing tests. Report findings first, ordered by severity, with concrete evidence and file locations. If no actionable issues are found, say so and note residual risk or unreviewed scope."
+            "Internal mode: review. Use a code-review stance. Work read-only. For non-trivial review, call progress/update_steps early with task-specific review areas, then update those steps as findings are checked; do not use a fixed template. Inspect the relevant code or active VS context before judging; for current VS solution code, prefer explicit vs.search / vs.search_file before workspace search. Prioritize correctness bugs, regressions, safety issues, architecture mismatches, and missing tests. Report findings first, ordered by severity, with concrete evidence and file locations. If no actionable issues are found, say so and note residual risk or unreviewed scope."
         }
         AgentIntentMode::Verify => {
             "Internal mode: verify. The user is asking whether a fact, fix, behavior, or result is confirmed. For non-trivial verification, call progress/update_steps early with task-specific checks, then update those steps as checks complete; do not use a fixed template. Work read-only. Check the strongest available evidence before answering. Clearly separate verified facts from inference and state any blocker that prevents confirmation. Do not modify files while verifying."
@@ -7084,6 +7108,23 @@ Read the `.uproject`, locate UE source, and verify MCP transport from source or 
         assert!(prompt.contains("prefer grouped bullet/list sections over wide Markdown tables"));
         assert!(prompt.contains("at most 3 columns"));
         assert!(local_read_tool_required_message().contains("not stale snapshots"));
+        assert!(local_read_tool_required_message().contains("vs.search"));
+    }
+
+    #[test]
+    fn developer_prompt_prioritizes_explicit_vs_search_when_bridge_connected() {
+        let mut project = test_project();
+        project.vs_bridge_endpoint = Some("http://127.0.0.1:8568".to_string());
+        let prompt = developer_prompt(&project, false);
+
+        assert!(prompt.contains("Current project has VS Bridge Connected"));
+        assert!(prompt.contains("vs.search / vs.search_file"));
+        assert!(prompt.contains("vs_search / vs_search_file"));
+        assert!(prompt.contains("before workspace/search"));
+        assert!(prompt.contains("at least one explicit VS tool call"));
+        assert!(prompt.contains("unsupported endpoint"));
+        assert!(prompt.contains("fall back to workspace search/read tools"));
+        assert!(prompt.contains("available=true"));
     }
 
     #[test]

@@ -1230,7 +1230,9 @@ function renderInlineMarkdown(
   onCodeLinkError: (message: string) => void,
   onTraceChanged: () => void,
 ): ReactNode[] {
-  const segments = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter((segment) => segment.length > 0)
+  const segments = text
+    .split(/(\[[^\]\r\n]+\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*)/g)
+    .filter((segment) => segment.length > 0)
   const nodes: ReactNode[] = []
 
   segments.forEach((segment, index) => {

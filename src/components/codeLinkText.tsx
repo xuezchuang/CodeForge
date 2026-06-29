@@ -78,7 +78,7 @@ function collectCodeLinkMatches(text: string): CodeLinkMatch[] {
     const start = match.index ?? 0
     matches.push({
       rawLink,
-      displayText: match[1],
+      displayText: normalizeMarkdownLinkLabel(match[1]),
       start,
       end: start + match[0].length,
     })
@@ -87,6 +87,9 @@ function collectCodeLinkMatches(text: string): CodeLinkMatch[] {
   codeLinkPattern.lastIndex = 0
   for (const match of text.matchAll(codeLinkPattern)) {
     const matchedLink = match[0]
+    if (matchedLink.startsWith('](')) {
+      continue
+    }
     const rawLink = normalizeCodeLinkTarget(matchedLink)
     const start = match.index ?? 0
     const end = start + matchedLink.length
@@ -119,6 +122,10 @@ function collectCodeLinkMatches(text: string): CodeLinkMatch[] {
   }
 
   return matches.sort((left, right) => left.start - right.start)
+}
+
+function normalizeMarkdownLinkLabel(label: string): string {
+  return label.replace(/^`([^`\r\n]+)`$/, '$1')
 }
 
 function firstCodeLinkInText(text: string | undefined): string | null {
